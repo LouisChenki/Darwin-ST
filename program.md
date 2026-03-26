@@ -1,114 +1,77 @@
-# autoresearch
+# AutoResearch: Spatio-Temporal Edition
 
-This is an experiment to have the LLM do its own research.
+This is an experiment to have the AI agent autonomously conduct Deep Learning research on Spatio-Temporal Neural Networks (like Traffic Flow Prediction).
+The agent will iteratively modify `train.py`, run experiments for a specified time budget, keep improvements, and discard failures.
 
-## Setup
+## 全局规范 (Global Constraints - MUST READ)
 
-To set up a new experiment, work with the user to:
+1. **中文双语注释 (Bilingual Comments)**: The agent must write ALL code comments primarily in Simplified Chinese. Professional deep learning terms should use Chinese accompanied by their English names (e.g. 损失函数 (Loss Function), 时空图卷积 (Spatio-Temporal Graph Convolution)).
+2. **张量维度追踪 (Dimension Tracking)**: Every tensor manipulation (like `view`, `permute`, `reshape`, `einsum`) must be strictly annotated with a Chinese comment showing the exact dimension changes dynamically, e.g. `# [B, C, H, W] -> [B, 512]` to avoid shape hallucinations.
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+## Phase 1: Setup & Initialization
 
-Once you get confirmation, kick off the experimentation.
+To set up a new experiment, you must interact with the user to do the following:
 
-## Experimentation
+1. **理解创新点建议 (Understand Innovation Prompt)**: Ask the user about the core methodological innovation they want to explore (e.g. Liquid Neural Networks, Time-Space Attention, State Space Models, etc.).
+2. **构建基座代码 (Construct Initial `train.py`)**: Based on the user's requirement, write the initial `train.py` from scratch.
+   - You MUST wrap the user's core innovation in a clearly marked block, class, or function with a loud comment marking it as the "【创新点保护区 (Innovation Protected Zone)】".
+   - **Constraint**: During the later autonomous experiment loop, you are FORBIDDEN from deleting this protected module or fundamentally changing its core mechanism. You can only tune its hyperparameters, adjust the surrounding feature-extraction layers, or change the optimizer/training loop.
+3. **验证数据 (Verify Data)**: Run `python3 prepare.py` if not already run. This will auto-download the PeMS data and build cached matrices.
+4. **初始化结果日志 (Initialize `results.tsv`)**: Create a `results.tsv` file with the header: `commit\tval_mae\tval_rmse\tpeak_vram_mb\tstatus\tdescription`.
+5. **创建 Git 分支 (Create Branch)**: Propose a tag, create the branch from master, and ask the user if you should kick off the autonomous experimentation loop.
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+## Phase 2: The Autonomous Experimentation Loop
+
+Each experiment runs on a single device (CUDA, MPS, or CPU). The training script MUST run and cleanly terminate within a **fixed time budget of 15 minutes** (wall clock training time). 
+
+Launch it simply as: `python3 train.py`.
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify `train.py` — this is the only file you edit. You can change architectures outside the protected zone, adjust hyperparameters, optimizers, learning schedules, etc.
+- Adjust the number of epochs dynamically such that the script finishes in roughly 15 minutes safely.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- Modify `prepare.py`. It is read-only and handles the sliding window DataLoaders and the fixed objective metric evaluation (MAE evaluator).
+- Delete or replace the user's Core Innovation Module defined in Phase 1.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The Goal: Get the lowest `val_mae`.** 
+Since the time budget is 15 minutes, you must structure `train.py` to train as efficiently as possible within this limit and achieve the best predictive generalization.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+## Output Format
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
-
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
-
-## Output format
-
-Once the script finishes it prints a summary like this:
+Once the `train.py` script finishes, it must print a summary:
 
 ```
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+val_mae:          15.4200
+val_rmse:         22.1400
+training_seconds: 900.1
+total_seconds:    905.9
+peak_vram_mb:     4506.2
+num_steps:        1500
+num_params_M:     5.3
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+You can extract the metrics during the loop using `grep "^val_mae:" run.log`.
 
+## Logging and Plotting
+
+After every single run, log it to `results.tsv` (tab-separated):
 ```
-grep "^val_bpb:" run.log
-```
-
-## Logging results
-
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpb	memory_gb	status	description
+commit	val_mae	val_rmse	peak_vram_mb	status	description
 ```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+**MANDATORY OUTPUT**: You MUST write code in `train.py` or a helper script that, at the end of every successful loop, generates a data visualization plot `progress.png`. This plot should visually trace the `val_mae` descending trend against commits based on `results.tsv`. **This is unequivocally required.**
 
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
-```
-
-## The experiment loop
-
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+## The Step-by-Step Flow 
 
 LOOP FOREVER:
+1. Tune `train.py` with a new experimental architectural idea or hyperparameter sweep.
+2. `git commit -am "experiment: <short description>"`
+3. Run: `python3 train.py > run.log 2>&1`
+4. Read results: `grep "^val_mae:" run.log`
+5. If crash/OOM: Try fixing it once. If fundamentally broken, log status `crash` in tsv and move on (Reset changes).
+6. If `val_mae` is LOWER than baseline: Record improvements, KEEP changes, advance the branch.
+7. If `val_mae` is HIGHER or equal (or `val_mae` is inf/nan): `git reset --hard HEAD^`, Discard changes.
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
-
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
-
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
-
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
-
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+**NEVER STOP**: Once the loop starts, execute it indefinitely while the human sleeps. Never ask "should I continue?". If you run out of obvious ideas, try radical structural sweeps outside the protected zone.

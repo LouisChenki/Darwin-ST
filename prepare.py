@@ -1,389 +1,215 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+针对时空预测任务（Spatio-Temporal Prediction）的数据准备脚本。
+下载 PeMS04 交通流数据集，处理为滑动窗口格式，并提供统一的评估与指标功能。
 
-Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+用法 (Usage):
+    uv run prepare.py
 """
 
 import os
 import sys
-import time
-import math
-import argparse
-import pickle
-from multiprocessing import Pool
-
 import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
+import numpy as np
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# 常量设置 (Constants - 固定的时间预算与数据格式)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
+TIME_BUDGET = 900  # 时间预算 (Time Budget) 扩展到 15 分钟
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+DATA_DIR = os.path.join(CACHE_DIR, "pems04")
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+# 数据集远程地址 (如果无法下载可以手动放入相应目录)
+PEMS04_URL = "https://github.com/Davidham3/ASTGCN/raw/master/data/PEMS04/pems04.npz"
+FILE_PATH = os.path.join(DATA_DIR, "pems04.npz")
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+# 时空参数设定 (Spatio-Temporal Parameters)
+SEQ_LEN_IN = 12   # 历史输入时间步 (Historical Sequence Length)
+SEQ_LEN_OUT = 12  # 未来预测时间步 (Future Sequence Length)
+TRAIN_RATIO = 0.6 # 训练集比例 (Train Ratio)
+VAL_RATIO = 0.2   # 验证集比例 (Validation Ratio)
 
 # ---------------------------------------------------------------------------
-# Data download
+# 数据下载与预处理 (Data Download & Preprocessing)
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
-
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+def download_data():
+    """下载 PeMS04 数据集并保存到本地缓存"""
     os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+    if os.path.exists(FILE_PATH):
+        print(f"数据已存在 (Dataset already exists): {FILE_PATH}")
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+    print(f"正在下载 PeMS04 数据集 (Downloading) 从 {PEMS04_URL} ...")
+    try:
+        response = requests.get(PEMS04_URL, stream=True)
+        response.raise_for_status()
+        with open(FILE_PATH, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        print("下载完成 (Download complete).")
+    except Exception as e:
+        print(f"下载失败 (Failed to download dataset). 请手动将 pems04.npz 放入 {DATA_DIR}. 报错内容: {e}")
         sys.exit(1)
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+def generate_dataset(data, seq_len_in, seq_len_out):
+    """
+    滑动窗口构建数据集 (Sliding Window Generation)
+    输入 data 形状: [T, N, C]
+    返回:
+        X: [num_samples, seq_len_in, N, C]
+        Y: [num_samples, seq_len_out, N] 默认只预测第一维 Flow
+    """
+    total_len = data.shape[0]
+    num_samples = total_len - seq_len_in - seq_len_out + 1
+    
+    X = np.zeros((num_samples, seq_len_in, data.shape[1], data.shape[2]), dtype=np.float32)
+    Y = np.zeros((num_samples, seq_len_out, data.shape[1]), dtype=np.float32)
+    
+    for i in range(num_samples):
+        X[i] = data[i: i + seq_len_in]
+        # 只取特征维度第一维 (Flow) 作为目标标签
+        Y[i] = data[i + seq_len_in: i + seq_len_in + seq_len_out, :, 0]
+        
+    return X, Y
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+def process_and_save():
+    """切分并缓存处理好的数据集"""
+    train_x_path = os.path.join(DATA_DIR, "train_x.npy")
+    if os.path.exists(train_x_path):
+         print("数据已预处理 (Preprocessed data already exists).")
+         return
+         
+    print("正在处理滑动窗口切片 (Processing sliding windows)...")
+    # pems04.npz 含有 'data' 键, shape: [16992, 307, 3] -> [T, N, C]
+    file_data = np.load(FILE_PATH)
+    data = file_data['data'] if 'data' in file_data else file_data[file_data.files[0]]
+    
+    # 构建滑动窗口 (Sliding Window)
+    X, Y = generate_dataset(data, SEQ_LEN_IN, SEQ_LEN_OUT)
+    
+    # 划分数据集 (Split Dataset)
+    num_samples = X.shape[0]
+    train_steps = int(num_samples * TRAIN_RATIO)
+    val_steps = int(num_samples * VAL_RATIO)
+    
+    train_x, train_y = X[:train_steps], Y[:train_steps]
+    val_x, val_y = X[train_steps:train_steps+val_steps], Y[train_steps:train_steps+val_steps]
+    
+    # Z-Score 归一化 (Standardization) -> 为了防止数据泄露，仅依训练集标准差进行归一化
+    mean = train_x[..., 0].mean()
+    std = train_x[..., 0].std()
+    
+    train_x[..., 0] = (train_x[..., 0] - mean) / std
+    val_x[..., 0] = (val_x[..., 0] - mean) / std
+    
+    np.save(train_x_path, train_x)
+    np.save(os.path.join(DATA_DIR, "train_y.npy"), train_y)
+    np.save(os.path.join(DATA_DIR, "val_x.npy"), val_x)
+    np.save(os.path.join(DATA_DIR, "val_y.npy"), val_y)
+    
+    # 保存缩放因子以备还原反变换 (Save Scaler)
+    np.save(os.path.join(DATA_DIR, "scaler.npy"), np.array([mean, std]))
+    print("预处理完成 (Preprocessing complete)!")
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+
+# ---------------------------------------------------------------------------
+# 运行时组件 (Runtime Utilities - Imported by train.py)
+# ---------------------------------------------------------------------------
+
+def load_data(split, batch_size, device='cpu', drop_last=True):
+    """
+    加载数据加载器 (DataLoader Load Function)
+    通过 pin_memory_True 针对 MPS/CUDA 异步传输做优化。
+    """
+    x_path = os.path.join(DATA_DIR, f"{split}_x.npy")
+    y_path = os.path.join(DATA_DIR, f"{split}_y.npy")
+    
+    if not os.path.exists(x_path):
+        raise FileNotFoundError(f"Dataset split {split} not found. Please run prepare.py first.")
+        
+    X = torch.from_numpy(np.load(x_path)).to(torch.float32)
+    Y = torch.from_numpy(np.load(y_path)).to(torch.float32)
+    
+    dataset = TensorDataset(X, Y)
+    
+    # [性能优化] - 根据统一内存架构 (M4 Max) 与 CUDA 进行内存锁定配置传输
+    is_accelerator = ('cuda' in str(device)) or ('mps' in str(device))
+    
+    loader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=(split == 'train'), 
+        pin_memory=is_accelerator,
+        drop_last=drop_last
     )
+    return loader
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+def get_scaler():
+    """读取均值域方差 (Get Scaler Parameters)"""
+    return np.load(os.path.join(DATA_DIR, "scaler.npy"))
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# 评估模块 (Evaluation Module - 这是唯一的且绝对稳固的标尺)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_mae(model, batch_size, device="cpu"):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    在验证集上度量系统的 平均绝对误差 (Mean Absolute Error, MAE) 与均方根误差 (RMSE)。
+    这是智能体进化的考核指标，极度客观。要求输出形状适配 [B, T_out, Nodes]。
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    model.eval()
+    val_loader = load_data("val", batch_size, 'cpu', drop_last=False) 
+    
+    total_mae = 0.0
+    total_mse = 0.0
+    total_samples = 0
+    
+    # 取回归一化器进行标签尺度的对比 (Rescale data for real-world metric evaluation)
+    scaler = get_scaler()
+    mean_val, std_val = float(scaler[0]), float(scaler[1])
+    
+    for x, y in val_loader:
+        x, y = x.to(device), y.to(device)
+        
+        # 前向传播 (Forward Propagation)
+        preds = model(x)
+        
+        if torch.isnan(preds).any():
+            return float('inf'), float('inf')
+        
+        # 统一恢复到绝对真实的交通流量尺度 (Inverse Transform)
+        preds_real = (preds * std_val) + mean_val     # 模型预测是在归一化的尺度，或者直接通过线性映射完成，需确认。
+        # 注意：此处假设模型的直接输出是与 y 的同等标度（未经反归一化的）。如果不使用特征对齐可以直接通过下式：
+        # 这里为简便起见，假设直接对 y 进行真实还原进行统计
+        # 实际上 y 保存的就是真实流量（无归一化）
+        # 如果模型直接拟合真实流量，就直接计算；如果模型拟合的是预测差距，需反向还原。
+        # 我们上游预处理时 val_y.npy 其实并未进行归一化（因为归一化仅处理了 x）。
+        # 请确保 model的最终输出拟合了真实值。
+        
+        mae = torch.abs(preds - y).sum().item()
+        mse = torch.pow(preds - y, 2).sum().item()
+        
+        total_mae += mae
+        total_mse += mse
+        total_samples += y.numel()
+        
+    mean_mae = total_mae / total_samples
+    mean_rmse = np.sqrt(total_mse / total_samples)
+    
+    model.train()
+    return mean_mae, mean_rmse
 
 # ---------------------------------------------------------------------------
-# Main
+# 程序入口 (Entry Point)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    print("初始化时空图预测数据的下载与解配 (Prepare Autoresearch Spatio-Temporal Data)...")
+    download_data()
+    process_and_save()
+    print("就绪 (Ready)! 数据管道搭建完成。")
