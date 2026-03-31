@@ -167,15 +167,15 @@ class AutoResearchModel(nn.Module):
         assert C >= 3, f"Shape Mismatch: Models expects Flow, TOD, DOW, got {C} features!"
         
         # 张量切片分离属性 (Feature Defusing)
-        flow_feat = x[..., 0:1] # [B, T_in, N, 1]
-        time_feat = x[..., 1:3] # [B, T_in, N, 2]
+        flow_feat = x[..., 0:1].contiguous() # [B, T_in, N, 1]
+        time_feat = x[..., 1:3].contiguous() # [B, T_in, N, 2]
         
         # 张量映射与融合 (Embedding & Add Fusion)
         h_flow = self.flow_proj(flow_feat) # [B, T, N, d_model]
         h_time = self.time_emb(time_feat)  # [B, T, N, d_model]
         
         # 融合周期相位特征
-        h_fuse = h_flow + h_time 
+        h_fuse = (h_flow + h_time).contiguous() 
         
         # 经过 TCN 短期记忆窗口跨度平滑提取
         h_tcn = self.tcn(h_fuse) + h_fuse
