@@ -25,22 +25,30 @@ To set up a new experiment, DO NOT start coding independently. You **MUST** firs
 - **核心创新点 (Innovation)**: [请描述你想引入的网络机制，例如：液态神经网络 / 因果时空注意力等]
 - **目标数据集 (Dataset)**: [请选择一项：PeMS04 / PeMS08 / METR-LA / PEMS-BAY]
 - **对比基线 (Baselines)**: [请选择一项或多项：ARIMA / DCRNN / ST-Transformer / UniST，或填“无”]
+- **实验分支名 (Git Branch Name)**: [请提供一个简短的英文分支名，例如：exp/lnn-gcn-base，或填“自动生成”]
 ```
 
 Wait carefully for the user's response. Once received, do the following:
 
 1. **配置环境与锁定基线**: Read the dataset and baselines. Note them down in `train.py` structure so they automatically plot the corresponding boundaries from `baseline_registry.py`.
 2. **构建基座代码 & 网络复杂度匹配 (Construct Initial `train.py` & Complexity Matching)**: Based on the innovation, write the initial `train.py` from scratch.
+   - **🥶 冷启动隔离 (Cold Start Isolation)**: You are **ABSOLUTELY FORBIDDEN** from reading or referencing `memory.md` during this initialization phase! Your initial codebase must act as a sterile control group ("Tabula Rasa"), built 100% strictly relying on the user's provided core innovation and baseline. Do not pollute the initial model with historical architectural memories!
    - **CRITICAL CONSTRAINT**: You MUST ensure that the parameter count (Model Complexity) of the architecture you construct is roughly in the same order of magnitude as the user's selected Baseline! (Do not build a 50-million parameter monster when comparing to a lightweight DCRNN framework). Ensure fair architectural groundings.
    - You MUST wrap the user's core innovation inside the "【创新点保护区 (Innovation Protected Zone)】". During Phase 2, you are FORBIDDEN from deleting this protected module.
 3. **环境数据初始化**: Ensure to tell the user that the background data downloading logic (`prepare.py`) will automatically take over based on their dataset choice by parsing an environment variable, e.g. `DATASET=PeMS08 python3 prepare.py` (assuming you've edited prepare to support it).
-4. **创建 Git 分支 & 开始自动循环**: Create `results.tsv` and ask permission to kick off loop.
+4. **强制物理隔离与创建版本库 (Enforce Git Isolation)**: As your VERY FIRST terminal action, execute `git checkout -b <branch_name>`.
+   - If the user wrote "自动生成" (auto-generate), engineer a highly readable English branch name based on the core innovation.
+   - You MUST ensure the terminal successfully switches to this new branch. ONLY after confirming Git branch creation/switching is successful, initialize `results.tsv` and formally request permission to advance to Phase 2.
 
 ## Phase 2: The Autonomous Experimentation Loop
 
-Each experiment runs on a single device. The training script MUST run and cleanly terminate within a **fixed time budget of 15 minutes** (wall clock training time). 
-
-Launch it simply: `python3 train.py`.
+**🧠 核心工作流：读写海马体 (Read-Write Hippocampus)**
+1. **先读后写 (Read Before Mutation)**: **Starting ONLY from the first evolutionary mutation of Phase 2**, before EVERY single subsequent modification on `train.py`, you MUST read `memory.md`. Comprehend the `SOTA DNA` (current champion architecture) and completely avoid repeating the fatal mistakes indexed in `The Graveyard`. (Reminder: Do NOT read `memory.md` during Phase 1 Initialization).
+2. **执行实验 (Execute Experiment)**: Launch the script via `python3 train.py`. The training script MUST run and cleanly terminate within a **fixed time budget of 15 minutes** (wall clock training time).
+3. **软性保护与增量反思 (Soft Preservation & Reflective Update)**:
+   - **成功突围 (KEEP)**: If `val_mae` improves over the current Best, you successfully bred a SOTA model! You MUST append the structured reflection to `evolution_log.jsonl` AND proactively edit `memory.md` -> updating `SOTA DNA` and `Elastic Parameter Insights` with your winning mechanisms.
+   - **实验爆炸 (DISCARD)**: If the Loss explodes, Shape Mismatch occurs, or MAE significantly regresses, you MUST document the failure etiology in `memory.md` -> `The Graveyard` BEFORE you revert/discard the code. Instruct your future self exactly WHY the architectural hypothesis crashed.
+   - You possess the utmost freedom to modify ANY component in `train.py`. However, if you opt to drastically rip out a module currently anchored in the `SOTA DNA` of `memory.md`, you must physically and mathematically justify this "hard-fork" in your reflection logs.
 
 **The Goal: Penetrate the Baselines (超越靶场基线) !**
 Your prime objective is not just to minimize `val_mae`. It is to push `val_mae` below the horizontal dashed line of the toughest User-Selected Baseline. You must evaluate **"Relative Improvement"** over the baseline.
