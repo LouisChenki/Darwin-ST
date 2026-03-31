@@ -60,7 +60,7 @@ graph TD
     D -- 否 (修改提示词) --> A
     D -- 是 (开始放权) --> E[Phase 2: 进入自动化研究循环]
 
-    subgraph 15分钟快速进化周期 (15-Min Evolution Loop)
+    subgraph Evolution["15分钟快速进化周期 (15-Min Evolution Loop)"]
         E --> F[智能体变异: 修改网络架构、通道数、融合机制]
         F --> G[基于 M4 Max / GPU 执行 15 分钟预算内训练]
         G --> H{客观验证: 验证集 MAE 是否下降?}
