@@ -19,11 +19,20 @@ from torch.utils.data import DataLoader, TensorDataset
 
 TIME_BUDGET = 900  # 时间预算 (Time Budget) 扩展到 15 分钟
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "pems04")
 
-# 数据集远程地址 (如果无法下载可以手动放入相应目录)
-PEMS04_URL = "https://github.com/Davidham3/ASTGCN/raw/master/data/PEMS04/pems04.npz"
-FILE_PATH = os.path.join(DATA_DIR, "pems04.npz")
+DATASET = os.environ.get("DATASET", "PeMS04")
+DATA_DIR = os.path.join(CACHE_DIR, DATASET.lower())
+
+# 数据集远程地址列表 (Dataset URLs)
+DATASET_URLS = {
+    "PeMS04": "https://github.com/Davidham3/ASTGCN/raw/master/data/PEMS04/pems04.npz",
+    "PeMS08": "https://github.com/Davidham3/ASTGCN/raw/master/data/PEMS08/pems08.npz",
+    "METR-LA": "https://github.com/chenkaiqi/METR-LA_placeholder_url/metr-la.npz", # 需替换为真实源或手动下载
+    "PEMS-BAY": "https://github.com/chenkaiqi/PEMS-BAY_placeholder_url/pems-bay.npz" 
+}
+
+PEMS_URL = DATASET_URLS.get(DATASET, DATASET_URLS["PeMS04"])
+FILE_PATH = os.path.join(DATA_DIR, f"{DATASET.lower()}.npz")
 
 # 时空参数设定 (Spatio-Temporal Parameters)
 SEQ_LEN_IN = 12   # 历史输入时间步 (Historical Sequence Length)
@@ -42,9 +51,9 @@ def download_data():
         print(f"数据已存在 (Dataset already exists): {FILE_PATH}")
         return
 
-    print(f"正在下载 PeMS04 数据集 (Downloading) 从 {PEMS04_URL} ...")
+    print(f"正在下载 {DATASET} 数据集 (Downloading) 从 {PEMS_URL} ...")
     try:
-        response = requests.get(PEMS04_URL, stream=True)
+        response = requests.get(PEMS_URL, stream=True)
         response.raise_for_status()
         with open(FILE_PATH, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
@@ -52,7 +61,7 @@ def download_data():
                     f.write(chunk)
         print("下载完成 (Download complete).")
     except Exception as e:
-        print(f"下载失败 (Failed to download dataset). 请手动将 pems04.npz 放入 {DATA_DIR}. 报错内容: {e}")
+        print(f"下载失败 (Failed to download dataset). 请手动将 {DATASET.lower()}.npz 放入 {DATA_DIR}. 报错内容: {e}")
         sys.exit(1)
 
 def generate_dataset(data, seq_len_in, seq_len_out):
@@ -83,10 +92,13 @@ def process_and_save():
          print("数据已预处理 (Preprocessed data already exists).")
          return
          
-    print("正在处理滑动窗口切片 (Processing sliding windows)...")
-    # pems04.npz 含有 'data' 键, shape: [16992, 307, 3] -> [T, N, C]
+    print(f"正在处理 {DATASET} 滑动窗口切片 (Processing sliding windows)...")
+    # pemsnpz 普遍含有 'data' 键, shape: [T, N, C]
     file_data = np.load(FILE_PATH)
     data = file_data['data'] if 'data' in file_data else file_data[file_data.files[0]]
+    
+    # 动态获取当前数据集节点数
+    num_nodes = data.shape[1]
     
     # 构建滑动窗口 (Sliding Window)
     X, Y = generate_dataset(data, SEQ_LEN_IN, SEQ_LEN_OUT)

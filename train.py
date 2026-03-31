@@ -14,6 +14,15 @@ import torch.nn as nn
 import torch.optim as optim
 
 from prepare import TIME_BUDGET, load_data, evaluate_mae
+from baseline_registry import get_baseline_metric
+
+# ---------------------------------------------------------------------------
+# 用户任务指令承接 (User Prompt Fulfillment)
+# ---------------------------------------------------------------------------
+# [AGENT CONFIG] 智能体在接收阶段 1 模板后，需将用户选定的 Baseline 和 Dataset 写入于此：
+DATASET = os.environ.get("DATASET", "PeMS04")
+SELECTED_BASELINES = ["DCRNN", "ST-Transformer"] # 例如 (e.g.)
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # 【创新点保护区 (Innovation Protected Zone)】
@@ -82,11 +91,20 @@ def generate_progress_plot(tsv_path="results.tsv", out_path="progress.png"):
             return
             
         plt.figure(figsize=(10, 5))
-        plt.plot(range(len(valid_df)), valid_df['val_mae'], marker='o', linestyle='-', color='indigo', linewidth=2)
-        plt.title('Validation MAE Progress Over Auto-Research Generational Steps', fontsize=14)
+        plt.plot(range(len(valid_df)), valid_df['val_mae'], marker='o', linestyle='-', color='indigo', linewidth=2, label='AutoResearch Model')
+        
+        # 将用户选取的 Baselines 以虚线水平绘制
+        colors = ['r', 'g', 'c', 'orange', 'm']
+        for i, baseline in enumerate(SELECTED_BASELINES):
+            b_mae = get_baseline_metric(DATASET, baseline, metric='mae')
+            if b_mae is not None:
+                plt.axhline(y=b_mae, color=colors[i % len(colors)], linestyle='--', alpha=0.8, linewidth=1.5, label=f'{baseline} (MAE: {b_mae})')
+                
+        plt.title(f'Validation MAE Progress on {DATASET}', fontsize=14)
         plt.xlabel('Successful Generational Commits (Kept)', fontsize=12)
         plt.ylabel('Validation MAE', fontsize=12)
         plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend(loc='upper right')
         plt.tight_layout()
         plt.savefig(out_path, dpi=300)
         plt.close()
@@ -114,7 +132,17 @@ def main():
     WEIGHT_DECAY = 1e-4
     MAX_EPOCHS = 500  # 提供远超能力的 Epoch 以确保纯靠 Time Budget 被中断
     
-    model = AutoResearchModel(in_channels=3, num_nodes=307, seq_in=12, seq_out=12)
+    # 获取节点的动态数目 (由于不同 Dataset 节点数不同)
+    try:
+        import numpy as np
+        # 探测随便一个 x 文件以读取维度
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch", DATASET.lower())
+        sample_x = np.load(os.path.join(cache_dir, "train_x.npy"), mmap_mode='r')
+        num_nodes = sample_x.shape[2]
+    except Exception:
+        num_nodes = 307 # Default PeMS04
+        
+    model = AutoResearchModel(in_channels=3, num_nodes=num_nodes, seq_in=12, seq_out=12)
     model.to(device)
     
     num_params = sum(p.numel() for p in model.parameters())
@@ -198,8 +226,15 @@ def main():
     elif device.type == 'mps':
         peak_vram_mb = torch.mps.driver_allocated_memory() / 1024 / 1024
 
+    # 报告最终评价 (Report Evaluation and Benchmarks)
+    baseline_mae = get_baseline_metric(DATASET, SELECTED_BASELINES[0], metric='mae') if len(SELECTED_BASELINES) > 0 else None
+    
     print("---")
     print(f"val_mae:          {val_mae:.6f}")
+    if baseline_mae is not None:
+        relative_improvement = (baseline_mae - val_mae) / baseline_mae * 100
+        print(f"vs_{SELECTED_BASELINES[0]}_%:  {relative_improvement:+.2f}%")
+        
     print(f"val_rmse:         {val_rmse:.6f}")
     print(f"training_seconds: {total_training_time:.1f}")
     print(f"total_seconds:    {total_seconds:.1f}")
