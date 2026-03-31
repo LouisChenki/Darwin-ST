@@ -139,8 +139,8 @@ class TemporalMixer(nn.Module):
         # x: [B, T, N, C] -> [B, C, T, N]
         x_perm = x.permute(0, 3, 1, 2)
         out = torch.relu(self.time_conv(x_perm))
-        # 还原回 [B, T, N, C]
-        return out.permute(0, 2, 3, 1)
+        # 还原回 [B, T, N, C] 并重整内存以供给 GCN 做矩阵乘法
+        return out.permute(0, 2, 3, 1).contiguous()
 
 class AutoResearchModel(nn.Module):
     def __init__(self, in_channels=3, num_nodes=307, seq_in=12, seq_out=12):
