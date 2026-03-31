@@ -83,15 +83,46 @@ class SpatioTemporalModule(nn.Module):
 # 周边自由探索网络 (Free Exploration Zone)
 # ---------------------------------------------------------------------------
 
+class SpatialAttention(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.qkv = nn.Linear(d_model, d_model * 3)
+        self.proj = nn.Linear(d_model, d_model)
+        
+    def forward(self, x):
+        # x: [B, T, N, C]
+        B, T, N, C = x.shape
+        # [B, T, N, C] -> [B, T, N, 3C]
+        qkv = self.qkv(x) 
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Spatial Attention: 混合 N 维度关联
+        # q: [B, T, N, C], k: [B, T, N, C] -> [B, T, N, N]
+        attn = torch.einsum('btnd,btmd->btnm', q, k) / (C ** 0.5)
+        attn = torch.softmax(attn, dim=-1)
+        
+        # [B, T, N, N] * [B, T, N, C] -> [B, T, N, C]
+        out = torch.einsum('btnm,btmd->btnd', attn, v)
+        return x + self.proj(out)
+
 class AutoResearchModel(nn.Module):
     def __init__(self, in_channels=3, num_nodes=307, seq_in=12, seq_out=12):
         super().__init__()
-        # 模型主体被嵌套，智能体可以在外部随心所欲增加各种归一化、残差或者新型网络结构
-        self.core = SpatioTemporalModule(in_channels, 1, num_nodes, seq_in, seq_out)
+        self.d_model = 16 # 使用较小维度以保证内存与计算效率
+        # 外部架构探索 (External Architecture Exploration)
+        self.input_proj = nn.Linear(in_channels, self.d_model)
+        self.spatial_attn = SpatialAttention(self.d_model)
+        self.norm = nn.LayerNorm(self.d_model)
+        
+        # 模型主体被嵌套，核心使用放大特征维度的 LNN
+        self.core = SpatioTemporalModule(self.d_model, 1, num_nodes, seq_in, seq_out)
         
     def forward(self, x):
         # x: [B, T_in, N, C_in]
-        return self.core(x)
+        x_proj = self.input_proj(x)
+        x_attn = self.spatial_attn(x_proj)
+        x_norm = self.norm(x_attn)
+        return self.core(x_norm)
 
 # ---------------------------------------------------------------------------
 # 工具与日志生成 (Utilities & Logging)
