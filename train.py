@@ -21,7 +21,7 @@ from baseline_registry import get_baseline_metric
 # ---------------------------------------------------------------------------
 # [AGENT CONFIG] 智能体在接收阶段 1 模板后，需将用户选定的 Baseline 和 Dataset 写入于此：
 DATASET = os.environ.get("DATASET", "PeMS04")
-SELECTED_BASELINES = ["DCRNN", "ST-Transformer"] # 例如 (e.g.)
+SELECTED_BASELINES = ["DCRNN"] # 基于用户给定的对比基线
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
@@ -32,35 +32,52 @@ SELECTED_BASELINES = ["DCRNN", "ST-Transformer"] # 例如 (e.g.)
 # 在 Phase 2 的自动研究循环中，您【不可】删除或本末倒置此处的前向核心推理逻辑与理念。
 # 但您可以任意向外扩展层级、更改通道数量、或者在外部空间包裹新的特征提取架构。
 
+class LiquidTimeConstantNode(nn.Module):
+    def __init__(self, in_features, state_size):
+        super().__init__()
+        self.state_size = state_size
+        self.W_in = nn.Linear(in_features, state_size)
+        self.W_rec = nn.Linear(state_size, state_size)
+        # 初始化流体时间常数 (Liquid Time Constant)
+        self.tau_inv = nn.Parameter(torch.ones(state_size) * 0.1)
+        self.A = nn.Parameter(torch.ones(state_size))
+        
+    def forward(self, x_t, h_t, dt=1.0):
+        # x_t 维度追踪 (Dimension Tracking): [B, in_features]
+        # h_t 维度追踪 (Dimension Tracking): [B, state_size]
+        f_val = torch.sigmoid(self.W_in(x_t) + self.W_rec(h_t))
+        dh = - (torch.abs(self.tau_inv) + f_val) * h_t + f_val * self.A
+        return h_t + dh * dt
+
 class SpatioTemporalModule(nn.Module):
     """
-    一个用于初始化的结构占位符 (An initialization placeholder).
-    此结构由智能体在 Phase 1 阶段基于用户的需求（如加入液态神经网络 LNN，或图注意力 GAT）直接重写生成。
+    基于液态神经网络 (Liquid Neural Network, LNN) 的时空架构.
+    利用连续时间 ODE 推演时序动态演化，适合非均匀序列建模。
     """
     def __init__(self, in_channels, out_channels, num_nodes, seq_len_in, seq_len_out):
         super().__init__()
         self.seq_len_out = seq_len_out
         self.num_nodes = num_nodes
         
-        # 极简的全连接作为平替 (Minimal Flatten & Linear Baseline)
-        hidden_dim = 64
-        self.fc1 = nn.Linear(seq_len_in * num_nodes * in_channels, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, seq_len_out * num_nodes)
+        self.hidden_dim = 128
+        # 输入特征数为每个节点通道叠加: in_channels * num_nodes
+        self.lnn_cell = LiquidTimeConstantNode(in_channels * num_nodes, self.hidden_dim)
+        self.fc_out = nn.Linear(self.hidden_dim, seq_len_out * num_nodes)
         
     def forward(self, x):
-        # x 形状追踪 (Dimension Tracking): [B, T_in, N, C]
-        B = x.shape[0]
-        # [B, T_in, N, C] -> [B, T_in * N * C]
-        x_flat = x.view(B, -1) 
+        # x 维度追踪 (Dimension Tracking): [B, T_in, N, C]
+        B, T_in, N, C = x.shape
+        x_flat = x.view(B, T_in, N * C)
         
-        h = torch.relu(self.fc1(x_flat))
+        # 统一设备与精度 (Initialize hidden state)
+        h_t = torch.zeros(B, self.hidden_dim, device=x.device, dtype=x.dtype)
         
-        # [B, Hidden] -> [B, T_out * N]
-        out = self.fc2(h)
-        
-        # [B, T_out * N] -> [B, T_out, N]
-        out = out.view(B, self.seq_len_out, self.num_nodes)
-        return out
+        # 按时间步模拟液体系统计算流
+        for t in range(T_in):
+            h_t = self.lnn_cell(x_flat[:, t, :], h_t, dt=1.0)
+            
+        out_flat = self.fc_out(h_t)
+        return out_flat.view(B, self.seq_len_out, self.num_nodes)
 
 # ---------------------------------------------------------------------------
 # 周边自由探索网络 (Free Exploration Zone)
@@ -156,7 +173,7 @@ def main():
     
     # 启用混合精度加速 (AMP) 支持
     use_amp_cuda = ('cuda' in str(device))
-    use_amp_mps = False # 关闭 MPS mixed precision 以避免特定版本的不支持警告
+    use_amp_mps = ('mps' in str(device)) # 必须集成 AMP M4 Max 支持
     scaler = torch.amp.GradScaler(device.type) if use_amp_cuda else None
 
     # 调用提前编译的数据模块 (Invoke dataloader)
