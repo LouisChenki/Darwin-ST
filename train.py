@@ -66,6 +66,7 @@ class SpatioTemporalModule(nn.Module):
         
     def forward(self, x):
         # x 维度追踪 (Dimension Tracking): [B, T_in, N, C]
+        x = x.contiguous()
         B, T_in, N, C = x.shape
         x_flat = x.reshape(B, T_in, N * C)
         
