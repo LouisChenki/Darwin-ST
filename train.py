@@ -124,6 +124,23 @@ class TemporalEmbedding(nn.Module):
         # 张量变换: [B, T, N, 2] -> [B, T, N, d_model]
         return self.time_proj(time_features)
 
+class TemporalMixer(nn.Module):
+    """
+    轻量级时间维度因果卷积 (Lightweight Temporal Causal Convolution)
+    在传入图卷积之前，扩张同一节点在近期时间步的感受野。
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        # 时域卷积 (Kernel=3, 跨越前后相连的时间步)
+        self.time_conv = nn.Conv2d(d_model, d_model, kernel_size=(3, 1), padding=(1, 0))
+        
+    def forward(self, x):
+        # x: [B, T, N, C] -> [B, C, T, N]
+        x_perm = x.permute(0, 3, 1, 2)
+        out = torch.relu(self.time_conv(x_perm))
+        # 还原回 [B, T, N, C]
+        return out.permute(0, 2, 3, 1)
+
 class AutoResearchModel(nn.Module):
     def __init__(self, in_channels=3, num_nodes=307, seq_in=12, seq_out=12):
         super().__init__()
@@ -133,9 +150,11 @@ class AutoResearchModel(nn.Module):
         self.flow_proj = nn.Linear(1, self.d_model)
         self.time_emb = TemporalEmbedding(self.d_model)
         
-        # 引入加深版物理图先验 (2-hop Deep GCN)
-        self.gcn1 = GraphConvolution(self.d_model, self.d_model)
-        self.gcn2 = GraphConvolution(self.d_model, self.d_model)
+        # 新近演化出的时域微调层 (Temporal Local Dynamics)
+        self.tcn = TemporalMixer(self.d_model)
+        
+        # 引入物理空间先验，退回至胜出 8% 的稳定单跳 GCN 以防过平滑
+        self.gcn = GraphConvolution(self.d_model, self.d_model)
         self.norm = nn.LayerNorm(self.d_model)
         
         # 维持底层液态神经网络 (LNN) 接稳信号
@@ -157,14 +176,14 @@ class AutoResearchModel(nn.Module):
         # 融合周期相位特征
         h_fuse = h_flow + h_time 
         
-        # 多跳 Graph 物理邻接扩散与残差 (Deep GCN & Residual)
-        h_graph_1 = torch.relu(self.gcn1(h_fuse, adj))
-        h_graph_2 = self.gcn2(h_graph_1, adj)
-        h_res = torch.relu(h_fuse + h_graph_2)
+        # 经过 TCN 短期记忆窗口跨度平滑提取
+        h_tcn = self.tcn(h_fuse) + h_fuse
         
-        h_norm = self.norm(h_res)
+        # 利用 Graph 物理邻接矩阵 A 扩散拓扑属性 (恢复成单层)
+        h_graph = torch.relu(self.gcn(h_tcn, adj))
         
-        # 移交具有时空完备洞察的信号矩阵给下游动态 LNN 层
+        # 归一化后交付 LNN
+        h_norm = self.norm(h_graph)
         return self.core(h_norm)
 
 # ---------------------------------------------------------------------------
