@@ -38,7 +38,8 @@ Wait carefully for the user's response. Once received, do the following:
 3. **环境数据初始化**: Ensure to tell the user that the background data downloading logic (`prepare.py`) will automatically take over based on their dataset choice by parsing an environment variable, e.g. `DATASET=PeMS08 python3 prepare.py` (assuming you've edited prepare to support it).
 4. **强制物理隔离与创建版本库 (Enforce Git Isolation)**: As your VERY FIRST terminal action, execute `git checkout -b <branch_name>`.
    - If the user wrote "自动生成" (auto-generate), engineer a highly readable English branch name based on the core innovation.
-   - You MUST ensure the terminal successfully switches to this new branch. ONLY after confirming Git branch creation/switching is successful, initialize `results.tsv` and formally request permission to advance to Phase 2.
+   - You MUST ensure the terminal successfully switches to this new branch. ONLY after confirming Git branch creation/switching is successful, initialize `results.tsv`.
+   - **🚀 无缝衔接全自动炼丹 (Seamless Autonomous Transition)**: Once the initial `train.py` and environment are set up, **DO NOT STOP to ask for human permission!** You must IMMEDIATELY and AUTONOMOUSLY transition into Phase 2's experimentation loop. The human has completely handed over the control of the research lab to you. Operate 24/7 unattended!
 
 ## Phase 2: The Autonomous Experimentation Loop
 
