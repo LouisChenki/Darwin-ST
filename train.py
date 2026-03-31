@@ -67,7 +67,7 @@ class SpatioTemporalModule(nn.Module):
     def forward(self, x):
         # x 维度追踪 (Dimension Tracking): [B, T_in, N, C]
         B, T_in, N, C = x.shape
-        x_flat = x.view(B, T_in, N * C)
+        x_flat = x.reshape(B, T_in, N * C)
         
         # 统一设备与精度 (Initialize hidden state)
         h_t = torch.zeros(B, self.hidden_dim, device=x.device, dtype=x.dtype)
@@ -77,7 +77,7 @@ class SpatioTemporalModule(nn.Module):
             h_t = self.lnn_cell(x_flat[:, t, :], h_t, dt=1.0)
             
         out_flat = self.fc_out(h_t)
-        return out_flat.view(B, self.seq_len_out, self.num_nodes)
+        return out_flat.reshape(B, self.seq_len_out, self.num_nodes)
 
 # ---------------------------------------------------------------------------
 # 周边自由探索网络 (Free Exploration Zone)
