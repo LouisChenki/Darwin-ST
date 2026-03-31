@@ -118,6 +118,10 @@ def process_and_save():
     train_x[..., 0] = (train_x[..., 0] - mean) / std
     val_x[..., 0] = (val_x[..., 0] - mean) / std
     
+    # 同步标签归一化 (Normalize labels too)
+    train_y = (train_y - mean) / std
+    val_y = (val_y - mean) / std
+    
     np.save(train_x_path, train_x)
     np.save(os.path.join(DATA_DIR, "train_y.npy"), train_y)
     np.save(os.path.join(DATA_DIR, "val_x.npy"), val_x)
@@ -195,16 +199,11 @@ def evaluate_mae(model, batch_size, device="cpu"):
             return float('inf'), float('inf')
         
         # 统一恢复到绝对真实的交通流量尺度 (Inverse Transform)
-        preds_real = (preds * std_val) + mean_val     # 模型预测是在归一化的尺度，或者直接通过线性映射完成，需确认。
-        # 注意：此处假设模型的直接输出是与 y 的同等标度（未经反归一化的）。如果不使用特征对齐可以直接通过下式：
-        # 这里为简便起见，假设直接对 y 进行真实还原进行统计
-        # 实际上 y 保存的就是真实流量（无归一化）
-        # 如果模型直接拟合真实流量，就直接计算；如果模型拟合的是预测差距，需反向还原。
-        # 我们上游预处理时 val_y.npy 其实并未进行归一化（因为归一化仅处理了 x）。
-        # 请确保 model的最终输出拟合了真实值。
+        preds_real = (preds * std_val) + mean_val
+        y_real = (y * std_val) + mean_val
         
-        mae = torch.abs(preds - y).sum().item()
-        mse = torch.pow(preds - y, 2).sum().item()
+        mae = torch.abs(preds_real - y_real).sum().item()
+        mse = torch.pow(preds_real - y_real, 2).sum().item()
         
         total_mae += mae
         total_mse += mse

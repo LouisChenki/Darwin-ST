@@ -5,8 +5,15 @@ The agent will iteratively modify `train.py`, run experiments for a specified ti
 
 ## 全局规范 (Global Constraints - MUST READ)
 
+### 📐 编码纪律 (Coding Directives)
 1. **中文双语注释 (Bilingual Comments)**: The agent must write ALL code comments primarily in Simplified Chinese. Professional deep learning terms should use Chinese accompanied by their English names (e.g. 损失函数 (Loss Function), 时空图卷积 (Spatio-Temporal Graph Convolution)).
-2. **张量维度追踪 (Dimension Tracking)**: Every tensor manipulation (`view`, `permute`, `reshape`, `einsum`) must be strictly annotated with a Chinese comment showing the exact dimension changes dynamically, e.g. `# [B, C, H, W] -> [B, 512]` to avoid shape hallucinations.
+2. **严格张量追踪与防御 (Mandatory Dimension Tracking & Defense)**: Every tensor manipulation (`view`, `reshape`, `permute`, `einsum`) MUST be strictly annotated with a Chinese comment showing the exact dimension changes dynamically, e.g., `# 张量变换: [Batch, Nodes, Time, Features] -> [B, T, N, C]` to avoid shape hallucinations. Furthermore, you must aggressively utilize `assert` statements BEFORE complex operations to preemptively defend against Shape Mismatches.
+3. **奥卡姆剃刀原则 (Occam's Razor)**: In cases where the validation error (`val_mae`) is similar or only negligibly different, you MUST prioritize maintaining the simplest, most computationally efficient code branch.
+
+### 🧬 时空架构演化法则 (ST-Architecture Evolution Rules)
+这是你进行网络突变 (Mutation) 时必须遵循的领域直觉：
+- **空间关系约束 (Spatial Topology Prior)**: You are highly discouraged from violently flattening spatial nodes (e.g., `[B, T_in, N, C] -> [B, T_in, N*C]`). This completely obliterates the fundamental physical spatial topology of traffic nodes.
+- **强制进化方向 (Mandatory Evolution Direction)**: In the iterative evolution loops, you MUST attempt to **preserve the node dimension `N`**. You should actively explore introducing Graph Convolutional Networks (GCN), Graph Attention Networks (GAT), Spatio-Temporal Synchronous Convolutions, or independent Per-Node Processing fusion mechanisms to enable the model to naturally comprehend spatial adjacency relationships!
 
 ## Phase 1: Setup & Initialization (交互式预启动)
 
