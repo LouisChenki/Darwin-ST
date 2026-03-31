@@ -83,46 +83,85 @@ class SpatioTemporalModule(nn.Module):
 # 周边自由探索网络 (Free Exploration Zone)
 # ---------------------------------------------------------------------------
 
-class SpatialAttention(nn.Module):
+class GraphConvolution(nn.Module):
+    """
+    物理图先验卷积 (Physical Prior Graph Convolution)
+    能利用真实的物理邻接矩阵 A 拓宽感知域。
+    """
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        self.bias = nn.Parameter(torch.FloatTensor(out_features))
+        nn.init.xavier_uniform_(self.weight)
+        nn.init.zeros_(self.bias)
+        
+    def forward(self, x, adj):
+        # x 形状: [B, T, N, C]
+        # adj 形状: [N, N]
+        B, T, N, C = x.shape
+        assert adj.shape == (N, N), f"Adjacency matrix shape mismatch! Expected ({N}, {N}) but got {adj.shape}"
+        
+        # 张量变换: 1. 节点特征映射 (Feature Projection)
+        # [B, T, N, C] @ [C, F] -> [B, T, N, F]
+        support = torch.matmul(x, self.weight)
+        
+        # 张量变换: 2. 图物理结构信息传播 (Graph Message Passing)
+        # adj: [N, N], support: [B, T, N, F] -> out: [B, T, N, F]
+        out = torch.einsum('nm,btmf->btnf', adj, support)
+        
+        return out + self.bias
+
+class TemporalEmbedding(nn.Module):
+    """
+    时间周期特征编码器 (Temporal Periodicity Encoder)
+    """
     def __init__(self, d_model):
         super().__init__()
-        self.qkv = nn.Linear(d_model, d_model * 3)
-        self.proj = nn.Linear(d_model, d_model)
+        # 取 时间戳(TOD) 和 星期(DOW) 2个维度
+        self.time_proj = nn.Linear(2, d_model)
         
-    def forward(self, x):
-        # x: [B, T, N, C]
-        B, T, N, C = x.shape
-        # [B, T, N, C] -> [B, T, N, 3C]
-        qkv = self.qkv(x) 
-        q, k, v = qkv.chunk(3, dim=-1)
-        
-        # Spatial Attention: 混合 N 维度关联
-        # q: [B, T, N, C], k: [B, T, N, C] -> [B, T, N, N]
-        attn = torch.einsum('btnd,btmd->btnm', q, k) / (C ** 0.5)
-        attn = torch.softmax(attn, dim=-1)
-        
-        # [B, T, N, N] * [B, T, N, C] -> [B, T, N, C]
-        out = torch.einsum('btnm,btmd->btnd', attn, v)
-        return x + self.proj(out)
+    def forward(self, time_features):
+        # 张量变换: [B, T, N, 2] -> [B, T, N, d_model]
+        return self.time_proj(time_features)
 
 class AutoResearchModel(nn.Module):
     def __init__(self, in_channels=3, num_nodes=307, seq_in=12, seq_out=12):
         super().__init__()
-        self.d_model = 16 # 使用较小维度以保证内存与计算效率
-        # 外部架构探索 (External Architecture Exploration)
-        self.input_proj = nn.Linear(in_channels, self.d_model)
-        self.spatial_attn = SpatialAttention(self.d_model)
+        self.d_model = 16 # 使用较小维度以保证内存与计算效率 (Occam's Razor)
+        
+        # 将原始交通流与时间分布特征分流提取
+        self.flow_proj = nn.Linear(1, self.d_model)
+        self.time_emb = TemporalEmbedding(self.d_model)
+        
+        # 引入物理空间先验，废除无规律的全局互相关
+        self.gcn = GraphConvolution(self.d_model, self.d_model)
         self.norm = nn.LayerNorm(self.d_model)
         
-        # 模型主体被嵌套，核心使用放大特征维度的 LNN
+        # 维持底层液态神经网络 (LNN) 接稳信号
         self.core = SpatioTemporalModule(self.d_model, 1, num_nodes, seq_in, seq_out)
         
-    def forward(self, x):
-        # x: [B, T_in, N, C_in]
-        x_proj = self.input_proj(x)
-        x_attn = self.spatial_attn(x_proj)
-        x_norm = self.norm(x_attn)
-        return self.core(x_norm)
+    def forward(self, x, adj):
+        # 强制性防御形状验证
+        B, T_in, N, C = x.shape
+        assert C >= 3, f"Shape Mismatch: Models expects Flow, TOD, DOW, got {C} features!"
+        
+        # 张量切片分离属性 (Feature Defusing)
+        flow_feat = x[..., 0:1] # [B, T_in, N, 1]
+        time_feat = x[..., 1:3] # [B, T_in, N, 2]
+        
+        # 张量映射与融合 (Embedding & Add Fusion)
+        h_flow = self.flow_proj(flow_feat) # [B, T, N, d_model]
+        h_time = self.time_emb(time_feat)  # [B, T, N, d_model]
+        
+        # 融合周期相位特征
+        h_fuse = h_flow + h_time 
+        
+        # 利用 Graph 物理邻接矩阵 A 扩散拓扑属性
+        h_graph = torch.relu(self.gcn(h_fuse, adj))
+        h_norm = self.norm(h_graph)
+        
+        # 移交具有时空完备洞察的信号矩阵给下游动态 LNN 层
+        return self.core(h_norm)
 
 # ---------------------------------------------------------------------------
 # 工具与日志生成 (Utilities & Logging)
@@ -138,8 +177,47 @@ def generate_progress_plot(tsv_path="results.tsv", out_path="progress.png"):
         if len(valid_df) == 0:
             return
             
-        plt.figure(figsize=(10, 5))
-        plt.plot(range(len(valid_df)), valid_df['val_mae'], marker='o', linestyle='-', color='indigo', linewidth=2, label='AutoResearch Model')
+        plt.figure(figsize=(12, 6))
+        y_vals = valid_df['val_mae'].values
+        x_vals = range(len(valid_df))
+        plt.plot(x_vals, y_vals, marker='o', linestyle='-', color='indigo', linewidth=2, label='AutoResearch Model')
+        
+        # 读取并在显著提升点绘制架构进化反思气泡 (Evolution Roadmap Annotations)
+        log_path = "evolution_log.jsonl"
+        evolution_data = {}
+        if os.path.exists(log_path):
+            import json
+            with open(log_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            record = json.loads(line)
+                            evolution_data[record.get("commit", "")] = record
+                        except:
+                            pass
+                            
+        for i in range(1, len(valid_df)):
+            prev_mae = y_vals[i-1]
+            curr_mae = y_vals[i]
+            commit_id = str(valid_df.iloc[i]['commit'])
+            
+            # 如果此轮下降具有显著意义 (例如 MAE 下滑 > 1%)，提取反思绘制科技树气泡
+            if prev_mae > 0 and (prev_mae - curr_mae) / prev_mae > 0.01:
+                bubble_text = f"MAE: {curr_mae:.2f}"
+                if commit_id in evolution_data:
+                    mut_info = evolution_data[commit_id]
+                    op = mut_info.get("操作类型", "")
+                    if op:
+                        bubble_text += f"\n[{op}]"
+                        
+                plt.annotate(
+                    bubble_text,
+                    xy=(i, curr_mae),
+                    xytext=(i, curr_mae + (prev_mae - curr_mae) * 0.5 + 0.5), # 悬浮在点上方
+                    arrowprops=dict(facecolor='gray', shrink=0.05, width=1, headwidth=5, alpha=0.6),
+                    bbox=dict(boxstyle="round,pad=0.4", fc="#FFF9C4", ec="#FBC02D", lw=1.5, alpha=0.9),
+                    fontsize=8, zorder=10, ha='center'
+                )
         
         # 将用户选取的 Baselines 以虚线水平绘制
         colors = ['r', 'g', 'c', 'orange', 'm']
@@ -210,6 +288,15 @@ def main():
     # 调用提前编译的数据模块 (Invoke dataloader)
     train_loader = load_data("train", BATCH_SIZE, device)
     
+    # 挂载预计算的物理图空间先验邻接矩阵 (Mount Spatial Graph Prior Adjacency)
+    adj_path = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch", DATASET.lower(), "adj.npy")
+    if os.path.exists(adj_path):
+        import numpy as np
+        adj_matrix = torch.from_numpy(np.load(adj_path)).to(device)
+    else:
+        print("警告: 缺失物理图缓存！使用单位阵占位验证防御性代码。")
+        adj_matrix = torch.eye(num_nodes).to(device)
+        
     total_training_time = 0.0
     global_step = 0
     t_start = time.time()
@@ -226,19 +313,19 @@ def main():
             # 引入通用防御性编程混合精度架构 (Defensive Mix Precision)
             if use_amp_cuda:
                 with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    preds = model(x)
+                    preds = model(x, adj_matrix)
                     loss = criterion(preds.float(), y)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             elif use_amp_mps:
                 with torch.amp.autocast(device_type='mps', dtype=torch.bfloat16):
-                    preds = model(x)
+                    preds = model(x, adj_matrix)
                     loss = criterion(preds.float(), y)
                 loss.backward()
                 optimizer.step()
             else:
-                preds = model(x)
+                preds = model(x, adj_matrix)
                 loss = criterion(preds, y)
                 loss.backward()
                 optimizer.step()
@@ -266,7 +353,7 @@ def main():
     print("\n--- 训练进程关闭 (Training Closed), 启动验证 (Commencing Verification) ---")
     
     # 评测验证集表现获取绝对客观的指标反馈
-    val_mae, val_rmse = evaluate_mae(model, BATCH_SIZE, device)
+    val_mae, val_rmse = evaluate_mae(model, BATCH_SIZE, device, adj_matrix=adj_matrix)
     
     peak_vram_mb = 0.0
     if device.type == 'cuda':

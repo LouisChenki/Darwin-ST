@@ -74,13 +74,27 @@ def generate_dataset(data, seq_len_in, seq_len_out):
     """
     total_len = data.shape[0]
     num_samples = total_len - seq_len_in - seq_len_out + 1
+    N = data.shape[1]
     
-    X = np.zeros((num_samples, seq_len_in, data.shape[1], data.shape[2]), dtype=np.float32)
-    Y = np.zeros((num_samples, seq_len_out, data.shape[1]), dtype=np.float32)
+    # 构建绝对确定性的时间周期特征 (Construct deterministic Time-Of-Day / Day-Of-Week)
+    # 假设 PeMS 标准数据为 5 分钟采样率 (288 steps/day)
+    time_ind = np.arange(total_len)
+    tod = (time_ind % 288) / 288.0
+    dow = ((time_ind // 288) % 7) / 7.0
+    
+    # X 将包含 3 个通道: Flow, TOD, DOW
+    X = np.zeros((num_samples, seq_len_in, N, 3), dtype=np.float32)
+    Y = np.zeros((num_samples, seq_len_out, N), dtype=np.float32)
     
     for i in range(num_samples):
-        X[i] = data[i: i + seq_len_in]
-        # 只取特征维度第一维 (Flow) 作为目标标签
+        # 通道 0: 核心交通流量 (Flow)
+        X[i, :, :, 0] = data[i: i + seq_len_in, :, 0]
+        # 通道 1: 空间共享的 日周期特征 (Time-of-Day)
+        X[i, :, :, 1] = np.tile(tod[i: i + seq_len_in].reshape(-1, 1), (1, N))
+        # 通道 2: 空间共享的 周周期特征 (Day-of-Week)
+        X[i, :, :, 2] = np.tile(dow[i: i + seq_len_in].reshape(-1, 1), (1, N))
+        
+        # 目标只需预测未来时刻的 Flow
         Y[i] = data[i + seq_len_in: i + seq_len_in + seq_len_out, :, 0]
         
     return X, Y
@@ -110,6 +124,29 @@ def process_and_save():
     
     train_x, train_y = X[:train_steps], Y[:train_steps]
     val_x, val_y = X[train_steps:train_steps+val_steps], Y[train_steps:train_steps+val_steps]
+    
+    # =========================================================================
+    # 生成物理图先验邻接矩阵 (Generate Empirical Graph Spatial Prior)
+    # 我们利用高置信度的训练集交通流，基于皮尔逊相关性 (Pearson) 构造动态图拓扑连接
+    # =========================================================================
+    print("正在推证空间邻接矩阵 (Generating Graph Spatial Adjacency Matrix)...")
+    # 把 [Samples, T_in, N, 1] 压平至 [Total_Steps, N]
+    train_flow_2d = train_x[..., 0].transpose(0, 1, 2).reshape(-1, num_nodes)
+    corr_matrix = np.corrcoef(train_flow_2d, rowvar=False)  # 产出维度: [N, N]
+    
+    # 过滤微弱边，设立硬阈值，只保留强烈的相关邻接作为边
+    adj = np.where(corr_matrix > 0.4, corr_matrix, 0.0)
+    np.fill_diagonal(adj, 1.0) # 加上自身信息增强自环 (Self-loop)
+    
+    # 拉普拉斯归一化处理 (Normalized Laplacian Transform) -> D^{-1/2} * A * D^{-1/2}
+    degree = np.sum(adj, axis=1)
+    d_inv_sqrt = np.power(degree, -0.5)
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
+    d_mat_inv_sqrt = np.diag(d_inv_sqrt)
+    norm_adj = d_mat_inv_sqrt.dot(adj).dot(d_mat_inv_sqrt)
+    
+    np.save(os.path.join(DATA_DIR, "adj.npy"), norm_adj.astype(np.float32))
+    # =========================================================================
     
     # Z-Score 归一化 (Standardization) -> 为了防止数据泄露，仅依训练集标准差进行归一化
     mean = train_x[..., 0].mean()
@@ -173,7 +210,7 @@ def get_scaler():
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_mae(model, batch_size, device="cpu"):
+def evaluate_mae(model, batch_size, device="cpu", adj_matrix=None):
     """
     在验证集上度量系统的 平均绝对误差 (Mean Absolute Error, MAE) 与均方根误差 (RMSE)。
     这是智能体进化的考核指标，极度客观。要求输出形状适配 [B, T_out, Nodes]。
@@ -193,7 +230,10 @@ def evaluate_mae(model, batch_size, device="cpu"):
         x, y = x.to(device), y.to(device)
         
         # 前向传播 (Forward Propagation)
-        preds = model(x)
+        if adj_matrix is not None:
+            preds = model(x, adj_matrix)
+        else:
+            preds = model(x)
         
         if torch.isnan(preds).any():
             return float('inf'), float('inf')

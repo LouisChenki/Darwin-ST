@@ -11,9 +11,12 @@ The agent will iteratively modify `train.py`, run experiments for a specified ti
 3. **奥卡姆剃刀原则 (Occam's Razor)**: In cases where the validation error (`val_mae`) is similar or only negligibly different, you MUST prioritize maintaining the simplest, most computationally efficient code branch.
 
 ### 🧬 时空架构演化法则 (ST-Architecture Evolution Rules)
-这是你进行网络突变 (Mutation) 时必须遵循的领域直觉：
-- **空间关系约束 (Spatial Topology Prior)**: You are highly discouraged from violently flattening spatial nodes (e.g., `[B, T_in, N, C] -> [B, T_in, N*C]`). This completely obliterates the fundamental physical spatial topology of traffic nodes.
-- **强制进化方向 (Mandatory Evolution Direction)**: In the iterative evolution loops, you MUST attempt to **preserve the node dimension `N`**. You should actively explore introducing Graph Convolutional Networks (GCN), Graph Attention Networks (GAT), Spatio-Temporal Synchronous Convolutions, or independent Per-Node Processing fusion mechanisms to enable the model to naturally comprehend spatial adjacency relationships!
+You are now operating as a Senior GeoAI Architect. This is the **Supreme Constitution** for your network mutations. You must fiercely and strictly adhere to these domain intuitions:
+
+- **🌌 强制空间依赖感知 (Mandatory Spatial Dependency Prior)**
+  - **物理拓扑神圣不可侵犯 (Sacred Topology)**: You are **ABSOLUTELY FORBIDDEN** from violently flattening the spatial node dimension (e.g., `[B, T_in, N, C] -> [B, T_in, N*C]`) and projecting it through naive Pure-MLP networks. This is an architectural sin that completely obliterates the physical traffic topology matrix.
+  - **深度拥抱图信息传递 (Embrace Graph Message Passing)**: `prepare.py` is actively supplying you with an empirical Physical Adjacency Matrix (`adj.npy`). You **MUST** relentlessly explore how to optimally embed and utilize this topological prior. Your mutation branches should organically evolve and design deeper **Graph Convolutional Networks (GCN)**, **Spatial-Temporal Attention Mechanisms (GAT/Transformers)**, **Diffusion Convolutions**, or **Topology-Aware Fusion Layers**!
+  - **地理关联共振 (Geographical Correlation)**: Your ultimate meta-goal is to force the neural pathways to inherently comprehend the geographic ripple effects and spatial relationships between adjacent flow sensors, rather than blindly memorizing isolated time-series curves.
 
 ## Phase 1: Setup & Initialization (交互式预启动)
 
@@ -66,5 +69,11 @@ After every single run, log it to `results.tsv` (tab-separated):
 commit	val_mae	val_rmse	peak_vram_mb	status	description
 ```
 
+**MANDATORY MUTATION REFLECTION**: If your mutation results in a successful `keep` (i.e. MAE improves), you MUST append a structured JSON reflection to a new file named `evolution_log.jsonl` (JSON lines formatted). This log meticulously tracks the scientific evolution of the architecture. Format MUST be exactly:
+```json
+{"commit": "<commit_hash>", "操作类型": "Your core architectural change short name", "科学假设": "Why you thought it would work physically/mathematically", "结果结论": "The precise metric improvement"}
+```
+
 **MANDATORY OUTPUT**: You MUST write code in `train.py` or a helper script that, at the end of every successful loop, generates a data visualization plot `progress.png`. 
-**Horizontal Comparators**: This plot MUST read from `baseline_registry.py` and draw perfectly horizontal dashed lines representing the `val_mae` limits of the user-selected Baselines on the plot background. Watch your actual model curve trace down and aggressively intersect with these fixed literature-bound targets!
+**Horizontal Comparators**: This plot MUST read from `baseline_registry.py` and draw perfectly horizontal dashed lines representing the `val_mae` limits of the user-selected Baselines on the plot background.
+**Explainable Evolution Roadmap**: The plotting logic MUST read the reflections from `evolution_log.jsonl` and attach beautiful floating annotations (text bubbles) pointing to the iteration nodes on the curve where significant performance leaps occurred! Translate the dull descent line into a rich "Architecture Tech Tree" tracking history.
