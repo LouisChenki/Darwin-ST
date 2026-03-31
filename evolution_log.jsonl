@@ -1,1 +1,3 @@
 {"commit": "5c04ea1", "操作类型": "V4 Base: LNN+GCN+Time", "val_mae": 22.1720}
+{"commit": "6d067ae", "操作类型": "Deep Res-GCN (Oversmoothing)", "val_mae": 22.7434}
+{"commit": "235623d", "操作类型": "TCN Local Smoothing", "val_mae": 21.8962}

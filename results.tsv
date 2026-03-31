@@ -1,2 +1,4 @@
 commit	val_mae	val_rmse	peak_vram_mb	status	description
 5c04ea1	22.1720	38.4681	1122.9	baseline	V4 Base: LNN+GCN+TemporalEmbedding (+8.00% vs DCRNN)
+6d067ae	22.7434	37.5440	1138.9	improved	Deep Res-GCN+LNN (+5.63% vs DCRNN, Slight Oversmoothing)
+235623d	21.8962	38.1695	1132.0	sota	TCN-GCN-LNN (+9.14% vs DCRNN)
