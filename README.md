@@ -1,92 +1,90 @@
-# autoresearch
+# AutoResearch: Spatio-Temporal Edition
 
-![teaser](progress.png)
 
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
+这是一个旨在让 AI 智能体自主进行时空神经网络（Spatio-Temporal Neural Networks，例如交通流预测）自动深度学习研究的实验性项目。
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
+核心思想：给予 AI 智能体一个针对时空序列预测的训练框架，让它彻夜自主实验。智能体会自动修改 `train.py` 中的网络架构、引入新的机制（如液态神经网络 LNN、因果时空注意力等），在固定的 **15分钟时间预算** 内进行模型训练，对比验证集表现，保留提升的实验并丢弃失败的尝试，不断循环。这个过程将使得时空神经网络自动进化，自动突破现有的经典基线（Baseline）模型。
 
-## How it works
+## 核心特性 (Key Features)
 
-The repo is deliberately kept small and only really has three files that matter:
+- **时空交通流基准对齐**: 内置对标四大主流数据集（PeMS04, PeMS08, METR-LA, PEMS-BAY）和四种经典模型基准线 (ARIMA, DCRNN, ST-Transformer, UniST)。以突破靶场基线作为最高目标。
+- **15分钟严格训练预算**: 每次架构迭代必须在 15 分钟内完成，确保所有创新的迭代都能在这种极不平衡的快速节奏中接受公平考验，并在最后输出绝对客观的 `val_mae` 指标反馈。
+- **硬件级加速 (Apple M4 Max)**: 脚本级深度优化统一内存操作（Pin Memory）与底层显存调用，支持 Apple MPS 平台及常见 GPU 架构。在推理级采用混合精度预设方案预防梯度饥饿。
+- **创新点保护区 (Innovation Protected Zone)**: 强制保护人类指定的最新架构机制，在此基础上扩展特征融合探索。随后的架构变异不改变基座逻辑，避免发生灾难性遗忘。
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+## 文件结构 (Project Structure)
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+项目主要由三个核心文件组成：
 
-If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+- **`prepare.py`** — 数据预处理及评估工具。负责下载时空交通流数据集 (npz 格式)、构建基于滑动窗口 (`seq_len=12`) 的训练数据，并提供客观唯一的 MAE/RMSE 官方度量手段。(不被 AI 智能体修改)
+- **`train.py`** — 包含神经网络的主体架构、优化器定义和训练循环，智能体将主要在这个文件中不断迭代与魔改，这是唯一一个经过智能体无数自我变异打磨的竞技场。(由 AI 智能体修改)
+- **`program.md`** — 智能体运行的全局系统提示词与进化准则 (System Prompt & Rulebook)。定义了严格的张量维度追踪与防御性编程纪律。(由人类研究员修改和配置)
 
-## Quick start
+辅助支持组件：
+- **`baseline_registry.py`** — 基线指标测算库，记录 SOTA 模型的官方指标数据标尺。
+- **`results.tsv`** & **`progress.png`** — 自动演化日志记录以及动态可视化的指标衰减进展图。
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+## 智能体演化能力展示 (Agent Evolution Capability Demonstration)
+
+随着自动实验循环的推进，智能体会自主记录并绘制每一个被 `keep` 的变异架构的性能轨迹。如下方的 `progress.png` 所示，图表不仅直观展现了随着实验世代的收敛，预测绝对误差逐渐逼近最优的过程；同时它也将客观比对其与用户选定的顶级学术基准线（如 ARIMA, DCRNN 等），为您的自动科研提供一目了然的标尺：
+
+![Agent Validation Progress](progress.png)
+
+## 快速开始 (Quick Start)
+
+**环境与硬件要求 (Requirements):** Python 3.10+, 推荐使用 [uv](https://docs.astral.sh/uv/)。测试环境最佳支持 Apple MPS 硬件加速架构，亦兼容普通独立 GPU。
 
 ```bash
-
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Install dependencies
+# 1. 初始化并安装依赖库 (Install dependencies)
 uv sync
 
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
+# 2. 选择数据集，准备并在本地预处理数据 (Download & preprocess data)
+# 数据集支持: PeMS04, PeMS08, METR-LA, PEMS-BAY
+DATASET=PeMS04 uv run prepare.py
 
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+# 3. 手动进行一次基座训练验证 (~15分钟预算)
+DATASET=PeMS04 uv run train.py
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+## 开启自主研究模式 (Autonomous Experimentation Mode)
 
-## Running the agent
+### 工作流程图 (Agent Workflow)
 
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+以下展现了 AutoResearch 智能体从接受初始化指令到进入自主突变循环的完整工作流：
 
+```mermaid
+graph TD
+    A[人类输入: 核心创新点、数据集、目标基线] -->|系统唤醒| B(Phase 1: 指令解析与环境对齐)
+    B --> C[构建包含 '创新点保护区' 的初始 train.py]
+    C --> D{人类确认识别与允许?}
+    D -- 否 (修改提示词) --> A
+    D -- 是 (开始放权) --> E[Phase 2: 进入自动化研究循环]
+
+    subgraph 15分钟快速进化周期 (15-Min Evolution Loop)
+        E --> F[智能体变异: 修改网络架构、通道数、融合机制]
+        F --> G[基于 M4 Max / GPU 执行 15 分钟预算内训练]
+        G --> H{客观验证: 验证集 MAE 是否下降?}
+        H -- 成功 (Keep) --> I[保留代码, 记录 results.tsv, 绘制 progress.png]
+        H -- 失败 (Discard) --> J[丢弃本次修改, 代码回滚至上一极值态]
+        I --> F
+        J --> F
+    end
+    
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style E fill:#bbf,stroke:#333,stroke-width:2px
+    style I fill:#dfd,stroke:#333,stroke-width:2px
+    style J fill:#fdd,stroke:#333,stroke-width:2px
 ```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
-```
 
-The `program.md` file is essentially a super lightweight "skill".
+加载您最习惯的代码 Agent 插件，如 Claude 智能体、Cursor，或任意支持本地文件读写的 AutoResearch 终端，在当前根目录下发起系统唤醒交互：
 
-## Project structure
+> "请阅读 `program.md` 文件中的指令模板，我想引入『液态时空神经网络』机制到 `PeMS04` 数据集上，对比基线设为 `DCRNN`，开始 Phase 1 的初始化！"
 
-```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
-```
+接下来智能体会自动执行：
+1. 分析核心需求并基于 `train.py` 搭建出处于 "**创新点保护区**" 的初始探索基础架构。
+2. 约束参数体量，确保其与目标基线（如 DCRNN）的网络复杂度对比处在同一合理的量级内。
+3. 获取您的人为确认许可后，进入无限循环的超高速自动演进（Phase 2），记录实验 `commit` 日志，绘制验证损失对抗基线的 `progress.png` 轨迹。您只需在一夜之后验收架构的突变结果。
 
-## Design choices
+## 许可证 (License)
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
-
-## Platform support
-
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
-
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
-
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
-
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
-
-## Notable forks
-
-- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
-- [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
-- [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
-- [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
-
-## License
-
-MIT
+MIT License. 基于原始 `nanochat-autoresearch` 重构用于特定的重度专业向时空网络预测场景。
