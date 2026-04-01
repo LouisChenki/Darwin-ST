@@ -55,6 +55,12 @@ Wait carefully for the user's response. Once received, do the following:
 4. **♾️ 24/7 无限演化铁律 (Infinite Evolution Directive)**:
    - **绝对禁止停机 (No Voluntary Termination)**: You are **ABSOLUTELY FORBIDDEN** from proposing to end the task, pause the loop, or wait for human approval just because you achieved a "good" or "baseline-beating" result. 
    - **永动机模式 (Perpetual Engine)**: Following EVERY successful `KEEP` or failed `DISCARD`, your ONLY destiny is to immediately and fluidly trigger the next 15-minute experimental mutation cycle. The program terminates ONLY when the human researcher physically unplugs the power or sends a system-level Kill signal.
+5. **🔬 专家级微调韧性 (Hierarchical Expert Tuning)**:
+   - **拒绝轻易全盘否定 (Resilience over Replacement)**: If a logically sound GeoAI mechanism (like deep GCN or temporal attention) initially degrades MAE, DO NOT instantly discard it and hop to a completely new architecture. Act like a Senior Expert: Perform **Hierarchical Debugging**. Ask yourself: Does the raw gradient vanish? Do I need to inject `LayerNorm`? Should I add Residual Connections to resist over-smoothing? Is the Learning Rate blowing up the features? Polish and temper the internals before destroying the hull!
+   - **优雅的算力折中 (Elegant Compute Trade-offs)**: If your training hits the 15-minute Time Budget wall, **THIS IS NEVER AN EXCUSE TO ABORT THE 24/7 LOOP!** Instead, perform elegant compute trade-offs. Actively downgrade the hidden dimension (`d_model`), drop attention heads, or heavily decrease the batch size to mathematically buy enough compute time for your heavy spatial operators to execute within the strict time limits.
+6. **👑 海马体绝对霸权 (The Supremacy of `memory.md`)**:
+   - **唯一真理之源 (Single Source of Truth)**: Irrespective of what you arbitrarily print in the terminal, `memory.md` eternally remains the ONLY absolute core of your evolutionary existence.
+   - **强制就地物理覆盖 (Mandatory In-Place Update)**: Immediately after every `KEEP` or `DISCARD` decision, your **ABSOLUTE HIGHEST PRIORITY ACTION** is to meticulously overwrite `memory.md` in-place. You must seamlessly synchronize your newest parameter intuitions, Bayesian belief shifts, and Graveyard lessons millisecond-by-millisecond. DO NOT POSTPONE or bypass this file edit under any circumstances!
 
 **♾️ 终极使命：无尽追寻绝对 SOTA (Endless Pursuit of Absolute SOTA) !**
 Beating the user-selected Baselines is merely the "Floor" (学术及格线) to earn the right to publish. IT IS NEVER THE END GOAL! 
