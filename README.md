@@ -60,31 +60,31 @@ This branch contains a fully evolved SOTA model on the `PeMS04` dataset, success
 ### Architecture Topology
 ```mermaid
 graph TD
-    %% 数据输入与特征离析
-    X[/"输入张量: [B, T_in, N, C]"/] --> Split
-    Split -- 交通流监控特征 (0维度) --> Flow["Flow Proj: Mapped to d_model"]
-    Split -- 周期时间上下文 (1,2维度) --> Time["Time Emb: Temporal Periodicity"]
+    %% Data Input and Feature Separation
+    X[/"Input Tensor: [B, T_in, N, C]"/] --> Split
+    Split -- Traffic Flow Feature (Dim 0) --> Flow["Flow Proj: Mapped to d_model"]
+    Split -- Temporal Context (Dims 1,2) --> Time["Time Emb: Temporal Periodicity"]
     Flow --> Fuse((Add Fusion))
     Time --> Fuse
     
-    %% 时间维度短接特征平滑
-    subgraph MutatedZone["自动变异寻优区 (Agent Free Exploration Zone)"]
-        Fuse --> TCN["TemporalMixer: 1D 因果卷积扩充时域感受野"]
+    %% Temporal Shortcut and Local Smoothing
+    subgraph MutatedZone["Agent Free Exploration Zone"]
+        Fuse --> TCN["TemporalMixer: 1D Causal Conv (Expanded Temporal Receptive Field)"]
         TCN --> Add1(("Add Res"))
         Fuse --> Add1
-        Add1 --> GCN["Graph Convolution: 结合物理拓扑邻接矩阵 A"]
+        Add1 --> GCN["Graph Convolution: Physical Adjacency Matrix A"]
         GCN --> ReLU("ReLU Activation")
-        ReLU --> LN["LayerNorm: 稳定变异区输出协方差"]
+        ReLU --> LN["LayerNorm: Stabilize Output Covariance"]
     end
     
-    %% 坚守创新底座 - O.D.E. 特性解算
-    subgraph ProtectedZone["创新保护基座 (Innovation Protected Zone - LNN)"]
-        LN --> LNN["LiquidTimeConstantNode: 连续时间流体常数 ODE 隐层计算流"]
-        LNN -- 沿着输入 T_in 序列循环迭代 --> LNN
-        LNN -.-> G["Hidden State 导出"]
+    %% Fixed ODE Backbone
+    subgraph ProtectedZone["Innovation Protected Zone - LNN"]
+        LN --> LNN["LiquidTimeConstantNode: Continuous-time ODE Hidden Computations"]
+        LNN -- Recurrent Iteration over T_in --> LNN
+        LNN -.-> G["Export Hidden State"]
     end
     
-    G --> Out["全连接预测层 Linear: 输出目标维度预测 [B, T_out, N]"]
+    G --> Out["Fully-Connected Linear: Target Prediction [B, T_out, N]"]
 ```
 
 ---
