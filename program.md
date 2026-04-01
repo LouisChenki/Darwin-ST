@@ -39,17 +39,19 @@ Wait carefully for the user's response. Once received, do the following:
 4. **强制物理隔离与创建版本库 (Enforce Git Isolation)**: As your VERY FIRST terminal action, execute `git checkout -b <branch_name>`.
    - If the user wrote "自动生成" (auto-generate), engineer a highly readable English branch name based on the core innovation.
    - You MUST ensure the terminal successfully switches to this new branch. ONLY after confirming Git branch creation/switching is successful, initialize `results.tsv`.
-   - **🚀 无缝衔接全自动炼丹 (Seamless Autonomous Transition)**: Once the initial `train.py` and environment are set up, **DO NOT STOP to ask for human permission!** You must IMMEDIATELY and AUTONOMOUSLY transition into Phase 2's experimentation loop. The human has completely handed over the control of the research lab to you. Operate 24/7 unattended!
+5. **构建先验定锚 (Establish Domain Priors)**: Before transitioning, you MUST execute a quick Python script to query `baseline_registry.py` for all baseline MAEs of the target dataset. Write these baseline metrics at the very top of `memory.md` under **"🎯 领域先验 (Domain Priors)"**. Explicitly declare that any architecture producing an MAE disastrously outside this academic range is merely an "未达标的实验性信念 (Unqualified Experimental Belief)" and is absolutely forbidden from entering the SOTA DNA.
+6. **🚀 无缝衔接全自动炼丹 (Seamless Autonomous Transition)**: Once the initial code, environment, and Bayesian memories are set up, **DO NOT STOP to ask for human permission!** You must IMMEDIATELY and AUTONOMOUSLY transition into Phase 2's experimentation loop. The human has completely handed over the control of the research lab to you. Operate 24/7 unattended!
 
 ## Phase 2: The Autonomous Experimentation Loop
 
-**🧠 核心工作流：读写海马体 (Read-Write Hippocampus)**
-1. **先读后写 (Read Before Mutation)**: **Starting ONLY from the first evolutionary mutation of Phase 2**, before EVERY single subsequent modification on `train.py`, you MUST read `memory.md`. Comprehend the `SOTA DNA` (current champion architecture) and completely avoid repeating the fatal mistakes indexed in `The Graveyard`. (Reminder: Do NOT read `memory.md` during Phase 1 Initialization).
+**🧠 贝叶斯核心工作流：读写海马体 (Bayesian Read-Write Hippocampus)**
+1. **先验检索 (Read Before Mutation)**: **Starting ONLY from the first evolutionary mutation of Phase 2**, before EVERY single subsequent modification on `train.py`, you MUST read `memory.md`. Comprehend the `High-Confidence Components` (SOTA DNA) and entirely dodge the fatal hypotheses located in `The Graveyard`. (Reminder: Do NOT read `memory.md` during Phase 1 Initialization).
+   - **连续演化论 (Continuous Evolution Comments)**: When modifying `train.py`, your code comments MUST explicitly state the Bayesian belief update directing your hypothesis. (e.g., `# 假设更新: 基于先验空间聚集性，增加对 GCN 核的信心 (Belief Update: Increased confidence in GCN kernel based on spatial prior)`).
 2. **执行实验 (Execute Experiment)**: Launch the script via `python3 train.py`. The training script MUST run and cleanly terminate within a **fixed time budget of 15 minutes** (wall clock training time).
-3. **软性保护与增量反思 (Soft Preservation & Reflective Update)**:
-   - **成功突围 (KEEP)**: If `val_mae` improves over the current Best, you successfully bred a SOTA model! You MUST append the structured reflection to `evolution_log.jsonl` AND proactively edit `memory.md` -> updating `SOTA DNA` and `Elastic Parameter Insights` with your winning mechanisms.
-   - **实验爆炸 (DISCARD)**: If the Loss explodes, Shape Mismatch occurs, or MAE significantly regresses, you MUST document the failure etiology in `memory.md` -> `The Graveyard` BEFORE you revert/discard the code. Instruct your future self exactly WHY the architectural hypothesis crashed.
-   - You possess the utmost freedom to modify ANY component in `train.py`. However, if you opt to drastically rip out a module currently anchored in the `SOTA DNA` of `memory.md`, you must physically and mathematically justify this "hard-fork" in your reflection logs.
+3. **贝叶斯后验反思 (Bayesian Posterior Update)**:
+   - **似然性评估 (Likelihood Check)**: Before blindly keeping a model, contrast its `val_mae` against the "🎯 Domain Priors" in `memory.md`. If the error is vastly inferior to the worst baseline, it is a failed hypotheses. Record the failure etiology in `The Graveyard` and DO NOT pollute the core DNA.
+   - **后验更新 (Posterior Update - KEEP)**: If `val_mae` demonstrates a statistically significant improvement and securely hits the domain prior benchmarks, you successfully reinforced a scientific belief! Append the structured reflection to `evolution_log.jsonl` AND proactively edit `memory.md` -> updating `核心基因 (High-Confidence Components)` and `参数先验区间 (Parameter Ranges)` with your conquering mechanisms.
+   - **拒绝硬锁死 (Soft Preservation)**: You possess the utmost freedom to modify ANY component in `train.py`. However, if you rip out a module currently anchored as a High-Confidence constituent, you must physically and mathematically justify this "belief shift" in your reflection logs.
 
 **The Goal: Penetrate the Baselines (超越靶场基线) !**
 Your prime objective is not just to minimize `val_mae`. It is to push `val_mae` below the horizontal dashed line of the toughest User-Selected Baseline. You must evaluate **"Relative Improvement"** over the baseline.
