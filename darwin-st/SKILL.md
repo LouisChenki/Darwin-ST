@@ -42,6 +42,7 @@ Agent 将利用迭代、试错、贝叶斯记忆的方式自主修改 `train.py`
 
 1. **读取海马体先验**: 每次修改 `train.py` 之前，必须读取当前目录下的 `memory.md`。充分理解当前记录在 DNA（High-Confidence Components）里的 SOTA 基因，并绕开失败墓地（The Graveyard）里的死路。同时遵循 `references/architecture-rules.md`。
 2. **执行并计时突变**: 运行修改后的 `python3 train.py`。该脚本必须受限于 15 分钟的墙上时钟计算限额。
+   - **⚠️ NaN 熔断机制**: 在运行过程中，你必须持续监控输出日志。如果发现在前几个 Epoch 就出现 `Loss=nan` 或 `Val MAE=inf`，**这代表网络已发生灾难性浮点数溢出**，你必须**立即中断该进程**（绝不能干等其跑完），直接进入失败后验逻辑 (DISCARD)，节约算力并进入下一次修正。
 3. **贝叶斯后验反思**:
    - `train.py` 执行完毕后，将其最终的 `val_mae` 与 `memory.md` 的领域先验对照。
    - 如果发生严重崩坏（劣于最差基线），将其死因写入 `The Graveyard`，这被称为一次失败 (DISCARD)。

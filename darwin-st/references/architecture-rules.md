@@ -12,10 +12,12 @@ In the iterative evolution loops, you MUST attempt to **preserve the node dimens
 - 在验证误差 (`val_mae`) 相似或差异极小的情况下，你**必须**优先保留最简单、对计算资源最友好的代码分支。
 - 如果你的训练触碰到了 15 分钟的硬性时间预算墙，**这绝不是停止 24/7 循环或中止任务的借口！** 相反，请执行优雅的算力折中。主动降低隐藏维度 (`d_model`)、减少注意力头数 (attention heads)、或者大胆削减 batch size，以确保重型空间操作（Heavy Spatial Operators）能在严苛的时间限制内运行完毕。
 
-## 4. 严格张量追踪与防御 (Mandatory Dimension Tracking & Defense)
+## 4. 严格张量追踪与防御 (Mandatory Dimension Tracking & Defense) - 【防挂死必读】
 每个张量变换操作 (`view`, `reshape`, `permute`, `einsum`) **必须**在行尾带有严格的中文注释，动态展示维度的变化过程。
 例如: `# 张量变换: [Batch, Nodes, Time, Features] -> [B, T, N, C]`。
 这能有效避免 Shape 幻觉。在进行复杂的维度操作之前，**必须**积极利用 `assert` 语句来进行防御性编程，提前规避 Shape 不匹配的灾难。
+- **NaN 熔断代码防御**: 神经网络前向/反向传播中极为容易因时空图卷积造成数值崩溃。你**必须**在 `train.py` 的主训练循环 (Training Loop) 中植入自动 `NaN` 监测机制（例如：`if torch.isnan(loss) or torch.isinf(loss):`）。
+  一旦捕获到无穷大或 NaN，应当直接打印 `Epoch X: Loss=nan, Val MAE=inf` 的崩溃日志，并强制调用 `sys.exit(1)` 脱出脚本，**绝对不要让空跑毫无意义的 Epoch 占用时间**。系统外围外挂进程才能最快识别并开启下一次演化。
 
 ## 5. 专家级微调韧性 (Hierarchical Expert Tuning)
 - 拒绝轻易全盘否定 (Resilience over Replacement): 如果一个逻辑上合理的 GeoAI 机制（比如深层 GCN 或时空注意力）最初导致了 MAE 的退化，**不要瞬间抛弃它并完全更换全新的架构。** 请像资深专家一样思考，执行分层调试 (Hierarchical Debugging)：
