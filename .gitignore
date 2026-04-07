@@ -25,3 +25,6 @@ results.tsv
 #others
 .DS_Store
 reference/
+
+#Python
+.venv

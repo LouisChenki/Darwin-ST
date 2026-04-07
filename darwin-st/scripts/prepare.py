@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 # 常量设置 (Constants - 固定的时间预算与数据格式)
 # ---------------------------------------------------------------------------
 
-TIME_BUDGET = 900  # 时间预算 (Time Budget) 扩展到 15 分钟
+TIME_BUDGET = 1200  # 时间预算 (Time Budget) 扩展到 20 分钟
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 
 DATASET = os.environ.get("DATASET", "PeMS04")
