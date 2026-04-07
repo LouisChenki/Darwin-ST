@@ -27,7 +27,7 @@ class DarwinSTGraphRAG:
         """
         场景 1: “对症下药” (核心能力)
         Agent 输入当前的数据集类型 (如 Graph)、基准测试名称 (如 PeMS04)，以及遇到的瓶颈关键词 (如 "长时预测")。
-        RAG 返回适用的结构修改建议和超参数代码。
+        RAG 返回适用的结构修改建议和超参数代码。具备软性分词模糊匹配能力。
         """
         cypher = """
         MATCH (d:Dataset)<-[:OBSERVED_IN]-(s:Symptom)<-[:RESOLVES]-(a:Action)-[:BASED_ON]->(c:Concept)
@@ -40,8 +40,15 @@ class DarwinSTGraphRAG:
             params["benchmark_name"] = benchmark_name
         
         if symptom_keyword:
-            cypher += " AND (s.name CONTAINS $keyword OR s.description CONTAINS $keyword)"
-            params["keyword"] = symptom_keyword
+            # 分词器：去掉停用词，只保留长度大于2的单词
+            stop_words = ['and', 'with', 'for', 'the', 'use', 'to', 'of', 'in', 'on', 'a']
+            keywords = [kw.lower() for kw in symptom_keyword.replace('-', ' ').split() if len(kw) > 2 and kw.lower() not in stop_words]
+            if keywords:
+                conditions = []
+                for i, kw in enumerate(keywords):
+                    params[f"kw_{i}"] = kw
+                    conditions.append(f"(toLower(s.name) CONTAINS $kw_{i} OR toLower(s.description) CONTAINS $kw_{i})")
+                cypher += " AND (" + " OR ".join(conditions) + ")"
             
         cypher += """
         RETURN a.name AS Action, a.description AS Mechanism, a.effectiveness AS Effectiveness, 
@@ -53,15 +60,31 @@ class DarwinSTGraphRAG:
     def find_solutions_by_concept(self, concept_id):
         """
         场景 2: “理论验证”
-        Agent 想要尝试一个具体的概念 (如 dynamic_graph_convolution)，想知道在这个概念下，前人是怎么实现并取得什么效果的。
+        具备柔性模糊匹配能力：将长句 concept_id 拆解为短 Token 在图谱中执行正则/包含查询。
         """
         cypher = """
-        MATCH (c:Concept {id: $concept_id})<-[:BASED_ON]-(a:Action)-[:APPLIED_TO]->(d:Dataset)
+        MATCH (c:Concept)<-[:BASED_ON]-(a:Action)-[:APPLIED_TO]->(d:Dataset)
         MATCH (a)-[:RESOLVES]->(s:Symptom)
+        """
+        params = {}
+        stop_words = ['and', 'with', 'for', 'the', 'use', 'to', 'of', 'in', 'on', 'a']
+        keywords = [kw.lower() for kw in concept_id.replace('-', ' ').split() if len(kw) > 2 and kw.lower() not in stop_words]
+        
+        if keywords:
+            conditions = []
+            for i, kw in enumerate(keywords):
+                params[f"kw_{i}"] = kw
+                conditions.append(f"(toLower(c.id) CONTAINS $kw_{i} OR toLower(c.name) CONTAINS $kw_{i})")
+            cypher += " WHERE " + " OR ".join(conditions)
+        else:
+            cypher += " WHERE toLower(c.id) CONTAINS toLower($concept_id)"
+            params["concept_id"] = concept_id
+
+        cypher += """
         RETURN a.name AS Action, a.math_or_code_structure AS Implementation, a.effectiveness AS Effectiveness,
                d.domain AS Domain, s.name AS Solved_Issue
         """
-        return self.query(cypher, {"concept_id": concept_id})
+        return self.query(cypher, params)
 
     def get_anti_patterns(self):
         """
@@ -75,12 +98,27 @@ class DarwinSTGraphRAG:
         """
         return self.query(cypher)
 
+    def get_inspirations(self):
+        """
+        场景 4: “灵感漫游超市” (Primary Drive)
+        不查错误，不验真伪，抛开目的性。无差别地丛图谱里随机抽样返回一批不同的模型构建方法，
+        包含基础机制和顶级架构，供 Agent 自由提取和发散组合。
+        """
+        cypher = """
+        MATCH (c:Concept)<-[:BASED_ON]-(a:Action)
+        WITH c, a, rand() as r
+        ORDER BY r
+        LIMIT 10
+        RETURN c.id AS Methodology_Family, a.name AS Specific_Mechanism, a.description AS How_It_Works, a.effectiveness AS Claimed_Effect
+        """
+        return self.query(cypher)
+
 if __name__ == "__main__":
     import argparse
     import json
     
     parser = argparse.ArgumentParser(description="Darwin-ST Agent GraphRAG Interface")
-    parser.add_argument("--action", type=str, required=True, choices=["diagnose", "verify", "antipatterns"], help="The GraphRAG action to perform.")
+    parser.add_argument("--action", type=str, required=True, choices=["diagnose", "verify", "antipatterns", "inspire"], help="The GraphRAG action to perform.")
     parser.add_argument("--dataset_type", type=str, default="Graph", help="Dataset type (e.g., Graph)")
     parser.add_argument("--benchmark", type=str, help="Optional benchmark name (e.g., PeMS04)")
     parser.add_argument("--symptom", type=str, help="Keyword for the symptom/bottleneck to diagnose")
@@ -102,18 +140,32 @@ if __name__ == "__main__":
             results = rag.find_solutions_by_concept(concept_id=args.concept)
         elif args.action == "antipatterns":
             results = rag.get_anti_patterns()
+        elif args.action == "inspire":
+            results = rag.get_inspirations()
             
         if args.json:
             print(json.dumps(results, ensure_ascii=False, indent=2))
         else:
             if not results:
-                print("未从文献图谱中检索到相关的处方或经验。建议 Agent 依靠自身创造力探索，或拓宽搜索关键词。")
-            for idx, res in enumerate(results):
-                print(f"=== [文献图谱处方 {idx+1}] ===")
-                for k, v in res.items():
-                    if v:
-                        print(f"{k}: {v}")
+                print("未从文献图谱中检索到相关的精准处方或经验。这可能是因为您传入的句子过长，导致无法在图谱中定位具体的概念节点。")
+                print("💡 [GraphRAG 提示]: 请不要灰心！请尝试从您的长句中提取 1~2 个最核心机制单词进行重新查询！")
                 print("-" * 40)
+                try:
+                    hints = rag.query("MATCH (c:Concept) RETURN c.id AS concept_id LIMIT 10")
+                    if hints:
+                        print("👉 知识图谱中存在的【部分学术概念】示例：")
+                        for h in hints:
+                            print(f"   - {h['concept_id']}")
+                except Exception:
+                    pass
+                print("-" * 40)
+            else:
+                for idx, res in enumerate(results):
+                    print(f"=== [文献图谱处方 {idx+1}] ===")
+                    for k, v in res.items():
+                        if v:
+                            print(f"{k}: {v}")
+                    print("-" * 40)
     except Exception as e:
         print(f"GraphRAG Query Error: {str(e)}")
     finally:
