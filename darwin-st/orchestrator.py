@@ -3,10 +3,16 @@ import json
 import time
 import subprocess
 import re
+import sys
 from typing import Annotated, TypedDict, List
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+# Add current file directory to path to ensure config is found, and setup BASE_DIR
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(BASE_DIR)
+
 from config import LLM_BASE_URL, LLM_MODEL_NAME, LLM_API_KEY, LLM_TEMPERATURE, MUTATE_SYSTEM_PROMPT, REVIEW_SYSTEM_PROMPT, REFLECT_PROMPT
 
 # ==============================================================================
@@ -78,9 +84,8 @@ def node_research(state: AutoResearchState):
     print(f"\n[Node 0: Research] Fetching GraphRAG Inspiration for Iteration {state['iteration_id']}")
     # Call the external script as a tool
     try:
-        import sys
         result = subprocess.check_output(
-            [sys.executable, "scripts/graph_rag.py", "--action", "inspire", "--json"], 
+            [sys.executable, os.path.join(BASE_DIR, "scripts/graph_rag.py"), "--action", "inspire", "--json"], 
             stderr=subprocess.STDOUT
         ).decode("utf-8")
         
@@ -150,7 +155,6 @@ def node_execute(state: AutoResearchState):
     # Exception Handling Pattern: Try/Catch for robustness
     try:
         # Run training using local venv
-        import sys
         result = subprocess.run(
             [sys.executable, "train.py"], 
             timeout=900, 
@@ -236,8 +240,7 @@ def node_reflect(state: AutoResearchState):
 def node_visualize(state: AutoResearchState):
     print(f"\n[Node 5: Visualize] Updating Evolution Tree HTML...")
     try:
-        import sys
-        subprocess.run([sys.executable, "scripts/plot_tree.py"])
+        subprocess.run([sys.executable, os.path.join(BASE_DIR, "scripts/plot_tree.py")])
     except Exception as e:
         print(f"Visualization error: {e}")
     return state
