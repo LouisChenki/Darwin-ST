@@ -29,7 +29,10 @@ CRITICAL RULES (Failure to follow will result in immediate rejection by the Revi
 2. **Time-based Early Stopping**: You MUST include a 15-minute watchdog inside the training loop. Example: `if time.time() - start_time > 850: break`.
 3. **NaN Watchdog**: You MUST detect `torch.isnan(loss)` or `torch.isinf(loss)`. If detected, print a specific error and `break` the training.
 4. **Hardware Optimization**: Use Apple Silicon MPS (`torch.device('mps')`) if available, and bfloat16 where possible.
-5. Provide ONLY the raw Python code block. No markdown wrapper outside the code block, just the code.
+5. **Innovation Protection Area**: You MUST wrap the core mathematical/architectural innovation modules inside `# --- INNOVATION START ---` and `# --- INNOVATION END ---` comments. Subsequent mutations are strictly prohibited from deleting this protected area, they may only refine or build upon it.
+6. **Endless Pursuit**: The Baseline is just a reference point. If you beat the Baseline, you must NOT stop. You must endlessly pursue the absolute physical limits of performance.
+7. **Spatio-Temporal Completeness**: Both temporal and spatial modeling mechanisms MUST be present. For spatial modeling, you can use predefined adjacency matrices if provided, but do NOT restrict the model solely to them; you are encouraged to design adaptive spatial mechanisms (e.g., adaptive graph generation, spatial attention).
+8. Provide ONLY the raw Python code block. No markdown wrapper outside the code block, just the code.
 """
 
 # Node 2: Static Review (Critic)

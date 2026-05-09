@@ -279,8 +279,100 @@ workflow.add_edge("visualize", "research")
 
 app = workflow.compile()
 
+def prompt_with_options(prompt_text, options, default_idx=0):
+    print(f"\n{prompt_text}")
+    for i, opt in enumerate(options):
+        print(f"  {i+1}. {opt}")
+    default_opt = options[default_idx]
+    choice = input(f"Select an option (1-{len(options)}) or type custom value [Default: {default_opt}]: ").strip()
+    if not choice:
+        return default_opt
+    if choice.isdigit() and 1 <= int(choice) <= len(options):
+        return options[int(choice)-1]
+    return choice
+
+def setup_phase():
+    if os.path.exists("memory.md"):
+        print("📁 Found existing memory.md. Resuming evolution loop...")
+        return
+        
+    print("🌟 Welcome to Darwin-ST: Autonomous Spatio-Temporal AI Researcher 🌟")
+    print("No memory.md found. Initiating Phase 1: Interactive Setup...\n")
+    
+    innovation_opts = [
+        "Liquid Neural Network (LNN)",
+        "Spatio-Temporal Causal Attention",
+        "Adaptive Graph ODE",
+        "Mamba-based Sequence Modeling"
+    ]
+    innovation = prompt_with_options("👉 核心创新点 (Innovation):", innovation_opts, 0)
+    
+    dataset_opts = ["PeMS04", "PeMS08", "METR-LA", "PEMS-BAY"]
+    dataset = prompt_with_options("👉 目标数据集 (Dataset):", dataset_opts, 0)
+    
+    baseline_opts = ["DCRNN", "STGCN", "ASTGCN", "GWNet", "AGCRN"]
+    baseline = prompt_with_options("👉 对比基线 (Baseline Name):", baseline_opts, 0)
+    
+    # Auto-generate a sensible default branch name
+    import re
+    safe_inno = re.sub(r'[^a-zA-Z0-9]', '-', innovation.split('(')[0].strip().lower())
+    safe_inno = re.sub(r'-+', '-', safe_inno).strip('-')
+    default_branch = f"exp/{safe_inno[:20]}"
+    
+    branch_name = input(f"\n👉 实验分支名 (Git Branch) [Default: {default_branch}]: ").strip()
+    if not branch_name:
+        branch_name = default_branch
+    
+    # 1. Git checkout
+    try:
+        subprocess.run(["git", "checkout", "-b", branch_name], check=True, capture_output=True)
+        print(f"\n🌿 Successfully checked out branch: {branch_name}")
+    except subprocess.CalledProcessError as e:
+        print(f"\n⚠️ Git checkout failed (maybe branch exists or not a git repo). Proceeding...")
+        
+    # 2. Search Baseline MAE using LLM
+    print(f"\n🔍 Searching Knowledge Base for the typical Validation MAE of {baseline} on {dataset}...")
+    query = f"What is the typical Validation Mean Absolute Error (MAE) of the {baseline} model on the {dataset} traffic prediction dataset? Please provide ONLY a floating point number (e.g., 24.5). If you don't know exactly, provide your best reasonable estimate."
+    try:
+        baseline_mae_response = llm.invoke([HumanMessage(content=query)])
+        match = re.search(r'\d+\.\d+', baseline_mae_response.content)
+        baseline_mae = match.group() if match else "Unknown"
+    except Exception:
+        baseline_mae = "Unknown"
+        
+    print(f"🎯 Intelligent Baseline Assessment: {baseline_mae}")
+    
+    # 3. Auto-download dataset
+    print(f"\n📦 Triggering Auto-Download for Dataset: {dataset}...")
+    try:
+        subprocess.run([sys.executable, os.path.join(BASE_DIR, "scripts/prepare.py"), "--dataset", dataset])
+    except Exception as e:
+        print(f"⚠️ Warning: Dataset download script failed to run: {e}")
+    
+    # 4. Create memory.md
+    memory_content = f"""# Darwin-ST memory.md
+
+## 🎯 领域先验 (Domain Priors)
+- **核心创新点**: {innovation}
+- **目标数据集**: {dataset}
+- **对比基线 (参考)**: {baseline} (Estimated MAE: {baseline_mae})
+- **约束边界**: 必须在 `# --- INNOVATION START ---` 保护区内开发。
+
+## 🏆 Current SOTA
+(Waiting for Gen 1...)
+
+## 🪦 The Graveyard (Failed Mutations)
+(Empty)
+"""
+    write_file("memory.md", memory_content)
+    print("\n✅ Phase 1 Setup Complete! Entering Phase 2: Autonomous Evolution Loop...\n")
+
+
 if __name__ == "__main__":
     print("🚀 Initializing Darwin-ST LangGraph Orchestrator...")
+    
+    # Run interactive setup if needed
+    setup_phase()
     
     # Initialize State
     initial_state = {
