@@ -209,6 +209,29 @@ def test_all_profiles_have_url():
         assert len(P.DATASET_URLS[name]) >= 1
 
 
+def test_apply_mirror_off_by_default(monkeypatch):
+    """未设 GITHUB_MIRROR 时 URL 原样返回。"""
+    monkeypatch.delenv("GITHUB_MIRROR", raising=False)
+    url = "https://github.com/x/y/raw/main/a.npz"
+    assert P._apply_mirror(url) == url
+
+
+def test_apply_mirror_prefixes_github(monkeypatch):
+    """设了镜像则给 GitHub 系 URL 加前缀。"""
+    monkeypatch.setenv("GITHUB_MIRROR", "https://gh-proxy.com/")
+    url = "https://github.com/x/y/raw/main/a.npz"
+    assert P._apply_mirror(url) == "https://gh-proxy.com/https://github.com/x/y/raw/main/a.npz"
+    raw = "https://raw.githubusercontent.com/x/y/main/a.csv"
+    assert P._apply_mirror(raw).startswith("https://gh-proxy.com/")
+
+
+def test_apply_mirror_ignores_non_github(monkeypatch):
+    """非 GitHub 源不加镜像。"""
+    monkeypatch.setenv("GITHUB_MIRROR", "https://gh-proxy.com/")
+    url = "https://example.com/data.npz"
+    assert P._apply_mirror(url) == url
+
+
 def test_dcrnn_datasets_have_vel_and_wam():
     """METR-LA/PEMS-BAY 应各含速度数据(vel)与邻接矩阵(wam)两个文件。"""
     for name in ("METR-LA", "PEMS-BAY"):

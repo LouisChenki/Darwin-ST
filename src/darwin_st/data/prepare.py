@@ -90,17 +90,37 @@ def data_dir_for(dataset_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _apply_mirror(url: str) -> str:
+    """若设置了环境变量 GITHUB_MIRROR, 给 GitHub 系 URL 加镜像前缀以加速 (国内服务器友好)。
+
+    例: GITHUB_MIRROR=https://gh-proxy.com/ 会把
+        https://github.com/... → https://gh-proxy.com/https://github.com/...
+    仅对 github.com / raw.githubusercontent.com 生效; 其它源原样返回。
+    未设置则不改动 (默认行为不变)。
+    """
+    mirror = os.environ.get("GITHUB_MIRROR", "").strip()
+    if not mirror:
+        return url
+    if ("github.com" in url) or ("githubusercontent.com" in url):
+        return mirror.rstrip("/") + "/" + url
+    return url
+
+
 def _download(url: str, dest: str, retries: int = 3) -> None:
-    """流式下载到 dest, 带重试 (GitHub 偶发 connection reset)。全部失败抛异常由调用方降级。"""
+    """流式下载到 dest, 带重试 (GitHub 偶发 connection reset)。全部失败抛异常由调用方降级。
+
+    支持 GITHUB_MIRROR 环境变量加速 (见 _apply_mirror)。
+    """
     import time
 
     import requests
 
+    fetch_url = _apply_mirror(url)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, stream=True, timeout=60)
+            resp = requests.get(fetch_url, stream=True, timeout=60)
             resp.raise_for_status()
             tmp = dest + ".part"
             with open(tmp, "wb") as f:
