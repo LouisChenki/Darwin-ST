@@ -232,6 +232,19 @@ def test_apply_mirror_ignores_non_github(monkeypatch):
     assert P._apply_mirror(url) == url
 
 
+def test_cache_dir_env_override(monkeypatch):
+    """DARWIN_ST_CACHE 环境变量可改缓存根目录 (避免撑爆系统盘)。"""
+    import importlib
+    monkeypatch.setenv("DARWIN_ST_CACHE", "/tmp/custom-darwin-cache")
+    importlib.reload(P)
+    try:
+        assert P.CACHE_DIR == "/tmp/custom-darwin-cache"
+        assert P.data_dir_for("PeMS04") == "/tmp/custom-darwin-cache/pems04"
+    finally:
+        monkeypatch.delenv("DARWIN_ST_CACHE", raising=False)
+        importlib.reload(P)  # 还原, 避免影响其它测试
+
+
 def test_dcrnn_datasets_have_vel_and_wam():
     """METR-LA/PEMS-BAY 应各含速度数据(vel)与邻接矩阵(wam)两个文件。"""
     for name in ("METR-LA", "PEMS-BAY"):

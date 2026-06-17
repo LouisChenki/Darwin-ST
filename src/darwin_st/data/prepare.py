@@ -52,7 +52,12 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 TIME_BUDGET = 1200  # 单次训练时间预算 (秒) = 20 分钟, 供 train.py 时间熔断使用
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "darwin-st")
+# 缓存目录: 默认 ~/.cache/darwin-st; 可用 DARWIN_ST_CACHE 覆盖。
+# ⚠️ 服务器上系统盘常很小(如 30GB), 应指向数据盘, 例:
+#    export DARWIN_ST_CACHE=/root/autodl-tmp/darwin-st-cache
+CACHE_DIR = os.environ.get(
+    "DARWIN_ST_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "darwin-st")
+)
 
 # 数据集下载源 (已修复占位符)。值为 {本地文件名: 远程URL} 映射 (一个数据集可能多文件)。
 # - PeMS04/08: ASTGCN 仓库直挂 .npz, raw 可直接下载 (图来自同目录 distance.csv, 需另置)。
