@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from darwin_st.search.genotype import (
+    EmbeddingConfig,
     Genotype,
     STBlock,
     mutate,
@@ -144,3 +145,73 @@ def test_protected_can_still_tune_hidden():
     g2 = mutate(g, "change_hidden", new_hidden=64)
     assert g2.hidden == 64
     assert g2.blocks[0].spatial_op == "adaptive"  # 创新点仍在
+
+
+# -- 身份嵌入基因 (研究结论: 比图算子更提精度) --
+
+def test_default_genotype_enables_node_embedding():
+    """默认应开节点嵌入(免费的最大杠杆), tod/dow 默认关。"""
+    g = random_genotype(depth=2)
+    assert g.embedding.use_node is True
+    assert g.embedding.use_tod is False
+    assert g.embedding.use_dow is False
+
+
+def test_embedding_in_serialization():
+    g = random_genotype(depth=1)
+    g.embedding.node_dim = 64
+    d = g.to_dict()
+    assert "embedding" in d
+    g2 = Genotype.from_dict(d)
+    assert g2.embedding.node_dim == 64
+    assert g2.embedding.use_node is True
+
+
+def test_embedding_affects_signature():
+    """嵌入配置不同 → 签名不同 (它是一等基因)。"""
+    g1 = random_genotype(depth=1)
+    g2 = g1.copy()
+    g2.embedding.use_tod = True
+    assert g1.signature() != g2.signature()
+
+
+def test_backward_compat_no_embedding_field():
+    """旧 genotype dict (无 embedding 字段) 应用默认配置, 不报错。"""
+    old = {"blocks": [{"spatial_op": "gcn", "temporal_op": "tcn", "fusion": "sequential"}],
+           "hidden": 32, "adj_mode": "sym", "protected": []}
+    g = Genotype.from_dict(old)
+    g.validate()
+    assert g.embedding.use_node is True  # 默认
+
+
+def test_mutate_toggle_embedding_enable():
+    g = random_genotype(depth=1)  # tod 默认关
+    g2 = mutate(g, "toggle_embedding", which="tod", enable=True)
+    assert g2.embedding.use_tod is True
+    assert g.embedding.use_tod is False  # 原件不变
+
+
+def test_mutate_toggle_embedding_dim():
+    g = random_genotype(depth=1)
+    g2 = mutate(g, "toggle_embedding", which="node", dim=64)
+    assert g2.embedding.node_dim == 64
+
+
+def test_mutate_toggle_embedding_disable_node():
+    """可关掉节点嵌入 (消融实验需要)。"""
+    g = random_genotype(depth=1)
+    g2 = mutate(g, "toggle_embedding", which="node", enable=False)
+    assert g2.embedding.use_node is False
+
+
+def test_mutate_toggle_embedding_bad_which():
+    g = random_genotype(depth=1)
+    with pytest.raises(ValueError):
+        mutate(g, "toggle_embedding", which="bogus", enable=True)
+
+
+def test_embedding_invalid_dim_rejected():
+    g = random_genotype(depth=1)
+    g.embedding.node_dim = -5
+    with pytest.raises(ValueError):
+        g.validate()

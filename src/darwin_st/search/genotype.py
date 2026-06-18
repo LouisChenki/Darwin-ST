@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, asdict
 
 from darwin_st.search.operators import SPATIAL_OPS, TEMPORAL_OPS
 
-__all__ = ["STBlock", "Genotype", "mutate", "random_genotype"]
+__all__ = ["STBlock", "EmbeddingConfig", "Genotype", "mutate", "random_genotype"]
 
 VALID_FUSION = {"sequential", "parallel", "residual"}
 VALID_ADJ_MODE = {"sym", "rw", "none"}
@@ -48,12 +48,37 @@ class STBlock:
 
 
 @dataclass
+class EmbeddingConfig:
+    """身份嵌入配置 (一等可变异基因)。
+
+    研究结论: 节点嵌入比图算子更提精度 (去掉 → MAE+18%)。故默认开节点嵌入。
+    time-of-day / day-of-week 需数据管道提供时间索引, 默认关 (就绪后可开)。
+    """
+
+    use_node: bool = True
+    node_dim: int = 32
+    use_tod: bool = False
+    tod_dim: int = 32
+    use_dow: bool = False
+    dow_dim: int = 32
+
+    VALID_DIMS = (16, 32, 64)
+
+    def validate(self) -> None:
+        for label, dim in (("node", self.node_dim), ("tod", self.tod_dim), ("dow", self.dow_dim)):
+            if dim <= 0:
+                raise ValueError(f"{label}_dim 必须为正: {dim}")
+
+
+@dataclass
 class Genotype:
     """完整架构基因型。"""
 
     blocks: list[STBlock]
     hidden: int = 32
     adj_mode: str = "sym"
+    # 身份嵌入配置 (一等基因, 默认开节点嵌入)
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     # 创新点保护区: 这些空间/时序算子名在变异中不可被删除 (可改超参)
     protected: list[str] = field(default_factory=list)
 
@@ -68,6 +93,7 @@ class Genotype:
             raise ValueError(f"hidden 必须为正: {self.hidden}")
         if self.adj_mode not in VALID_ADJ_MODE:
             raise ValueError(f"未知 adj_mode: {self.adj_mode} (可选 {sorted(VALID_ADJ_MODE)})")
+        self.embedding.validate()
         for b in self.blocks:
             b.validate()
         # 保护区算子必须确实存在于某个 block 中
@@ -84,16 +110,21 @@ class Genotype:
             "blocks": [asdict(b) for b in self.blocks],
             "hidden": self.hidden,
             "adj_mode": self.adj_mode,
+            "embedding": asdict(self.embedding),
             "protected": list(self.protected),
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Genotype":
         blocks = [STBlock(**b) for b in d["blocks"]]
+        emb_d = d.get("embedding", {})
+        # 兼容旧 genotype (无 embedding 字段) → 用默认配置
+        embedding = EmbeddingConfig(**emb_d) if emb_d else EmbeddingConfig()
         return cls(
             blocks=blocks,
             hidden=d.get("hidden", 32),
             adj_mode=d.get("adj_mode", "sym"),
+            embedding=embedding,
             protected=list(d.get("protected", [])),
         )
 
@@ -166,6 +197,16 @@ def mutate(geno: Genotype, op: str, rng_index: int = 0, **params) -> Genotype:
 
     elif op == "change_adj_mode":
         g.adj_mode = params["new_adj_mode"]
+
+    elif op == "toggle_embedding":
+        # 把身份嵌入当可变异基因: 开关某类嵌入 / 改其维度
+        which = params["which"]              # "node" | "tod" | "dow"
+        if which not in ("node", "tod", "dow"):
+            raise ValueError(f"toggle_embedding 的 which 非法: {which}")
+        if "enable" in params:
+            setattr(g.embedding, f"use_{which}", bool(params["enable"]))
+        if "dim" in params:
+            setattr(g.embedding, f"{which}_dim", int(params["dim"]))
 
     else:
         raise ValueError(f"未知变异算子: {op}")

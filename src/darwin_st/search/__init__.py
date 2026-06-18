@@ -10,5 +10,36 @@ from darwin_st.search.operators import (
     build_spatial_op,
     build_temporal_op,
 )
+from darwin_st.search.embeddings import (
+    SpatialNodeEmbedding,
+    TimeOfDayEmbedding,
+    DayOfWeekEmbedding,
+    STEmbedding,
+)
+from darwin_st.search.genotype import (
+    STBlock,
+    EmbeddingConfig,
+    Genotype,
+    mutate,
+    random_genotype,
+)
+from darwin_st.search.builder import STModel, build_model, count_params
 
-__all__ = ["SPATIAL_OPS", "TEMPORAL_OPS", "build_spatial_op", "build_temporal_op"]
+__all__ = [
+    "SPATIAL_OPS",
+    "TEMPORAL_OPS",
+    "build_spatial_op",
+    "build_temporal_op",
+    "SpatialNodeEmbedding",
+    "TimeOfDayEmbedding",
+    "DayOfWeekEmbedding",
+    "STEmbedding",
+    "STBlock",
+    "EmbeddingConfig",
+    "Genotype",
+    "mutate",
+    "random_genotype",
+    "STModel",
+    "build_model",
+    "count_params",
+]
