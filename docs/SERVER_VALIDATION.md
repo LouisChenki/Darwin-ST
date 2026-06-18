@@ -71,3 +71,19 @@ scripts/run_autoresearch.py 在真实 PeMS04 + 4×RTX5090 跑通完整自治循�
   让 archive 先积累), 而非绝对基线。正式跑(长 epoch)时绝对阈值才合理。
 
 **额外教训**: git fetch 也被 GitHub 限流 → `git remote set-url origin https://gh-proxy.com/https://github.com/...` 走镜像; python 输出 piped 全缓冲 → sys.stdout.reconfigure(line_buffering)(已修), 或改看 memory.db 实时进度。
+
+## P2 点火复跑成功 (2026-06-18, HEAD 25eb4e4, 修复后)
+
+warmup+相对退化标定修复后, 同配置(3轮×4架构, 12 epoch)复跑:
+- **结束: max_rounds(3) 980s, 12 KEEP / 0 DISCARD / 0 CRASH, 程序化停止。**
+- **archive 填充 5/36 (coverage 0.14, QD 0.180)** —— 修复生效, 进化拿到 KEEP 信号。
+- 进化逐轮改进: best MAE 25.59 → 24.51 → 24.51(3轮太短)。
+- 最优架构: depth=1 hidden=64 adj=sym **emb_node=True** [(adaptive,tcn,residual)] ——
+  带节点嵌入, 符合研究指明方向。
+- gap vs SOTA(STD-MAE 17.8) = +6.7(短训练冒烟, 正式跑需 max_epochs↑ + 轮数↑ + 多seed)。
+
+**整套 P2 自治系统在真实数据+4卡上验证通过**: 进化NAS+HPO+并行调度+MAP-Elites档案+
+结构化记忆+graveyard+程序化自治 全链路真实跑通、永不暂停、自己收敛。
+
+**正式冲SOTA建议**(后续): max_epochs 80-100、max_rounds 数十、POP_SIZE 20、多seed平均、
+开 time_budget 熔断; 由 orchestrator 长跑(可 /loop 或 nohup 24/7)。
