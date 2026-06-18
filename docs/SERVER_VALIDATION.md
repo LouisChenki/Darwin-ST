@@ -40,3 +40,18 @@
 
 ## 结论
 P0/P1 在服务器真实环境验证**通过**。P-1 已修。P-2 需在进入 P2 前修掉(避免撑爆盘)。P-3/P-4 可延后。
+
+## P2-c 基线验证 (2026-06-18, HEAD 5e8c92f)
+
+genotype→builder→真实 PeMS04→GPU 训练→masked 评测 **整条链贯通**:
+- 2-block (adaptive 图 + tcn + 节点嵌入, hidden=64), 15 epoch ~40s
+- 训练 loss 持续下降 (0.19→0.17), test MAE=26.6 (符合预期: 未调优冒烟基线, 验证管道非精度)
+
+观察到的**待 P2 后续解决**的现象 (非 bug, 记录):
+- val_MAE 在 27-31 震荡未稳定下降 (train_loss 在降) → 训练不稳, LR 可能偏高、缺早停取最优。
+  这正是 HPO(Optuna 调 LR)+ 多 seed + best-checkpoint 要解决的。当前不修。
+
+服务器实跑补充经验:
+- `nohup bash -c` **不加 -l 则 conda PATH 不载入** → python not found。
+  服务器后台跑必须 `nohup bash -lc "..."` 或用 `/root/miniconda3/bin/python` 全路径。
+- 长 git fetch 在后台 SSH 会被截断 → 服务器 git 操作也要 detached + 轮询。
