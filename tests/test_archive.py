@@ -1,0 +1,196 @@
+"""archive.py 的正确性回归测试 (设备无关)。
+
+核心契约:
+  - BD 计算: 主导空间/时序族 + 参数量档正确
+  - 插入: 每格精英, 严格改进才替换
+  - coverage/empty_cells/qd_score
+  - 混合选择返回精英
+  - 岛屿重置清差半留优半
+  - 不同 BD 进不同 cell (多样性), 同 BD 竞争同 cell
+"""
+
+from __future__ import annotations
+
+from darwin_st.optim.archive import (
+    MAPElitesArchive,
+    behavior_descriptor,
+    cell_index,
+    all_cells,
+)
+from darwin_st.search.genotype import Genotype, STBlock, random_genotype
+
+
+def _geno(spatial="gcn", temporal="tcn", depth=1):
+    return Genotype(blocks=[STBlock(spatial, temporal) for _ in range(depth)])
+
+
+# ---------------------------------------------------------------------------
+# 行为描述子
+# ---------------------------------------------------------------------------
+
+
+def test_bd_spatial_families():
+    assert behavior_descriptor(_geno("gcn"), 1000)["spatial_family"] == "local_conv"
+    assert behavior_descriptor(_geno("cheb"), 1000)["spatial_family"] == "local_conv"
+    assert behavior_descriptor(_geno("gat"), 1000)["spatial_family"] == "attention"
+    assert behavior_descriptor(_geno("diffusion"), 1000)["spatial_family"] == "diffusion_adaptive"
+    assert behavior_descriptor(_geno("adaptive"), 1000)["spatial_family"] == "diffusion_adaptive"
+    assert behavior_descriptor(_geno("identity"), 1000)["spatial_family"] == "none"
+
+
+def test_bd_temporal_families():
+    assert behavior_descriptor(_geno(temporal="tcn"), 1000)["temporal_family"] == "conv"
+    assert behavior_descriptor(_geno(temporal="gru"), 1000)["temporal_family"] == "recurrent"
+    assert behavior_descriptor(_geno(temporal="attn"), 1000)["temporal_family"] == "attention"
+
+
+def test_bd_param_buckets():
+    assert behavior_descriptor(_geno(), 10_000)["param_bucket"] == 0    # <50k
+    assert behavior_descriptor(_geno(), 100_000)["param_bucket"] == 1   # 50k-200k
+    assert behavior_descriptor(_geno(), 500_000)["param_bucket"] == 2   # >200k
+
+
+def test_bd_dominant_family_by_count():
+    """多块时主导族 = 出现最多的。"""
+    g = Genotype(blocks=[STBlock("gcn", "tcn"), STBlock("gcn", "tcn"), STBlock("gat", "tcn")])
+    assert behavior_descriptor(g, 1000)["spatial_family"] == "local_conv"  # gcn x2 > gat x1
+
+
+def test_all_cells_is_36():
+    assert len(all_cells()) == 36
+
+
+# ---------------------------------------------------------------------------
+# 插入: 每格精英 + 严格改进
+# ---------------------------------------------------------------------------
+
+
+def test_first_insert_succeeds():
+    arc = MAPElitesArchive(seed=0)
+    assert arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000) is True
+    assert len(arc) == 1
+
+
+def test_strict_improvement_replaces():
+    arc = MAPElitesArchive(seed=0)
+    # 同 BD (gcn/tcn/<50k) 竞争同一 cell
+    arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)
+    assert arc.add(_geno("gcn", "tcn"), fitness=18.0, num_params=12_000) is True  # 更优 → 替换
+    assert arc.add(_geno("gcn", "tcn"), fitness=19.0, num_params=11_000) is False  # 更差 → 拒
+    assert arc.add(_geno("gcn", "tcn"), fitness=18.0, num_params=11_000) is False  # 相等 → 拒(严格)
+    assert len(arc) == 1
+    assert arc.best().fitness == 18.0
+
+
+def test_different_bd_different_cells():
+    """不同 BD 进不同 cell (多样性保持)。"""
+    arc = MAPElitesArchive(seed=0)
+    arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)      # local_conv/conv/0
+    arc.add(_geno("gat", "gru"), fitness=22.0, num_params=10_000)      # attention/recurrent/0
+    arc.add(_geno("gcn", "tcn"), fitness=21.0, num_params=300_000)     # local_conv/conv/2
+    assert len(arc) == 3  # 三个不同 cell
+
+
+# ---------------------------------------------------------------------------
+# coverage / empty / qd
+# ---------------------------------------------------------------------------
+
+
+def test_coverage_and_empty():
+    arc = MAPElitesArchive(seed=0)
+    arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)
+    assert arc.coverage() == 1 / 36
+    assert len(arc.empty_cells()) == 35
+    assert cell_index(behavior_descriptor(_geno("gcn", "tcn"), 10_000)) not in arc.empty_cells()
+
+
+def test_qd_score_increases_with_better_elites():
+    arc = MAPElitesArchive(seed=0)
+    arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)
+    q1 = arc.qd_score()
+    arc.add(_geno("gcn", "tcn"), fitness=10.0, num_params=10_000)  # 更优精英
+    assert arc.qd_score() > q1  # 质量提升 → QD 升
+
+
+# ---------------------------------------------------------------------------
+# 选择
+# ---------------------------------------------------------------------------
+
+
+def test_select_returns_elite():
+    arc = MAPElitesArchive(seed=0)
+    assert arc.select() is None  # 空档案
+    arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)
+    e = arc.select()
+    assert e is not None
+    assert e.fitness == 20.0
+
+
+def test_select_mix_uniform_and_tournament():
+    """混合选择: 多次选择应能取到不同精英 (有多样性)。"""
+    arc = MAPElitesArchive(seed=0, p_uniform=0.5)
+    pool = ["gcn", "gat", "cheb", "diffusion", "adaptive"]
+    for i, sp in enumerate(pool):
+        arc.add(_geno(sp, "tcn"), fitness=20.0 - i, num_params=10_000 + i * 100_000)
+    picks = {id(arc.select()) for _ in range(50)}
+    assert len(picks) >= 2  # 不是每次都选同一个
+
+
+# ---------------------------------------------------------------------------
+# 岛屿重置
+# ---------------------------------------------------------------------------
+
+
+def test_stagnation_detection():
+    arc = MAPElitesArchive(seed=0, stagnation_patience=3)
+    arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)
+    assert not arc.stagnated()
+    # 连续没改进 (更差插入)
+    for _ in range(4):
+        arc.add(_geno("gcn", "tcn"), fitness=25.0, num_params=10_000)  # 被拒, since_improve++
+    assert arc.stagnated()
+
+
+def test_island_reset_keeps_better_half():
+    arc = MAPElitesArchive(seed=0)
+    pool = ["gcn", "gat", "cheb", "diffusion"]
+    # 4 个不同 cell, fitness 20/19/18/17
+    for i, sp in enumerate(pool):
+        arc.add(_geno(sp, "tcn"), fitness=20.0 - i, num_params=10_000 + i * 100_000)
+    assert len(arc) == 4
+    cleared = arc.island_reset()
+    assert cleared == 2          # 清掉差的一半
+    assert len(arc) == 2
+    # 保留的应是较优的 (fitness 17, 18)
+    fits = sorted(e.fitness for e in arc.elites())
+    assert fits == [17.0, 18.0]
+    assert not arc.stagnated()   # 计数器重置
+
+
+def test_island_reset_clears_to_empty_cells():
+    """重置后被清的格成为 empty_cells (供 LLM 定向)。"""
+    arc = MAPElitesArchive(seed=0)
+    for i, sp in enumerate(["gcn", "gat", "cheb", "diffusion"]):
+        arc.add(_geno(sp, "tcn"), fitness=20.0 - i, num_params=10_000 + i * 100_000)
+    before_empty = len(arc.empty_cells())
+    arc.island_reset()
+    assert len(arc.empty_cells()) > before_empty  # 清出更多空格
+
+
+# ---------------------------------------------------------------------------
+# 端到端: 档案在搜索流中累积多样精英
+# ---------------------------------------------------------------------------
+
+
+def test_archive_accumulates_diverse_elites():
+    import random
+    rng = random.Random(0)
+    arc = MAPElitesArchive(seed=0)
+    pool_s = ["gcn", "gat", "cheb", "diffusion", "adaptive", "identity"]
+    pool_t = ["tcn", "gru", "attn"]
+    for _ in range(100):
+        g = _geno(rng.choice(pool_s), rng.choice(pool_t))
+        arc.add(g, fitness=rng.uniform(15, 25), num_params=rng.choice([10_000, 100_000, 300_000]))
+    # 应填充多个 cell (多样性), 但不超过 36
+    assert 5 <= len(arc) <= 36
+    assert arc.best() is not None

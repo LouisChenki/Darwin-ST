@@ -11,6 +11,12 @@ from darwin_st.optim.hpo import (
     optimize_architecture,
 )
 from darwin_st.optim.scheduler import EvalResult, GPUScheduler, resolve_devices
+from darwin_st.optim.archive import (
+    Elite,
+    MAPElitesArchive,
+    behavior_descriptor,
+    cell_index,
+)
 
 __all__ = [
     "HPOConfig",
@@ -21,4 +27,8 @@ __all__ = [
     "EvalResult",
     "GPUScheduler",
     "resolve_devices",
+    "Elite",
+    "MAPElitesArchive",
+    "behavior_descriptor",
+    "cell_index",
 ]
