@@ -11,6 +11,7 @@ dependencies = [
     "pyarrow>=21.0.0",
     "requests>=2.32.0",
     "neo4j>=5.0.0",
+    "optuna>=4.0.0",
     "torch==2.8.0",
 ]
 
@@ -30,6 +31,10 @@ packages = ["src/darwin_st"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+filterwarnings = [
+    # Optuna 把 group/constant_liar 标为 experimental, 但它们是 BOHB/并行的标准稳定用法
+    "ignore::optuna.exceptions.ExperimentalWarning",
+]
 
 [tool.uv.sources]
 # torch 按平台分流:
