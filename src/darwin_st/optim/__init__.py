@@ -17,6 +17,7 @@ from darwin_st.optim.archive import (
     behavior_descriptor,
     cell_index,
 )
+from darwin_st.optim.orchestrator import OrchestratorConfig, RunState, Orchestrator
 
 __all__ = [
     "HPOConfig",
@@ -31,4 +32,7 @@ __all__ = [
     "MAPElitesArchive",
     "behavior_descriptor",
     "cell_index",
+    "OrchestratorConfig",
+    "RunState",
+    "Orchestrator",
 ]
