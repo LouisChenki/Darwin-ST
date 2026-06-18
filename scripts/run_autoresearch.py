@@ -16,9 +16,16 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import torch
+
+# 行缓冲 stdout: 否则 piped/重定向时全缓冲, 看不到实时轮次进度 (服务器实跑教训)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 from darwin_st.optim.hpo import HPOConfig
 from darwin_st.optim.orchestrator import Orchestrator, OrchestratorConfig
