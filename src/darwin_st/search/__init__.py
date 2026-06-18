@@ -24,6 +24,12 @@ from darwin_st.search.genotype import (
     random_genotype,
 )
 from darwin_st.search.builder import STModel, build_model, count_params
+from darwin_st.search.evolution import (
+    Member,
+    AgingEvolution,
+    random_mutation,
+    seed_genotypes,
+)
 
 __all__ = [
     "SPATIAL_OPS",
@@ -42,4 +48,8 @@ __all__ = [
     "STModel",
     "build_model",
     "count_params",
+    "Member",
+    "AgingEvolution",
+    "random_mutation",
+    "seed_genotypes",
 ]
