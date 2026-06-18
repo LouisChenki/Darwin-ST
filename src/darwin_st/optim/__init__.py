@@ -18,6 +18,7 @@ from darwin_st.optim.archive import (
     cell_index,
 )
 from darwin_st.optim.orchestrator import OrchestratorConfig, RunState, Orchestrator
+from darwin_st.optim.train import train_one, evaluate_architecture, make_eval_fn
 
 __all__ = [
     "HPOConfig",
@@ -35,4 +36,7 @@ __all__ = [
     "OrchestratorConfig",
     "RunState",
     "Orchestrator",
+    "train_one",
+    "evaluate_architecture",
+    "make_eval_fn",
 ]
