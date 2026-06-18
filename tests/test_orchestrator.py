@@ -110,19 +110,46 @@ def test_crash_does_not_stop_loop():
     # 崩的不算 KEEP
 
 
-def test_discard_above_worst_baseline():
-    """MAE 劣于最差基线 → DISCARD, 不进 best。"""
+def test_discard_above_absolute_threshold():
+    """显式绝对阈值: MAE 劣于它 → DISCARD。"""
     def bad_eval(geno, device):
         return EvalResult(genotype=geno, status="OK", mae=999.0, rmse=999.0, device=device,
                           extra={"num_params": 50_000})
 
     cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
-                             max_rounds=3, target_mae=0.0)
+                             max_rounds=3, target_mae=0.0, discard_above=22.93)
     orch = Orchestrator(cfg, bad_eval, devices=2)
     state = orch.run()
     assert state.n_discard >= 1
     assert state.n_keep == 0
     assert state.best_mae == float("inf")  # 没有有效 KEEP
+
+
+def test_warmup_keeps_everything_then_relative_discard():
+    """冷启动 warmup 期一律 KEEP(让 archive 积累); warmup 后相对 best 退化才 DISCARD。
+
+    这修复了点火实跑发现的问题: 短训练 MAE 全劣于已发表基线 → 旧逻辑全 DISCARD → archive 空。
+    """
+    seq = iter([20.0, 19.0, 18.0])  # 前 3 个递减 (warmup 内全 KEEP)
+
+    def eval_fn(geno, device):
+        try:
+            mae = next(seq)
+        except StopIteration:
+            mae = 40.0  # warmup 后的大退化 (相对 best=18 超 1.5 倍 → DISCARD)
+        return EvalResult(genotype=geno, status="OK", mae=mae, device=device,
+                          extra={"num_params": 50_000})
+
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=3, target_mae=0.0, warmup_keep=3,
+                             discard_regression_factor=1.5)
+    orch = Orchestrator(cfg, eval_fn, devices=2)
+    state = orch.run()
+    # 前 3 个(20/19/18)在 warmup 内全 KEEP; 之后的 40 相对 best=18 退化超 1.5x → DISCARD
+    assert state.n_keep >= 3
+    assert state.best_mae == 18.0
+    assert state.n_discard >= 1
+    assert len(orch.archive) >= 1   # archive 确实积累了 (修复点)
 
 
 # ---------------------------------------------------------------------------

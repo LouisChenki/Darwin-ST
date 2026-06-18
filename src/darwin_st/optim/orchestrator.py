@@ -57,8 +57,13 @@ class OrchestratorConfig:
     max_rounds: int | None = None        # 最多多少轮 (每轮一批并行评估)
     max_evals: int | None = None         # 最多评估多少架构
     target_mae: float | None = None      # 自定目标 MAE (默认用 baseline_registry 的 SOTA)
-    # 判定一次评估是否"成功保留"的相对阈值: MAE 须优于当前最差基线才算 KEEP, 否则 DISCARD
-    discard_above: float | None = None   # 超过此 MAE 记 DISCARD; None = 用最差基线
+    # KEEP/DISCARD 判定 (短训练下"劣于已发表基线"过严, 会清空 archive):
+    #   - 冷启动前 warmup_keep 个有效评估一律 KEEP, 让 archive/进化先积累信号。
+    #   - 之后: 相对当前 best 退化超过 discard_regression_factor 倍才 DISCARD (相对, 非绝对基线)。
+    #   - discard_above 给定时用绝对阈值 (正式长训练跑可设为最差基线)。
+    discard_above: float | None = None    # 绝对阈值; None = 用相对/warmup 策略
+    warmup_keep: int = 16                 # 冷启动期一律 KEEP 的有效评估数
+    discard_regression_factor: float = 1.5  # MAE > best*此倍数 → DISCARD
 
 
 @dataclass
@@ -122,12 +127,26 @@ class Orchestrator:
         self.state.sota_name, self.state.sota_mae = name, mae
         self._target = config.target_mae if config.target_mae is not None else mae
 
-        # DISCARD 阈值: 默认用该数据集最差基线 (劣于它即判 DISCARD)
+        # DISCARD 策略: 绝对阈值(若给定) 否则 warmup + 相对退化 (见 OrchestratorConfig)
         self._discard_above = config.discard_above
-        if self._discard_above is None:
-            from darwin_st.baseline_registry import list_baselines
-            ranked = list_baselines(config.dataset, "mae")
-            self._discard_above = max(ranked.values()) if ranked else float("inf")
+        self._n_valid = 0   # 已见的有限 MAE 评估数 (warmup 计数)
+
+    def _classify(self, mae: float) -> tuple[str, str | None]:
+        """定结局: CRASH(无效) / KEEP / DISCARD。返回 (status, fail_reason)。"""
+        if not _finite(mae):
+            return "CRASH", "nan_or_inf"
+        # 绝对阈值优先 (正式长训练跑可设为最差基线)
+        if self._discard_above is not None:
+            if mae > self._discard_above:
+                return "DISCARD", "worse_than_threshold"
+            return "KEEP", None
+        # 相对策略: 冷启动 warmup 期一律 KEEP, 让 archive/进化先积累
+        if self._n_valid < self.cfg.warmup_keep:
+            return "KEEP", None
+        # warmup 后: 相对当前 best 退化超阈即 DISCARD
+        if self.state.best_mae < float("inf") and mae > self.state.best_mae * self.cfg.discard_regression_factor:
+            return "DISCARD", "regression_vs_best"
+        return "KEEP", None
 
     # -- 停止判定 (纯代码, 非 LLM) --
     def should_stop(self) -> str | None:
@@ -158,13 +177,13 @@ class Orchestrator:
         self.state.evals += 1
         geno = res.genotype
 
-        # 1) 定结局: CRASH(评估崩) / DISCARD(劣于最差基线) / KEEP(可用进展)
-        if res.status == "CRASH" or not _finite(res.mae):
-            status, fail_reason = "CRASH", (res.fail_reason or "nan_or_inf")
-        elif res.mae > self._discard_above:
-            status, fail_reason = "DISCARD", "worse_than_worst_baseline"
+        # 1) 定结局: CRASH(评估崩) / DISCARD / KEEP
+        if res.status == "CRASH":
+            status, fail_reason = "CRASH", (res.fail_reason or "eval_crash")
         else:
-            status, fail_reason = "KEEP", None
+            status, fail_reason = self._classify(res.mae)
+            if _finite(res.mae):
+                self._n_valid += 1   # warmup 计数 (仅有效 MAE)
 
         # 2) 落 memory (含 graveyard: CRASH/DISCARD 自动进, 防重复)
         trial_id = None

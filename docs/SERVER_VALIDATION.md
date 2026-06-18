@@ -55,3 +55,19 @@ genotype→builder→真实 PeMS04→GPU 训练→masked 评测 **整条链贯�
 - `nohup bash -c` **不加 -l 则 conda PATH 不载入** → python not found。
   服务器后台跑必须 `nohup bash -lc "..."` 或用 `/root/miniconda3/bin/python` 全路径。
 - 长 git fetch 在后台 SSH 会被截断 → 服务器 git 操作也要 detached + 轮询。
+
+## P2 点火验证 (2026-06-18, HEAD 609bd94)
+
+scripts/run_autoresearch.py 在真实 PeMS04 + 4×RTX5090 跑通完整自治循环:
+- 3 轮 × 4 架构(=12 评估), 907s, **0 崩溃**, 程序化 max_rounds 正常停止。
+- 4 卡全程并行工作; 试验逐条落 memory.db; 进化+HPO+scheduler+archive+graveyard 全链协作。
+- **机器全部验证通过**: 自治循环确实自己转、永不暂停、程序化停止。
+
+**发现的问题 (待修, 不是 bug 是标定)**:
+- 短 epoch(12)冒烟下 12 个架构 MAE 23-37, 全部劣于 PeMS04 最差基线(ASTGCN 22.93)→
+  **全判 DISCARD, archive 空, best=inf**。后果: 进化拿不到 KEEP 信号、archive 不积累。
+- 根因: DISCARD 阈值用"劣于已发表最差基线"假设了充分训练; 短训练下不成立。
+- 修法: DISCARD 阈值改为**相对/自适应**(如相对当前 best 的退化幅度, 或冷启动期一律 KEEP
+  让 archive 先积累), 而非绝对基线。正式跑(长 epoch)时绝对阈值才合理。
+
+**额外教训**: git fetch 也被 GitHub 限流 → `git remote set-url origin https://gh-proxy.com/https://github.com/...` 走镜像; python 输出 piped 全缓冲 → sys.stdout.reconfigure(line_buffering)(已修), 或改看 memory.db 实时进度。
