@@ -87,3 +87,25 @@ warmup+相对退化标定修复后, 同配置(3轮×4架构, 12 epoch)复跑:
 
 **正式冲SOTA建议**(后续): max_epochs 80-100、max_rounds 数十、POP_SIZE 20、多seed平均、
 开 time_budget 熔断; 由 orchestrator 长跑(可 /loop 或 nohup 24/7)。
+
+## P2.5-e Tier-2 创造闭环端到端实跑 (2026-06-19)
+
+**配置**: PeMS04, 4×GPU, 弱基线gcn+tcn, pop=6, max_rounds=6, HPO=2, epochs=8, stagnation=2。
+
+**验证通过(闭环鲁棒性)**:
+- ✅ 优化引擎真实训练: round1 best MAE=33.4 → round3=30.1(进化在降误差)。
+- ✅ 停滞**正确触发创造**: 诊断瓶颈"长程依赖不足"→跨域检索拉回dilated_causal_convolution(SSM域)→DeepSeek融合计划(膨胀卷积并行分支+零初始化残差, 理由专业)→Aider写代码。
+- ✅ **验证守卫工作**: 第一版算子输出恒等输入被门trivial_identity拒, 触发重试。
+- ✅ **自主性铁律**: 创造失败(3次重试未过验证)**不中止循环**, 继续进化round3降了MAE。4卡全程可用, memory落库正常。
+
+**发现的真问题(待优化, 非bug)**:
+- ⚠️ **创造延迟过高**: 单次创造~10分钟(每次重试=完整Aider+DeepSeek往返~1-2min × max_retries=3 + 验证)。多次停滞触发多次慢创造, 整体太慢。
+- ⚠️ **合成成功率不稳**: 观察到的创造尝试多次未过验证(trivial_identity等)。deepseek-v4-pro写的算子质量波动。
+- 根因: ①Aider每次重试都全量重跑(慢)②验证反馈循环长③弱基线下DeepSeek倾向产平凡解。
+
+**优化方向(后续)**:
+- 降 max_retries(如2)或加快验证反馈; 创造异步化(不阻塞进化主循环, 后台合成完再入队);
+- prompt 强化"非平凡"约束 + few-shot 好例子; 或换更快模型做初版、pro做精修(AlphaEvolve式model ensemble);
+- 限制创造频率(如每N轮最多一次), 避免慢创造拖垮节奏。
+
+**结论**: 创造闭环在真实环境**机制全通、鲁棒(失败不崩)**, 但**创造的速度与成功率需调优**才实用。这是真实实跑才能发现的工程问题, 已记录待优化。
