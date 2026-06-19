@@ -13,6 +13,14 @@ from darwin_st.knowledge.ontology import (
     FUNCTION_VOCAB,
 )
 from darwin_st.knowledge.seeds import all_seed_mechanisms, SEED_MECHANISMS
+from darwin_st.knowledge.embedding import HashEmbedder, SentenceTransformerEmbedder
+from darwin_st.knowledge.graph_store import InMemoryGraphStore, Neo4jGraphStore
+from darwin_st.knowledge.retrieval import (
+    RetrievalResult,
+    cross_domain_analogy,
+    find_cross_domain_analogy,
+    decompose_to_preconditions,
+)
 
 __all__ = [
     "Mechanism",
@@ -23,4 +31,12 @@ __all__ = [
     "FUNCTION_VOCAB",
     "all_seed_mechanisms",
     "SEED_MECHANISMS",
+    "HashEmbedder",
+    "SentenceTransformerEmbedder",
+    "InMemoryGraphStore",
+    "Neo4jGraphStore",
+    "RetrievalResult",
+    "cross_domain_analogy",
+    "find_cross_domain_analogy",
+    "decompose_to_preconditions",
 ]
