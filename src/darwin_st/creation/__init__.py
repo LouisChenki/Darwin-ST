@@ -15,6 +15,7 @@ from darwin_st.creation.contracts import (
 )
 from darwin_st.creation.llm import LLMClient, MockLLM, OpenAICompatLLM
 from darwin_st.creation.aider_backend import AiderConfig, AiderBackend
+from darwin_st.creation.registry import OperatorRegistry, SYNTH_PREFIX
 from darwin_st.creation.synthesizer import (
     SynthesisConfig,
     SynthesisResult,
@@ -38,6 +39,8 @@ __all__ = [
     "OpenAICompatLLM",
     "AiderConfig",
     "AiderBackend",
+    "OperatorRegistry",
+    "SYNTH_PREFIX",
     "SynthesisConfig",
     "SynthesisResult",
     "OperatorSynthesizer",

@@ -252,13 +252,13 @@ TEMPORAL_OPS = {
 
 
 def build_spatial_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Module:
-    """按名实例化空间算子。adaptive 需要 num_nodes。"""
+    """按名实例化空间算子。adaptive 与合成算子(synth_前缀)需要 num_nodes。"""
     if name not in SPATIAL_OPS:
         raise KeyError(f"未知空间算子 '{name}'. 可选: {sorted(SPATIAL_OPS)}")
     cls = SPATIAL_OPS[name]
-    if name == "adaptive":
+    if name == "adaptive" or name.startswith("synth_"):
         if num_nodes is None:
-            raise ValueError("adaptive 算子需要 num_nodes")
+            raise ValueError(f"算子 '{name}' 需要 num_nodes")
         return cls(dim, num_nodes=num_nodes, **kw)
     return cls(dim, **kw)
 
