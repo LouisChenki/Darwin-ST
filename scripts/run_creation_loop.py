@@ -76,13 +76,16 @@ def main():
     model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
     llm = OpenAICompatLLM()
     backend = AiderBackend(AiderConfig(model=f"deepseek/{model}"))
-    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=3, temperature=0.8),
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2, temperature=0.9),
                                 code_backend=backend)
     registry = OperatorRegistry(persist_dir=os.path.join(cache, "dynamic_ops"))
     registry.load_persisted()  # 加载之前合成的算子
 
     mem = MemoryStore(os.path.join(cache, "memory_creation.db"))
-    cloop = CreationLoop(store, embedder, synth, registry, memory=mem)
+    from darwin_st.creation import CreationConfig
+    n_hypo = _env_int("N_HYPOTHESES", 4)
+    cloop = CreationLoop(store, embedder, synth, registry, memory=mem,
+                         config=CreationConfig(n_hypotheses=n_hypo))
 
     # --- 优化引擎 (真实训练) ---
     hpo_cfg = HPOConfig(n_trials=hpo_trials, max_epochs=max_epochs,
@@ -117,7 +120,7 @@ def main():
     creations = [h for h in state.history if h.get("event") == "creation"]
     print(f"\n=== 创造事件 ({len(creations)} 次) ===")
     for c in creations:
-        print(f"  • 合成算子 {c['operator']} 解决瓶颈: {c['bottleneck']}")
+        print(f"  • 合成算子 {c.get('operators')} (成功{c.get('n_success')}个) 解决瓶颈: {c['bottleneck']}")
     print(f"注入算子库: {registry.registered_names()}")
 
     # 合成算子是否被评估 + 表现
