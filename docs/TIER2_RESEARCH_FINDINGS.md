@@ -73,3 +73,37 @@
 ## 6. 落地顺序(P3 → Tier-2)
 P3: ①机制中心 schema(Neo4j)②建图 pipeline(语料扩 CV/序列/自监督/图学习, schema 引导抽取+两层置信+人工门)③向量+图混合 + find_cross_domain_analogy ④v1 验收: 一次成功跨域移植。
 Tier-2(P2.5, 用 P3 知识): ①Aider 算子合成(沙箱 worktree+测试验收)②idea 面板(Generator/Critic/Ranker/Meta-review)③接 orchestrator(面板=提议+预排, GPU 只烧 top-4)④surrogate predictor + 校准门。
+
+## 7. 组合式创造 (Level 2) —— 用户三问的研究结论 (2026-06-19)
+
+用户三问敲定了 P3/Tier-2 的三个关键设计:
+
+### Q1 检索模糊性 → 双层匹配 (已解决)
+检索**不是字符串匹配**(那是旧 graph_rag 的毛病)。两层:
+- **MAC 向量层(处理表达模糊)**: 把卡的 embedding_text(只含 abstract_function+preconditions, 绝不含表面/域)嵌入, 算语义相似 → "长程依赖/long-range/远距离时序"向量都接近。
+- **受控前提词表(处理概念对齐)**: 前提归一到 PRECONDITION_VOCAB, 防近义干扰项 + 支持精确图遍历。
+- 开放点: 词表维护(新前提人工复核入库), 调研明确"precondition 规范化是研究开放问题"。
+
+### Q2 math_structure 复现 → 不抓代码, 数学本质即可 (已解决)
+**澄清: math_structure 不是"精确复现论文", 是"给 Aider 的灵感种子"**。LLM 在我们框架里**重新实现**(适配[B,T,N,C]+ST), 非逐行抄论文(论文代码常不能直接用)。正确性由**Aider 重写 + builder测试 + 真实MAE**保证, 非"对齐论文代码"(FunSearch 哲学)。
+→ **v1 不建库时抓代码**(复杂度爆炸收益低); 个别难复现机制再按需补参考代码片段。
+
+### Q3 创造能力 → 锁定 Level 2 组合式创造 (已拍板, 弃 Level 3)
+- L0 重组算子(纯进化, 天花板低) / L1 跨域迁移(搬运, STD-MAE那类) / **L2 组合式创造(把多个跨域机制化学融合成新算子, 论文真创新点)** / L3 凭空发明(无系统可靠做到, 弃)。
+- **研究强力背书 L2**: Uzzi Science 2013——"传统核心+注入一个非典型组合"命中率 9.11%(~2倍), 纯新颖仅 5.33% 近基线; Strumsky-Lobo——纯de novo发明 1990后<1%, 真novelty几乎都是"已有组件新组合"。**L2 正是科学突破主流, 非妥协**。
+- Weitzman 关键: 瓶颈在**评估能力非生成能力** → 投资 verifier/selector。
+
+**防退化守卫(按证据强度排序, 这是回应"粗暴融合反而差")**:
+1. **零初始化残差融合(最强, 近定理, 先建)**: `y=baseline(x)+α·new_branch(x)`, α=nn.Parameter(0)。init 时=baseline 精确(坏融合=no-op), 但 branch 梯度≠0 能从0学起或保持0忽略。证据 ReZero/ControlNet/LoRA/LayerScale。诚实: "init 不退化"是定理, "训练后不退化"无全局界——只能说"模型能学会忽略坏分支"非"保证≥baseline"。
+2. **4 算子组合文法**: sequential/parallel/additive-residual/gated-routed(Modular DL survey)。约束组合方式防 Frankenstein。"最小集更好"是待验假设。
+3. **因果接地的融合 prompt**: 按"为何有效(causal_behavior)"融合非表面堆叠(Gentner: 深层因果驱动推断soundness)。生成端偏置非硬保证。
+4. **廉价执行接地的 critic 门**: CodeT 式(编译+小batch前后向+NaN/shape/param检查+few-step代理MAE)再上全量训练。**只用执行接地, 别让生成者自评**(LLM Cannot Self-Correct: 内在自纠会降分); critic 用独立/更强模型, 偏向召回。
+5. **真实 masked-MAE 是最终裁判(governing 哲学)**: 多数融合会死, 只需偶尔命中(FunSearch 命中率~2.9%)。K 个 i.i.d. 样本/步 + 评估级联。
+
+**组合检索(关键升级)**: 检索**不是返回单个最相似机制, 而是返回互补机制集**——覆盖瓶颈的多个前提(如 long-range + label-scarcity 同时拉回 SSM + 掩码自编码让 LLM 融合)。技术: 瓶颈分解成前提(Self-Ask 式)→ 按前提分别检索 → 子模最大覆盖贪心选集(IA-Select/Lin-Bilmes, (1-1/e)保证)/ P-Companion"先预测K个互补类型再分子空间检索"。
+
+**融合 prompt 结构(plan-then-code, 已验证+25% Pass@1)**: 每机制陈述为(因果为何有效)+(解决哪个前提); 目标陈述为关系瓶颈; **先要显式融合计划**(共享结构/候选推断/选哪个组合算子)再生成代码。父代从 archive 自由抽取(ADAS/FunSearch, 不硬编码"组合A+B"), 按 fitness 升序呈现(免费给改进方向信号)。
+
+**archive 保踏脚石**: append-only 增长, **不按 fitness 剪枝**(保留新颖但弱的模块作踏脚石——ADAS iter5/11/12 复合是证据)。premature 收敛才加 islands/MAP-Elites。
+
+**诚实 solid vs 赌注**: solid=L2选择/自由archive抽取重组/零初始化init安全/evaluator仲裁/执行接地门胜自评/plan-before-code/子模覆盖检索。研究赌注=按前提给机制打标签的检索pipeline/因果schema prompt产出更好融合/4算子近最小充分/零初始化训练后不退化。
