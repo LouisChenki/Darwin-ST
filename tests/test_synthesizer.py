@@ -149,3 +149,75 @@ def test_synthesize_bad_plan_fails_gracefully():
     res = synth.synthesize(_req())
     assert not res.success
     assert "计划" in res.last_error
+
+
+# ---------------------------------------------------------------------------
+# code_backend (Aider 路径) —— 用 mock backend 测逻辑, 不需真 aider
+# ---------------------------------------------------------------------------
+
+
+class _MockBackend:
+    """mock 代码后端: 按队列返回 (code, error)。"""
+    def __init__(self, outputs):
+        self.outputs = iter(outputs)
+        self.calls = []
+
+    def write_operator(self, instruction, target_file="op.py"):
+        self.calls.append(instruction)
+        return next(self.outputs)
+
+
+_GOOD_OP_CODE = (
+    "import torch\nimport torch.nn as nn\n"
+    "class FusedLongRangeOp(nn.Module):\n"
+    "    def __init__(self, channels, num_nodes, **kw):\n"
+    "        super().__init__()\n"
+    "        self.proj = nn.Linear(channels, channels)\n"
+    "        self.branch = nn.Linear(channels, channels)\n"
+    "        self.alpha = nn.Parameter(torch.zeros(1))\n"
+    "    def forward(self, x, adj=None):\n"
+    "        return self.proj(x) + self.alpha * self.branch(x)\n"
+)
+
+_BAD_OP_CODE = (
+    "import torch.nn as nn\n"
+    "class FusedLongRangeOp(nn.Module):\n"
+    "    def __init__(self, channels, num_nodes, **kw):\n"
+    "        super().__init__()\n"
+    "        self.lin = nn.Linear(channels, channels)\n"
+    "    def forward(self, x, adj=None):\n"
+    "        return self.lin(x).mean(dim=2)\n"  # 丢节点维 N
+)
+
+
+def test_synthesize_with_code_backend_success():
+    """code_backend(Aider 路径): plan 用 llm, 代码用后端。"""
+    llm = MockLLM(lambda msgs: _GOOD_PLAN)  # 只需出计划
+    backend = _MockBackend([(_GOOD_OP_CODE, "")])
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2), code_backend=backend)
+    res = synth.synthesize(_req())
+    assert res.success, res.last_error
+    assert res.operator.name == "FusedLongRangeOp"
+    assert len(backend.calls) == 1  # 后端被调一次
+
+
+def test_synthesize_code_backend_retries():
+    """后端先给坏代码 → 重试 → 第二次好代码 → 成功; 错误反馈进指令。"""
+    llm = MockLLM(lambda msgs: _GOOD_PLAN)
+    backend = _MockBackend([(_BAD_OP_CODE, ""), (_GOOD_OP_CODE, "")])
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=3), code_backend=backend)
+    res = synth.synthesize(_req())
+    assert res.success
+    assert res.attempts == 2
+    # 第二次调用的指令应含上轮验证错误
+    assert "验证失败" in backend.calls[1] or "shape" in backend.calls[1]
+
+
+def test_synthesize_code_backend_failure():
+    """后端一直返回 None(如 aider 失败) → 优雅失败。"""
+    llm = MockLLM(lambda msgs: _GOOD_PLAN)
+    backend = _MockBackend([(None, "aider 超时")] * 5)
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2), code_backend=backend)
+    res = synth.synthesize(_req())
+    assert not res.success
+    assert "后端" in res.last_error or "验证" in res.last_error

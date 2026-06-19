@@ -24,6 +24,7 @@ from darwin_st.knowledge.graph_store import Neo4jGraphStore, InMemoryGraphStore
 from darwin_st.knowledge.retrieval import find_cross_domain_analogy
 from darwin_st.creation import FusionRequest, OperatorSynthesizer, SynthesisConfig
 from darwin_st.creation.llm import OpenAICompatLLM
+from darwin_st.creation.aider_backend import AiderBackend, AiderConfig
 
 
 def main():
@@ -64,10 +65,14 @@ def main():
         baseline_operator="dilated_causal_convolution",
     )
 
-    # 3) 真实 DeepSeek 合成
-    print(f"\n[合成] 调用 {os.environ.get('DEEPSEEK_MODEL','deepseek-v4-pro')} 做 plan-then-code...")
+    # 3) 真实 DeepSeek 合成 (plan 用 LLM, 代码用 Aider 沙箱)
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    aider_model = f"deepseek/{model}"
+    print(f"\n[合成] 计划用 {model}, 代码用 Aider({aider_model}) 沙箱写入...")
     llm = OpenAICompatLLM()
-    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=4, temperature=0.8))
+    backend = AiderBackend(AiderConfig(model=aider_model))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=4, temperature=0.8),
+                                code_backend=backend)
     result = synth.synthesize(req, needs_adj=False)
 
     print(f"\n=== 合成结果 ===")

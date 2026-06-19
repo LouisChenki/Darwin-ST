@@ -148,14 +148,41 @@ def exec_operator_code(code: str, class_name: str):
 
 
 class OperatorSynthesizer:
-    """plan-then-code 算子合成 + 验证 harness 守卫 + bounded 重试。"""
+    """plan-then-code 算子合成 + 验证 harness 守卫 + bounded 重试。
 
-    def __init__(self, llm: LLMClient, cfg: SynthesisConfig | None = None):
+    code_backend: 写代码的后端 (可选)。
+      - 给定 (如 AiderBackend): 用它在 git 沙箱里写算子 (健壮, 推荐)。
+      - 为 None: 回退到 LLM 直生代码 + 正则抽取 (轻量, 测试用)。
+    plan 阶段始终用 llm (计划是 JSON 非文件编辑, 不需 aider)。
+    """
+
+    def __init__(self, llm: LLMClient, cfg: SynthesisConfig | None = None, code_backend=None):
         self.llm = llm
         self.cfg = cfg or SynthesisConfig()
+        self.code_backend = code_backend
+
+    def _build_aider_instruction(self, req: FusionRequest, plan: FusionPlan, prev_error: str) -> str:
+        """给 aider 的自然语言指令 (含契约 + 计划 + 上轮错误)。"""
+        import json
+        maths = json.dumps([{"name": m.name, "math": m.math_structure} for m in req.mechanisms],
+                           ensure_ascii=False)
+        instr = (
+            f"在该文件写一个 PyTorch nn.Module 算子类, 类名必须是 {plan.operator_name}。\n"
+            f"契约(必须遵守): __init__(self, channels, num_nodes, **kw); "
+            f"forward(self, x, adj=None) 返回与 x 同形状 [B,T,N,C] 的张量; "
+            f"绝不丢节点维 N(不要 flatten/mean 掉 N); 必须可微(不用 round/argmax/detach/.item/原地操作); "
+            f"forward 只能用 x 和 adj(不访问标签); 参数量适中。\n"
+            f"融合方式={plan.composition}; 融合理由={plan.rationale}。\n"
+            f"优先 additive_residual: 留一个 nn.Parameter(torch.zeros(1)) 作 α, 输出=主路径+α*新分支。\n"
+            f"相关机制数学结构(灵感): {maths}\n"
+            f"包含必要 import(torch, torch.nn as nn)。只写这一个类。"
+        )
+        if prev_error:
+            instr += f"\n上一版验证失败, 请修正: {prev_error[:600]}"
+        return instr
 
     def synthesize(self, req: FusionRequest, needs_adj: bool = False) -> SynthesisResult:
-        # 1) 计划
+        # 1) 计划 (始终用 llm)
         try:
             plan_text = self.llm.chat(build_plan_prompt(req), temperature=self.cfg.temperature)
             plan_d = extract_json(plan_text)
@@ -174,9 +201,18 @@ class OperatorSynthesizer:
         prev_error = ""
         for attempt in range(1, self.cfg.max_retries + 1):
             try:
-                code_text = self.llm.chat(build_code_prompt(req, plan, prev_error),
-                                          temperature=self.cfg.temperature)
-                code = extract_code(code_text)
+                if self.code_backend is not None:
+                    # Aider 后端: 沙箱里写代码, 读回
+                    instr = self._build_aider_instruction(req, plan, prev_error)
+                    code, err = self.code_backend.write_operator(instr)
+                    if code is None:
+                        prev_error = f"代码后端失败: {err}"
+                        continue
+                else:
+                    # LLM 直生 + 抽取
+                    code_text = self.llm.chat(build_code_prompt(req, plan, prev_error),
+                                              temperature=self.cfg.temperature)
+                    code = extract_code(code_text)
                 cls = exec_operator_code(code, plan.operator_name)
             except Exception as e:
                 prev_error = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-600:]}"
