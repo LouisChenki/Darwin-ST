@@ -228,3 +228,75 @@ def test_never_asks_user():
     orch = Orchestrator(cfg, _make_eval_fn(crash_prob=0.8), devices=2)
     state = orch.run()  # 若有 input() 会卡死; 能返回即证明无交互
     assert state.stop_reason is not None
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 创造接入 (停滞触发跨域创造)
+# ---------------------------------------------------------------------------
+
+
+def test_creation_triggered_on_stagnation():
+    """停滞时 orchestrator 调 creation_loop, 合成算子的 genotype 被评估。"""
+    from darwin_st.creation import (CreationLoop, MockLLM, OperatorRegistry,
+                                    OperatorSynthesizer, SynthesisConfig)
+    from darwin_st.knowledge import HashEmbedder, InMemoryGraphStore, all_seed_mechanisms
+    from darwin_st.search import operators as ops_mod
+    from darwin_st.search.genotype import Genotype, STBlock
+
+    # 清理注入算子
+    before_ops = set(ops_mod.SPATIAL_OPS)
+
+    store = InMemoryGraphStore(HashEmbedder(dim=128))
+    for m in all_seed_mechanisms():
+        store.add_mechanism(m)
+
+    plan = ('{"operator_name": "OrchFusedOp", "rationale": "r", "shared_structure": "s",'
+            '"composition": "additive_residual", "source_mechanisms": ["a"], "expected_effect": "e"}')
+    code = ('```python\nimport torch\nimport torch.nn as nn\n'
+            'class OrchFusedOp(nn.Module):\n'
+            '    def __init__(self, channels, num_nodes, **kw):\n'
+            '        super().__init__(); self.l = nn.Linear(channels, channels)\n'
+            '        self.a = nn.Parameter(torch.zeros(1))\n'
+            '    def forward(self, x, adj=None): return self.l(x) + self.a * x\n```')
+    resp = iter([plan, code] * 10)
+    synth = OperatorSynthesizer(MockLLM(lambda m: next(resp)), SynthesisConfig(max_retries=2))
+    cloop = CreationLoop(store, store.embedder, synth, OperatorRegistry())
+
+    created = {"ops": []}
+
+    def eval_fn(geno, device):
+        # 记录是否评估到了 synth 算子
+        for b in geno.blocks:
+            if b.spatial_op.startswith("synth_"):
+                created["ops"].append(b.spatial_op)
+        return EvalResult(genotype=geno, status="OK", mae=20.0, device=device,
+                          extra={"num_params": 50_000})
+
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=6, target_mae=0.0, warmup_keep=2,
+                             discard_regression_factor=1.5)
+    # 强制快速停滞: archive stagnation_patience 默认 20, 这里手动调小
+    orch = Orchestrator(cfg, eval_fn, devices=2, base_genotype=Genotype(blocks=[STBlock("gcn", "tcn")]),
+                        creation_loop=cloop)
+    orch.archive.stagnation_patience = 2  # 快速触发创造
+    state = orch.run()
+
+    # 创造事件应被记录
+    creation_events = [h for h in state.history if h.get("event") == "creation"]
+    assert len(creation_events) >= 1, "停滞未触发创造"
+    # 合成算子的 genotype 应被评估
+    assert len(created["ops"]) >= 1, "合成算子未进入评估"
+
+    # 清理
+    for k in list(ops_mod.SPATIAL_OPS):
+        if k not in before_ops:
+            ops_mod.SPATIAL_OPS.pop(k, None)
+
+
+def test_creation_none_does_not_break():
+    """不接 creation_loop 时, 停滞照常 island_reset, 不崩。"""
+    cfg = OrchestratorConfig(population_size=4, tournament_size=2, max_rounds=4, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=2)  # creation_loop=None
+    orch.archive.stagnation_patience = 2
+    state = orch.run()
+    assert state.rounds == 4  # 正常跑完

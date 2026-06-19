@@ -105,10 +105,13 @@ class Orchestrator:
         base_genotype: Genotype | None = None,
         protected: list[str] | None = None,
         on_round: Callable[[RunState], None] | None = None,
+        creation_loop=None,                # Tier-2 CreationLoop: 停滞时触发跨域创造 (可选)
     ):
         self.cfg = config
         self.memory = memory
         self.on_round = on_round
+        self.creation_loop = creation_loop
+        self._pending_seed_genotypes: list = []   # 创造产出的待评 genotype 队列
 
         self.evo = AgingEvolution(
             population_size=config.population_size,
@@ -163,7 +166,12 @@ class Orchestrator:
     def step(self) -> list[EvalResult]:
         """跑一轮: 取 (设备数) 个架构并行评估, 消化结果。返回本轮结果。"""
         batch_size = self.scheduler.num_devices
-        genotypes = [self.evo.ask() for _ in range(batch_size)]
+        genotypes = []
+        # 优先评估创造产出的待评 genotype (Tier-2 新算子), 余位由进化补
+        while self._pending_seed_genotypes and len(genotypes) < batch_size:
+            genotypes.append(self._pending_seed_genotypes.pop(0))
+        while len(genotypes) < batch_size:
+            genotypes.append(self.evo.ask())
         results = self.scheduler.run_batch(genotypes)
         for res in results:
             self._digest(res)
@@ -238,7 +246,30 @@ class Orchestrator:
                 self.state.stop_reason = reason
                 break
             self.step()
-            # 停滞 → 岛屿重置 (清差半, 交 empty_cells 给后续 LLM 定向)
+            # 停滞 → Tier-2 跨域创造(若接入)+ 岛屿重置
             if self.archive.stagnated():
+                self._try_creation()
                 self.archive.island_reset()
         return self.state
+
+    def _try_creation(self) -> None:
+        """停滞时触发 Tier-2 跨域创造: 合成新算子 → 待评 genotype 入队。
+
+        失败/无创造层都不中止循环(自主性: 创造是低频增益, 非必需)。
+        """
+        if self.creation_loop is None:
+            return
+        gap = None
+        if self.state.sota_mae is not None and self.state.best_mae < float("inf"):
+            gap = self.state.best_mae - self.state.sota_mae
+        try:
+            outcome = self.creation_loop.maybe_create(
+                self.state.best_genotype, sota_gap=gap,
+                run_tag=self.cfg.run_tag, dataset=self.cfg.dataset)
+            if outcome.success and outcome.seed_genotype is not None:
+                self._pending_seed_genotypes.append(outcome.seed_genotype)
+                self.state.history.append({"event": "creation", "operator": outcome.operator_name,
+                                           "bottleneck": outcome.bottleneck})
+        except Exception as e:
+            # 创造出错不中止优化
+            self.state.history.append({"event": "creation_failed", "error": str(e)[:120]})
