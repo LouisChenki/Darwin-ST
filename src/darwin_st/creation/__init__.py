@@ -13,6 +13,14 @@ from darwin_st.creation.contracts import (
     FusionPlan,
     SynthesizedOperator,
 )
+from darwin_st.creation.llm import LLMClient, MockLLM, OpenAICompatLLM
+from darwin_st.creation.synthesizer import (
+    SynthesisConfig,
+    SynthesisResult,
+    OperatorSynthesizer,
+    extract_code,
+    exec_operator_code,
+)
 
 __all__ = [
     "ZeroInitResidualFusion",
@@ -24,4 +32,12 @@ __all__ = [
     "FusionRequest",
     "FusionPlan",
     "SynthesizedOperator",
+    "LLMClient",
+    "MockLLM",
+    "OpenAICompatLLM",
+    "SynthesisConfig",
+    "SynthesisResult",
+    "OperatorSynthesizer",
+    "extract_code",
+    "exec_operator_code",
 ]
