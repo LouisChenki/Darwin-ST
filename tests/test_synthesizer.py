@@ -221,3 +221,67 @@ def test_synthesize_code_backend_failure():
     res = synth.synthesize(_req())
     assert not res.success
     assert "后端" in res.last_error or "验证" in res.last_error
+
+
+# ---------------------------------------------------------------------------
+# 多假设合成 (synthesize_many)
+# ---------------------------------------------------------------------------
+
+
+_PLAN_ARRAY = (
+    '[{"operator_name": "HypoA", "rationale": "r", "shared_structure": "s",'
+    ' "composition": "additive_residual", "source_mechanisms": ["a"], "expected_effect": "e"},'
+    ' {"operator_name": "HypoB", "rationale": "r2", "shared_structure": "s2",'
+    ' "composition": "parallel", "source_mechanisms": ["b"], "expected_effect": "e2"}]'
+)
+
+def _op_code(name):
+    return (f'```python\nimport torch\nimport torch.nn as nn\n'
+            f'class {name}(nn.Module):\n'
+            f'    def __init__(self, channels, num_nodes, **kw):\n'
+            f'        super().__init__(); self.l = nn.Linear(channels, channels)\n'
+            f'        self.a = nn.Parameter(torch.zeros(1))\n'
+            f'    def forward(self, x, adj=None): return self.l(x) + self.a * x\n```')
+
+
+def test_synthesize_many_multiple_success():
+    """一次生成 2 个假设, 各自合成 → 2 个成功结果。"""
+    responses = iter([_PLAN_ARRAY, _op_code("HypoA"), _op_code("HypoB")])
+    llm = MockLLM(lambda msgs: next(responses))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1))
+    results = synth.synthesize_many(_req(), n_hypotheses=2)
+    successes = [r for r in results if r.success]
+    assert len(successes) == 2
+    assert {r.operator.name for r in successes} == {"HypoA", "HypoB"}
+
+
+def test_synthesize_many_partial_success():
+    """2 假设, 一个好一个坏 → 1 成功 1 失败, 不崩。"""
+    bad = ('```python\nimport torch.nn as nn\nclass HypoB(nn.Module):\n'
+           '    def __init__(self,channels,num_nodes,**kw):\n        super().__init__(); self.l=nn.Linear(channels,channels)\n'
+           '    def forward(self,x,adj=None): return self.l(x).mean(dim=2)\n```')  # 丢N
+    responses = iter([_PLAN_ARRAY, _op_code("HypoA"), bad])
+    llm = MockLLM(lambda msgs: next(responses))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1))
+    results = synth.synthesize_many(_req(), n_hypotheses=2)
+    assert sum(1 for r in results if r.success) == 1
+    assert sum(1 for r in results if not r.success) == 1
+
+
+def test_synthesize_many_bad_plan_array():
+    """计划阶段非数组/非JSON → 优雅失败。"""
+    llm = MockLLM(lambda msgs: "不是JSON")
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1))
+    results = synth.synthesize_many(_req(), n_hypotheses=2)
+    assert all(not r.success for r in results)
+
+
+def test_synthesize_many_dedup_names():
+    """重名假设去重。"""
+    dup = '[' + _PLAN_ARRAY[1:-1].split('},')[0] + '}, ' + _PLAN_ARRAY[1:-1].split('},')[0] + '}]'
+    responses = iter([dup, _op_code("HypoA")])
+    llm = MockLLM(lambda msgs: next(responses))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1))
+    results = synth.synthesize_many(_req(), n_hypotheses=2)
+    # 两个同名 HypoA, 去重后只合成一个
+    assert len([r for r in results if r.success]) <= 1

@@ -31,20 +31,32 @@ __all__ = ["CreationConfig", "CreationOutcome", "CreationLoop", "diagnose_bottle
 class CreationConfig:
     target_domain: str = "ST"
     max_mechanisms: int = 3        # 跨域互补集大小
+    n_hypotheses: int = 4          # 一次生成多少个融合假设 (单 Generator 生 N 个)
     seed: int = 0
 
 
 @dataclass
 class CreationOutcome:
-    """一次创造尝试的结果。"""
+    """一次创造尝试的结果 (可含多个成功算子)。"""
 
-    success: bool
-    operator_name: str | None = None      # 注入的算子注册名
-    seed_genotype: Genotype | None = None # 用新算子产出的待评 genotype
+    success: bool                          # 至少有一个算子成功合成+注入
+    operator_names: list[str] = field(default_factory=list)   # 注入的算子注册名(多个)
+    seed_genotypes: list[Genotype] = field(default_factory=list)  # 待评 genotype(多个)
     bottleneck: str = ""
     retrieved_mechanisms: list[str] = field(default_factory=list)
-    reason: str = ""                      # 失败原因 / 成功说明
-    insight: str = ""                     # 写入 memory 的融合经验
+    n_hypotheses: int = 0                  # 生成的假设数
+    n_success: int = 0                     # 成功合成的数
+    reason: str = ""
+    insight: str = ""
+
+    # 向后兼容单算子访问
+    @property
+    def operator_name(self) -> str | None:
+        return self.operator_names[0] if self.operator_names else None
+
+    @property
+    def seed_genotype(self) -> Genotype | None:
+        return self.seed_genotypes[0] if self.seed_genotypes else None
 
 
 def diagnose_bottleneck(best_genotype: Genotype | None, sota_gap: float | None) -> str:
@@ -101,33 +113,39 @@ class CreationLoop:
         if not res.mechanisms:
             return CreationOutcome(False, bottleneck=bottleneck, reason="跨域检索无结果")
 
-        # 3) 合成 + 验证 (synthesizer 内部走 LLM/Aider + 验证 harness)
+        # 3) 多假设合成: 一次生成 N 个融合方案, 各自合成+验证
         req = FusionRequest(
             bottleneck=bottleneck, target_preconditions=res.target_preconditions,
             mechanisms=res.mechanisms,
             baseline_operator=(best_genotype.blocks[0].spatial_op if best_genotype else ""))
-        synth_res = self.synthesizer.synthesize(req, needs_adj=False)
+        results = self.synthesizer.synthesize_many(req, n_hypotheses=self.cfg.n_hypotheses,
+                                                   needs_adj=False)
+        successes = [r for r in results if r.success and r.operator is not None]
 
-        if not synth_res.success:
-            insight = f"融合 {mech_names} 解决'{bottleneck}'未通过合成/验证: {synth_res.last_error[:120]}"
+        if not successes:
+            err = results[0].last_error if results else "无结果"
+            insight = f"融合 {mech_names} 解决'{bottleneck}': {len(results)} 个假设均未过验证"
             self._record_insight(insight, dataset, mech_names, success=False)
-            return CreationOutcome(False, bottleneck=bottleneck,
-                                   retrieved_mechanisms=mech_names,
-                                   reason=synth_res.last_error[:200], insight=insight)
+            return CreationOutcome(False, bottleneck=bottleneck, retrieved_mechanisms=mech_names,
+                                   n_hypotheses=len(results), n_success=0,
+                                   reason=err[:200], insight=insight)
 
-        # 4) 注入算子库
-        reg_name = self.registry.register(synth_res.operator)
+        # 4) 注入所有成功算子 + 各产出一个待评 genotype
+        op_names, seeds = [], []
+        for r in successes:
+            reg_name = self.registry.register(r.operator)
+            op_names.append(reg_name)
+            seeds.append(self._make_seed_genotype(best_genotype, reg_name))
 
-        # 5) 产出用新算子的 genotype 交给进化 (以最优为基, 把第一块空间算子换成新算子)
-        seed_geno = self._make_seed_genotype(best_genotype, reg_name)
-
-        insight = (f"成功融合 {mech_names} → 新算子 {reg_name}(组合方式 "
-                   f"{synth_res.plan.composition})解决'{bottleneck}'; 已注入待评测")
+        compositions = [r.plan.composition for r in successes]
+        insight = (f"融合 {mech_names} 解决'{bottleneck}': {len(results)} 假设中 "
+                   f"{len(successes)} 个成功 → 注入 {op_names}(组合 {compositions}), 待评测")
         self._record_insight(insight, dataset, mech_names, success=True)
 
         return CreationOutcome(
-            True, operator_name=reg_name, seed_genotype=seed_geno,
+            True, operator_names=op_names, seed_genotypes=seeds,
             bottleneck=bottleneck, retrieved_mechanisms=mech_names,
+            n_hypotheses=len(results), n_success=len(successes),
             reason="合成并注入成功", insight=insight)
 
     def _make_seed_genotype(self, best: Genotype | None, op_name: str) -> Genotype:

@@ -250,8 +250,8 @@ def test_creation_triggered_on_stagnation():
     for m in all_seed_mechanisms():
         store.add_mechanism(m)
 
-    plan = ('{"operator_name": "OrchFusedOp", "rationale": "r", "shared_structure": "s",'
-            '"composition": "additive_residual", "source_mechanisms": ["a"], "expected_effect": "e"}')
+    plan = ('[{"operator_name": "OrchFusedOp", "rationale": "r", "shared_structure": "s",'
+            '"composition": "additive_residual", "source_mechanisms": ["a"], "expected_effect": "e"}]')
     code = ('```python\nimport torch\nimport torch.nn as nn\n'
             'class OrchFusedOp(nn.Module):\n'
             '    def __init__(self, channels, num_nodes, **kw):\n'

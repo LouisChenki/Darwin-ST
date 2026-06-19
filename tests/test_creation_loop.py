@@ -35,6 +35,9 @@ _GOOD_PLAN = (
     '"expected_effect": "改善长程"}'
 )
 
+# 多假设路径: 计划阶段返回 JSON 数组
+_GOOD_PLAN_ARRAY = "[" + _GOOD_PLAN + "]"
+
 _GOOD_CODE = '''```python
 import torch
 import torch.nn as nn
@@ -103,7 +106,7 @@ def test_diagnose_sota_gap():
 
 
 def test_maybe_create_success(store):
-    loop = _loop(store, [_GOOD_PLAN, _GOOD_CODE])
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
     best = Genotype(blocks=[STBlock("gcn", "tcn")])
     outcome = loop.maybe_create(best, sota_gap=3.0)
     assert outcome.success, outcome.reason
@@ -115,7 +118,7 @@ def test_maybe_create_success(store):
 
 
 def test_maybe_create_seed_genotype_uses_new_op(store):
-    loop = _loop(store, [_GOOD_PLAN, _GOOD_CODE])
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
     best = Genotype(blocks=[STBlock("gcn", "tcn")])
     outcome = loop.maybe_create(best, sota_gap=3.0)
     # 产出的 genotype 第一块用了新算子
@@ -124,7 +127,7 @@ def test_maybe_create_seed_genotype_uses_new_op(store):
 
 def test_maybe_create_seed_genotype_compiles(store):
     """产出的待评 genotype 能 builder 编译 + 前向 (闭环到进化)。"""
-    loop = _loop(store, [_GOOD_PLAN, _GOOD_CODE])
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
     best = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=16)
     outcome = loop.maybe_create(best, sota_gap=3.0)
     model = build_model(outcome.seed_genotype, num_nodes=5, in_channels=3,
@@ -136,7 +139,7 @@ def test_maybe_create_seed_genotype_compiles(store):
 def test_maybe_create_records_insight(store):
     """成功创造写 insight 到 memory(融合经验, 不进机制库)。"""
     mem = MemoryStore(":memory:")
-    loop = _loop(store, [_GOOD_PLAN, _GOOD_CODE], memory=mem)
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE], memory=mem)
     loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0, dataset="PeMS04")
     insights = mem.get_insights("PeMS04")
     assert len(insights) >= 1
@@ -149,10 +152,10 @@ def test_maybe_create_synth_failure_records_and_no_crash(store):
     mem = MemoryStore(":memory:")
     # 计划 OK 但代码一直坏(丢节点维)
     bad_code = '```python\nimport torch.nn as nn\nclass FusedCreationOp(nn.Module):\n    def __init__(self,channels,num_nodes,**kw):\n        super().__init__(); self.l=nn.Linear(channels,channels)\n    def forward(self,x,adj=None): return self.l(x).mean(dim=2)\n```'
-    loop = _loop(store, [_GOOD_PLAN, bad_code, bad_code, bad_code], memory=mem)
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, bad_code, bad_code], memory=mem)
     outcome = loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
     assert not outcome.success
     assert outcome.insight  # 记了失败经验
     insights = mem.get_insights("PeMS04")
-    assert any("未通过" in i["insight_text"] for i in insights)
+    assert any("未过验证" in i["insight_text"] for i in insights)
     mem.close()

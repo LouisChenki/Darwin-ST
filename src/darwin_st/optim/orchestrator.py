@@ -266,10 +266,11 @@ class Orchestrator:
             outcome = self.creation_loop.maybe_create(
                 self.state.best_genotype, sota_gap=gap,
                 run_tag=self.cfg.run_tag, dataset=self.cfg.dataset)
-            if outcome.success and outcome.seed_genotype is not None:
-                self._pending_seed_genotypes.append(outcome.seed_genotype)
-                self.state.history.append({"event": "creation", "operator": outcome.operator_name,
-                                           "bottleneck": outcome.bottleneck})
+            if outcome.success and outcome.seed_genotypes:
+                self._pending_seed_genotypes.extend(outcome.seed_genotypes)
+                self.state.history.append({"event": "creation", "operators": outcome.operator_names,
+                                           "bottleneck": outcome.bottleneck,
+                                           "n_success": outcome.n_success})
         except Exception as e:
             # 创造出错不中止优化
             self.state.history.append({"event": "creation_failed", "error": str(e)[:120]})
