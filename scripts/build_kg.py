@@ -190,6 +190,9 @@ EXTRACT_SYSTEM = """你是时空预测 AutoML 系统的【跨域机制抽取员�
 - 只抽真正的【可移植基元】。一篇论文通常贡献 0-2 个新基元; 多数是在复用已有基元——\
   复用的基元也可抽 (跨域全面性靠它), 但 abstract_function 要写成域无关的。
 - preconditions 必须从给定受控词表里挑, 不要自造前提。
+- 【语言统一】所有自由文本字段 (abstract_function / causal_behavior / consequences /\
+  anti_patterns) 一律用英文输出, 保证库内语言一致 (跨域向量检索一致性)。\
+  name 用英文 snake_case 学界通名。即使论文是中文或你倾向中文, 也必须输出英文。
 - 严格输出 JSON: {{"mechanisms": [ {{...}}, ... ]}}。无机制则输出 {{"mechanisms": []}}。"""
 
 
