@@ -14,7 +14,7 @@ results/
 queue/
 
 # Agent prompt files (generated per-session by launchers)
-CLAUDE.md
+# 注: CLAUDE.md 现在是长期维护的项目指南(非 per-session), 故跟踪它; AGENTS.md 仍由 launcher 生成
 AGENTS.md
 
 # Experimental code/artifacts
