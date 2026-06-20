@@ -55,8 +55,13 @@ from darwin_st.knowledge.ontology import (  # noqa: E402
     Mechanism,
 )
 from darwin_st.knowledge.extraction import (  # noqa: E402
+    PRECONDITION_ALIASES,
+    PRECONDITION_VOCAB,
+    canonical_name,
     coverage_report,
     dedup_mechanisms,
+    normalize_domain,
+    normalize_preconditions,
     parse_mechanism_cards,
 )
 from darwin_st.knowledge.seeds import all_seed_mechanisms  # noqa: E402
@@ -294,9 +299,29 @@ def build_store(out_dir: str):
 
 
 def ingest(store, mechs: list[Mechanism]) -> tuple[int, list[str]]:
-    """灌库 (validate 失败的卡跳过并记录)。返回 (成功数, 跳过原因)。"""
+    """灌库。进库前对 origin_domain + preconditions 做最后一道归一兜底 ——
+    保证不因写法 (大小写/下划线/同义词) 而静默丢卡或丢前提 (全面性铁律)。
+      · 域: normalize_domain 的"未知→ST"使域问题永不致丢卡;
+      · 前提: normalize_preconditions 把同义词归一到 VOCAB, 真未知的丢弃并 log
+        (让你看见被丢的概念, 决定是否登记进 PRECONDITION_VOCAB)。
+    真改写/丢弃时显式 log, 不静默。validate 仍可能因其他原因拒卡, 那是真错照常记录。
+    返回 (成功数, 跳过原因)。"""
     ok, skipped = 0, []
     for m in mechs:
+        canon = normalize_domain(m.origin_domain)
+        if canon != m.origin_domain:
+            print(f"  [域归一] {m.name}: {m.origin_domain!r} → {canon!r}", flush=True)
+            m.origin_domain = canon
+        norm_pre = normalize_preconditions(m.preconditions)
+        # 被丢弃 ⟺ canonical 后既不在 VOCAB 也不在 ALIASES (与 normalize_preconditions 同判定);
+        # 不能拿原始词比归一后的词 (归一成功也会"不相等", 会误报)。
+        dropped = [p for p in (m.preconditions or [])
+                   if canonical_name(p) not in PRECONDITION_VOCAB
+                   and canonical_name(p) not in PRECONDITION_ALIASES]
+        if dropped:
+            print(f"  [前提丢弃] {m.name}: {dropped} 不在受控词表/别名表 "
+                  f"(如需保留请登记进 PRECONDITION_VOCAB 或 PRECONDITION_ALIASES)", flush=True)
+        m.preconditions = norm_pre
         try:
             store.add_mechanism(m)
             ok += 1
