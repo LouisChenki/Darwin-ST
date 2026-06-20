@@ -20,6 +20,10 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+# P3-b 建图 pipeline (scripts/build_kg.py): PDF 方法段回退解析
+kg = [
+    "pypdf>=4.0.0",
+]
 
 [build-system]
 requires = ["hatchling"]

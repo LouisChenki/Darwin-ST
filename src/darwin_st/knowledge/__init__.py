@@ -21,6 +21,14 @@ from darwin_st.knowledge.retrieval import (
     find_cross_domain_analogy,
     decompose_to_preconditions,
 )
+from darwin_st.knowledge.extraction import (
+    parse_mechanism_cards,
+    normalize_preconditions,
+    normalize_domain,
+    dedup_mechanisms,
+    coverage_report,
+    CoverageReport,
+)
 
 __all__ = [
     "Mechanism",
@@ -39,4 +47,10 @@ __all__ = [
     "cross_domain_analogy",
     "find_cross_domain_analogy",
     "decompose_to_preconditions",
+    "parse_mechanism_cards",
+    "normalize_preconditions",
+    "normalize_domain",
+    "dedup_mechanisms",
+    "coverage_report",
+    "CoverageReport",
 ]
