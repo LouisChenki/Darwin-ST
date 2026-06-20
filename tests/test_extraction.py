@@ -103,6 +103,28 @@ def test_parse_cards_bare_array():
     assert len(cards) == 1 and cards[0].name == "x"
 
 
+def test_parse_cards_salvages_truncated_output():
+    """被 max_tokens 截断的响应: 救回截断前的完整卡, 丢弃半张 (不整批归零)。
+
+    复现小批实跑的 0 卡 bug: batch 输出超 max_tokens 被切断 → 整段 JSON 不平衡 →
+    旧逻辑返回 [] (20 篇全军覆没)。截断容错应救回前两张完整卡。
+    """
+    truncated = (
+        '{"mechanisms": [\n'
+        '  {"name": "state_space_model", "abstract_function": "建模长程依赖",'
+        '   "preconditions": ["long_range_dependency"], "origin_domain": "NLP",'
+        '   "abstraction_level": "concept"},\n'
+        '  {"name": "masked_autoencoding", "abstract_function": "遮盖重建学冗余",'
+        '   "preconditions": ["redundancy"], "origin_domain": "CV",'
+        '   "abstraction_level": "concept"},\n'
+        '  {"name": "contrastive_lea'  # ← 截断在第三张中间
+    )
+    cards = parse_mechanism_cards(truncated)
+    assert [c.name for c in cards] == ["state_space_model", "masked_autoencoding"]
+    for c in cards:
+        c.validate()  # 救回的卡归一后仍合法
+
+
 def test_parse_cards_skips_empty_and_garbage():
     raw = '{"mechanisms": [{"name":"", "abstract_function":"a"}, {"name":"ok","abstract_function":""}]}'
     assert parse_mechanism_cards(raw) == []

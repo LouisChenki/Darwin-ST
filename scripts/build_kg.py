@@ -79,7 +79,9 @@ ABSTRACT_MIN_LEN = 600
 ST_DOMAINS = {"spatio-temporal", "spatiotemporal", "st"}
 
 # 一次 LLM 抽取喂几篇 (批处理省 token; 太大则单卡质量降)。
-BATCH_SIZE = 4
+# 每次喂 LLM 的论文数。1 = 每篇单独抽: 输出短不易被 max_tokens 截断,
+# 且单篇解析失败不连累整批 (小批实跑发现 batch=4 时输出超 4096 token 被截断→整批 0 卡)。
+BATCH_SIZE = 1
 
 
 # ===========================================================================
@@ -88,14 +90,22 @@ BATCH_SIZE = 4
 
 
 def load_corpus(corpus_dir: str, limit: int | None = None) -> list[dict]:
-    """读 metadata.jsonl → list[dict]。每条含 id/title/abstract/domain/pdf_path 等。"""
+    """读 metadata.jsonl → list[dict]。每条含 id/title/abstract/domain/pdf_path 等。
+
+    pdf_path 在 metadata 里是相对路径 (如 'papers/xxx.pdf'); 这里解析为绝对路径
+    (相对 corpus_dir), 否则 PDF 回退会因 CWD≠corpus_dir 而静默失败 (找不到文件→空文本)。
+    """
     meta_path = os.path.join(corpus_dir, "metadata.jsonl")
     rows: list[dict] = []
     with open(meta_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                r = json.loads(line)
+                pp = r.get("pdf_path", "")
+                if pp and not os.path.isabs(pp):
+                    r["pdf_path"] = os.path.join(corpus_dir, pp)
+                rows.append(r)
     if limit:
         rows = rows[:limit]
     return rows
@@ -219,7 +229,7 @@ def extract_batch(llm, batch: list[dict], avoid, must_have) -> list[Mechanism]:
     try:
         resp = llm.chat(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.3, max_tokens=4096,
+            temperature=0.3, max_tokens=8192,
         )
     except Exception as e:  # 单批失败不致命, 记日志继续
         print(f"  [warn] LLM 抽取批失败: {e}", flush=True)

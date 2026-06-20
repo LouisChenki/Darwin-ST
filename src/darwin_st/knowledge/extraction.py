@@ -342,8 +342,57 @@ def _as_list(v) -> list:
     return [v]
 
 
+def _salvage_objects(text: str) -> list:
+    """从被截断的 JSON 文本里抢救出数组内所有"完整的 {...} 对象"。
+
+    LLM 输出被 max_tokens 截断时, 整段 {"mechanisms":[{...},{...},{... ← 断]} 不平衡,
+    json.loads 整段失败。但截断点之前的若干 {...} 是完整的 —— 从第一个 '[' 之后
+    (跳过外层容器), 逐字符扫描平衡括号, 把每个能独立 json.loads 成功的对象救回来
+    (宁可少抽几张, 不要整批归零)。无 '[' (裸对象流) 时从头扫。
+    """
+    lb = text.find("[")
+    scan_from = lb + 1 if lb >= 0 else 0
+    out: list = []
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i in range(scan_from, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        obj = json.loads(text[start : i + 1])
+                        if isinstance(obj, dict):
+                            out.append(obj)
+                    except Exception:
+                        pass
+                    start = -1
+    return out
+
+
 def _extract_json(text: str):
-    """从可能含 markdown 围栏/噪声的文本里抽出第一段合法 JSON。"""
+    """从可能含 markdown 围栏/噪声的文本里抽出第一段合法 JSON。
+
+    截断容错: 直接解析与平衡括号都失败时 (常见于 max_tokens 截断), 退而抢救
+    所有完整的顶层 {...} 对象, 包成 {"mechanisms": [...]} 返回 —— 避免整批归零。
+    """
     if not text:
         return None
     # 去 ```json ... ``` 围栏
@@ -371,6 +420,13 @@ def _extract_json(text: str):
                         return json.loads(candidate[start : i + 1])
                     except Exception:
                         break
+    # 最后兜底: 截断输出里抢救完整的顶层对象 (单卡或多卡)
+    salvaged = _salvage_objects(candidate)
+    if salvaged:
+        # 若救回的对象本身就是 {"mechanisms":[...]} 容器, 解包; 否则当作卡列表
+        if len(salvaged) == 1 and ("mechanisms" in salvaged[0] or "cards" in salvaged[0]):
+            return salvaged[0]
+        return {"mechanisms": salvaged}
     return None
 
 
