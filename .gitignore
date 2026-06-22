@@ -27,8 +27,10 @@ results.tsv
 .DS_Store
 reference/
 
-# P3-b 建图产物 (大 JSON, 运行时生成; 保留 README)
+# P3-b 建图 + 质检产物 (运行时生成; 保留 README)
 src/darwin_st/knowledge/data/*.json
+src/darwin_st/knowledge/data/*.md
+!src/darwin_st/knowledge/data/README.md
 
 #Python
 .venv
