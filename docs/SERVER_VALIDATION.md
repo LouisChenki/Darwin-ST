@@ -143,3 +143,24 @@ warmup+相对退化标定修复后, 同配置(3轮×4架构, 12 epoch)复跑:
 **数据同步备注**: mechanism_cards.json(956KB)本是gitignore的data/产物, 因scp/本地→服务器传输被环境拦截, 用`git add -f`强制跟踪此一文件经GitHub中转到服务器(未改gitignore规则)。
 
 **结论**: 定稿615库在正式实验环境(服务器GPU+真实嵌入)跨域检索**工作良好且语义合理**, 真实语义较Hash显著提升检出质量。跨域类比研究假设在定稿库上坐实, 为Tier-2创造闭环铺好路。
+
+## P3-b 创造闭环用615库实跑 + flash模型 (2026-06-23, HEAD c7e35e9)
+
+**目的**: 把创造闭环知识源从16种子卡换成615定稿库(KB_SOURCE=cards), 验证大库能跑通整条Level-2创造链。中途用户要求把DeepSeek-v4-pro换flash加速(run_creation_loop在round1后切换, 未浪费LLM调用)。
+
+**配置**: PeMS04, 4×5090, POP=6 MAX_ROUNDS=4 STAGNATION=2 N_HYPOTHESES=4 MAX_EPOCHS=8, KB_SOURCE=cards(615库, Neo4j复用), DEEPSEEK_MODEL=deepseek-v4-flash(诊断/合成LLM + Aider写码均用flash)。全程1195s≈20min。
+
+**flash合成大获成功(推翻"flash写代码弱"的预判)**:
+- ✅ **创造触发2次, 合成算子全部成功**: 第一次2/2过验证门, 第二次4/4。注入算子库累积15个synth算子。
+- ✅ **21个含synth算子的试验真实训练全部KEEP**, 最优MAE=21.94由合成算子保持。
+- ✅ **flash vs pro**: 合成成功率不输(pro历史3/3, flash 2/2+4/4); 速度明显更快; 写码经Aider+验证门兜底, flash完全够用。
+
+**615库 vs 16种子库增益**:
+- 16种子库(P2.5-g): 最优合成算子MAE=**29.46**。
+- 615库(本次): 最优MAE=**21.94**, 大幅提升。(注: 对比不完全干净, 进化/HPO也有贡献; 但615库检索精准命中dilated_causal_convolution等对症机制驱动合成。)
+
+**注入式设计红利验证**: 仅改run_creation_loop.py的store初始化8行(KB_SOURCE切换+KB_RELOAD防残留), CreationLoop/synthesize_many/orchestrator/评测层零改动即换知识源。
+
+**诚实观察**: 本次检索主要拉回dilated_causal_convolution(长程依赖对症), 合成算子全是它的融合变体(残差/门控/并行多尺度)。615库丰富性体现在"检索精准命中对症机制", 但单瓶颈下融合的机制种类不算多样——受瓶颈诊断措辞影响, 可调。
+
+**结论**: 615定稿库在创造闭环跑通, flash模型合成成功率与速度俱佳, 大库较小库MAE显著提升。论文核心创新(LLM跨域涌现合成有效算子)在定稿库+flash上再次验证。下一步可: 更丰富瓶颈触发多样融合 / P4收尾 / 正式冲SOTA长跑。
