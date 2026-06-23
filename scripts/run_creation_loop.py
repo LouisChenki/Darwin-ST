@@ -33,6 +33,7 @@ from darwin_st.search.genotype import Genotype, STBlock
 from darwin_st.knowledge import all_seed_mechanisms
 from darwin_st.knowledge.embedding import SentenceTransformerEmbedder
 from darwin_st.knowledge.graph_store import Neo4jGraphStore, InMemoryGraphStore
+from darwin_st.knowledge.qc import mechanisms_from_cards
 from darwin_st.creation import (CreationLoop, OperatorRegistry, OperatorSynthesizer,
                                 SynthesisConfig)
 from darwin_st.creation.llm import OpenAICompatLLM
@@ -42,6 +43,31 @@ from darwin_st.creation.aider_backend import AiderBackend, AiderConfig
 def _env_int(k, d):
     v = os.environ.get(k)
     return int(v) if v else d
+
+
+def _load_mechanisms(cache):
+    """按 KB_SOURCE 选知识源: cards=615 定稿库 / seeds=16 种子卡。
+
+    KB_SOURCE=cards (默认): 从 mechanism_cards.json 读 → mechanisms_from_cards 重建。
+    KB_SOURCE=seeds: 16 种子卡 (旧行为, 便于对比时一行切回)。
+    路径可 KB_CARDS 覆盖, 默认仓库内 data/mechanism_cards.json。
+    """
+    import json
+
+    src = os.environ.get("KB_SOURCE", "cards")
+    if src == "seeds":
+        return all_seed_mechanisms(), "seeds-16"
+    default_cards = os.path.join(os.path.dirname(__file__), "..", "src", "darwin_st",
+                                 "knowledge", "data", "mechanism_cards.json")
+    path = os.environ.get("KB_CARDS", default_cards)
+    cards = json.load(open(path, encoding="utf-8")).get("mechanisms", [])
+    mechs = mechanisms_from_cards(cards)
+    return mechs, f"cards-{len(mechs)}"
+
+
+def _domain_dist(mechs):
+    from collections import Counter
+    return dict(sorted(Counter(m.origin_domain for m in mechs).items()))
 
 
 def main():
@@ -59,18 +85,29 @@ def main():
           f"停滞触发={stagnation}")
 
     # --- 知识图谱 (跨域检索) ---
+    mechs, kb_tag = _load_mechanisms(cache)
+    kb_reload = os.environ.get("KB_RELOAD", "0") == "1"
+    print(f"[知识] 源={kb_tag} 域分布={_domain_dist(mechs)}")
     embedder = SentenceTransformerEmbedder()
     try:
         store = Neo4jGraphStore(embedder)
-        if not store.all_mechanisms():
-            for m in all_seed_mechanisms():
+        existing = len(store.all_mechanisms())
+        # 残留旧库 (如上次的 16 种子) 与本次期望不符, 或显式 KB_RELOAD → 清空重灌,
+        # 否则"验证了 615"是假的 (检索到的是旧库)。
+        if kb_reload or existing != len(mechs):
+            with store.driver.session() as s:
+                s.run("MATCH (n) WHERE n:Mechanism OR n:Precondition DETACH DELETE n")
+            for m in mechs:
                 store.add_mechanism(m)
-        print(f"[知识] Neo4j 机制数: {len(store.all_mechanisms())}")
+            print(f"[知识] Neo4j 清空重灌: {existing} → {len(store.all_mechanisms())}")
+        else:
+            print(f"[知识] Neo4j 已有 {existing} 机制, 数量匹配, 复用 (KB_RELOAD=1 强制重灌)")
     except Exception as e:
         print(f"[知识] Neo4j 不可用({e}), 回退内存图")
         store = InMemoryGraphStore(embedder)
-        for m in all_seed_mechanisms():
+        for m in mechs:
             store.add_mechanism(m)
+        print(f"[知识] 内存图机制数: {len(store.all_mechanisms())}")
 
     # --- 创造层 (真实 DeepSeek + Aider) ---
     model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
