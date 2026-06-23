@@ -10,7 +10,7 @@ genotype 是「离散、可序列化、可变异」的架构表示 (phenotype=bu
   - adj_mode: 邻接归一化模式 (sym/rw/none, 仅对需要外部图的空间算子)
   - protected: 创新点保护区 —— Agent 在 Tier2 写入的创新算子名列表, **进化禁止删除**
 
-铁律 (来自 SKILL.md 与 architecture-rules.md):
+铁律 (见 docs/P2_ALGORITHM_DESIGN.md 架构铁律):
   - 【创新点保护区】protected 中的算子在任何变异下不得被移除 (可调其超参/接线, 不可删)
   - 节点维 N 由算子层保证不丢; genotype 层不引入展平
 """

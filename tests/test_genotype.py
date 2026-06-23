@@ -4,7 +4,7 @@
   - 序列化往返一致, 签名稳定且键序无关
   - 合法性校验拦截非法算子/融合/adj_mode
   - 变异返回新对象不改原件
-  - **创新点保护区**: 保护算子不可被 swap/remove (SKILL.md 铁律)
+  - **创新点保护区**: 保护算子不可被 swap/remove (架构铁律)
 """
 
 from __future__ import annotations

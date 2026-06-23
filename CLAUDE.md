@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Darwin-ST is an **autonomous spatio-temporal forecasting research system**: it self-optimizes traffic-forecasting models (PeMS04/08, METR-LA, PEMS-BAY) toward SOTA via evolutionary NAS + HPO, and — its core research bet — uses an LLM to **invent new operators by cross-domain analogy** (e.g. transplanting masked-autoencoding from CV into ST). It originated as a fork of `karpathy/autoresearch` (an LLM-pretraining auto-tuner) but the internals were fully rebuilt for ST forecasting. The `darwin-st/` directory is the legacy Agent-Skill publish layer (SKILL.md + thin shells); the real system is the `src/darwin_st/` package.
+Darwin-ST is an **autonomous spatio-temporal forecasting research system**: it self-optimizes traffic-forecasting models (PeMS04/08, METR-LA, PEMS-BAY) toward SOTA via evolutionary NAS + HPO, and — its core research bet — uses an LLM to **invent new operators by cross-domain analogy** (e.g. transplanting masked-autoencoding from CV into ST). The whole system lives in the `src/darwin_st/` package: a self-contained Python system that calls an LLM as a low-frequency Tier-2 tool (the Python harness drives; the LLM does not).
 
 The governing design lives in `docs/` — read these before substantial work: `ANALYSIS.md` (original diagnosis), `BLUEPRINT.md` (P0–P4 roadmap), `P2_ALGORITHM_DESIGN.md` (NAS/HPO/MAP-Elites decisions), `TIER2_DESIGN_DECISIONS.md` + `TIER2_RESEARCH_FINDINGS.md` (the LLM-creation layer), `SERVER_VALIDATION.md` (what's actually been run on real hardware).
 
@@ -63,7 +63,7 @@ src/darwin_st/
 
 - **Masked metrics only.** `data/metrics.py` is the single source of truth; predictions must be inverse-transformed to real scale before scoring. Never compare against unmasked MAE or normalized-scale numbers.
 - **Per-dataset protocol profiles.** PeMS04/08 use 6/2/2 split + 12-step-average MAE; METR-LA/PEMS-BAY use 7/1/2 + per-horizon. `protocol.py` dispatches; hardcoding one corrupts the others. Scaler fits on **train only**.
-- **Node dimension N is sacred.** All tensors are `[B,T,N,C]`; operators must never flatten/mean away N (`architecture-rules.md`). The validation harness enforces this on synthesized ops.
+- **Node dimension N is sacred.** All tensors are `[B,T,N,C]`; operators must never flatten/mean away N (see `docs/P2_ALGORITHM_DESIGN.md` 架构铁律). The validation harness enforces this on synthesized ops.
 - **Aging evolution removes the OLDEST member, not the worst** — this is the noise-regularization core, not a bug.
 - **Baselines are corrected literature numbers** in `baseline_registry.py` (PeMS04 SOTA ≈17.8). The program-driven stop compares `best_so_far` against these — don't "fix" them to old wrong values.
 - **`darwin-st/scripts/*.py` are thin re-export shells** over `src/darwin_st/`. Edit the `src/` source, not the shells.

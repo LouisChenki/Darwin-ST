@@ -6,7 +6,7 @@
     DiffusionConv / AdaptiveAdj / Identity。理解空间邻接关系。
   - 时序算子 (Temporal): 在时间维 T 上混合 —— DilatedTCN / GRU / TemporalAttn / Identity。
 
-⚠️ 张量约定 (全库统一, 见 references/architecture-rules.md):
+⚠️ 张量约定 (全库统一, 见 docs/P2_ALGORITHM_DESIGN.md 架构铁律):
     内部一律 [B, T, N, F] (Batch, Time, Nodes, Features)。
     **严禁把空间节点维 N 暴力展平** —— 那会摧毁交通节点的物理空间拓扑。
     空间算子在 N 维按邻接混合; 时序算子在 T 维混合。两类都保持 [B,T,N,F] 进出。

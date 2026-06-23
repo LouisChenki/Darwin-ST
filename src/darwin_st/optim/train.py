@@ -7,7 +7,7 @@ orchestrator 需要的 eval_fn(genotype, device) → EvalResult。
   对该架构采样多组超参 → 每组建模型、真实数据训练若干 epoch →
   每 epoch report val-MAE 给 ASHA 剪枝 → 取最优超参的 MAE 作为该架构得分。
 
-训练纪律 (docs/P2_ALGORITHM_DESIGN.md + architecture-rules.md):
+训练纪律 (docs/P2_ALGORITHM_DESIGN.md):
   - masked MAE 训练 loss(归一化尺度)+ evaluate 真实尺度 masked 指标
   - **NaN 熔断**: loss 出现 nan/inf 立即停该 trial(记崩, 不空跑)
   - **时间熔断**: 单 trial 超时间预算即停(防重算子吃满算力)

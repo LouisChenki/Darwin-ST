@@ -104,5 +104,30 @@
 7. orchestrator.py(两层协议 + 程序化停止 + graveyard 硬否决)
 8. predictor.py(≥50 评估后,SAIL/BRP-NAS 式排序预筛)
 
+## 架构铁律(节点维约束)
+
+时空算子(无论进化变异还是 Tier-2 合成)必须遵守的硬约束。validation harness
+(creation/validation.py)对合成算子强制检查其中的形状契约;进化/手写算子同样适用。
+
+1. **节点维 N 神圣,张量全程 `[B, T, N, C]`**。严禁把空间节点暴力压平
+   (如 `[B, T, N, C] → [B, T, N*C]`)——这会彻底摧毁交通节点的物理空间拓扑。
+   算子的 `forward([B,T,N,C]) → [B,T,N,C]`,绝不 flatten/mean 掉 N。这是全库统一约定,
+   也是合成算子能否通过验证门的第一关。
+
+2. **强制保留并利用空间结构**。进化方向应主动引入 GCN / GAT / 时空同步卷积 /
+   逐节点处理融合等机制,让模型理解空间邻接关系,而非把 N 当 batch 维抹平。
+
+3. **奥卡姆剃刀与算力折中**。`val_mae` 相近时优先保留最简单、对算力最友好的分支。
+   触碰时间/显存预算墙时执行优雅折中(降 `d_model`、减注意力头、削 batch),
+   而非抛弃机制本身。
+
+4. **维度防御 + NaN 熔断**。复杂张量变换(`view`/`reshape`/`permute`/`einsum`)前后
+   用 `assert` 防御性检查形状,规避 Shape 幻觉。训练循环植入 `torch.isnan/isinf`
+   检测,捕获即判 DISCARD,不空跑无意义的 epoch。
+
+5. **分层调试优于全盘替换**。一个合理的时空机制(深层 GCN / 时空注意力)初期导致
+   MAE 退化时,不要立即抛弃换新架构。先排查:梯度消失/爆炸?需注入 LayerNorm?
+   加残差连接抵御过平滑(over-smoothing)?学习率过大致发散?先打磨再否定。
+
 ## 关键来源
 STID 2208.05233 · STAEformer 2308.10425 · STD-MAE 2312.00516 · AutoCTS 2112.11174 · AutoCTS+ 2211.16126 · AutoSTF 2409.16586 · Regularized Evolution 1802.01548 · MAP-Elites 1504.04909 · CVT-MAP-Elites 1610.05729 · SAIL 1702.03713 · QD-NAS 2208.00204 · LLMatic 2306.01102 · ELM 2206.08896 · FunSearch 10.1038/s41586-023-06924-6 · OPRO 2309.03409 · AIDE 2502.13138 · ExpeL 2308.10144 · Optuna ASHA/TPE 官方文档 + 源码

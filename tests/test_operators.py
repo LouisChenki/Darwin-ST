@@ -1,6 +1,6 @@
 """operators.py 的正确性回归测试 (设备无关, CPU 即可全绿)。
 
-核心契约 (来自 references/architecture-rules.md):
+核心契约 (架构铁律, 见 docs/P2_ALGORITHM_DESIGN.md):
   1. 每个算子保持 [B,T,N,F] 形状 —— **节点维 N 永不丢失/展平**
   2. 所有算子可微 (梯度能回传)
   3. 空间算子正确使用邻接; 时序算子在 T 维混合

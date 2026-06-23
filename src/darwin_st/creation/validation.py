@@ -6,7 +6,7 @@ LLM 可以乱写, 但没过门的绝不浪费 GPU。
 
 门 (cheap→expensive 级联):
   1. 实例化: 能 build 成 nn.Module
-  2. 形状: forward([B,T,N,C]) → [B,T,N,C] (保持节点维 N, architecture-rules 铁律)
+  2. 形状: forward([B,T,N,C]) → [B,T,N,C] (保持节点维 N, 架构铁律见 docs/P2_ALGORITHM_DESIGN.md)
   3. 可微: gradcheck —— 对输入与参数有有限梯度 (catch 不可微/detach/inplace)
   4. NaN/Inf 门: 输出与梯度均有限
   5. 参数量上限: 不超预算 (防爆显存的巨型算子)

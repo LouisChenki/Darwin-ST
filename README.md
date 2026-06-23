@@ -1,69 +1,83 @@
-# AutoResearch: Darwin-ST
+# Darwin-ST
 
-🤖 **Darwin-ST** 是一套专为大型语言模型 Agent（如 Geminicli、Claude 等）打造的“时空图神经网络 (Spatio-Temporal GNN) 自动化研究技能”。
+🌐 **Darwin-ST** 是一套**自主时空预测研究系统**:针对交通流预测(PeMS04/08、METR-LA、PEMS-BAY),通过进化式 NAS + 超参优化(HPO)自动逼近 SOTA;并且——这是它的核心研究赌注——用 LLM **通过跨域类比发明新算子**(例如把 CV 的掩码自编码迁移进时空预测)。
 
-基于本仓库提供的标准 Agent Skill，你的 AI 助手可以全天候 24/7 接管算力，自主完成网络的搭建、训练、验证，并通过贝叶斯后验机制不断进行反思与架构突变，以不断突破时空预测基线。
+它是一个**自包含的 Python 系统**:确定性的 Python 自治循环是主体,LLM 只在停滞时作为 Tier-2 工具被调用来合成新机制。系统全部位于 `src/darwin_st/` 包中。
 
 ---
 
-## 📂 仓库结构 (Repository Structure)
+## 双层自治架构
 
-本仓库采用了 [Agent Skills 标准结构](https://github.com/anthropics/skills) 进行构建：
+系统的脊梁是**确定性 Python 主导(Tier-1,高频)+ 把"创造力"外包给 LLM(Tier-2,低频,仅停滞触发)**:
+
+- **Tier-1 优化引擎**:aging 进化 NAS + Optuna TPE/ASHA + MAP-Elites 档案 + 多卡并行调度。`while True` 自治循环,程序化停止(超越 SOTA 才停),永不暂停问人。
+- **Tier-2 创造层**:停滞时诊断瓶颈 → 跨域机制知识库检索互补机制 → DeepSeek 合成 N 个融合假设 → Aider 在 git 沙箱写算子 → 验证门把关 → 注入算子库参与进化与真实评测。
+
+底层是可信评测地基(masked MAE/RMSE/MAPE、按数据集分流的协议、邻接矩阵)和 SQLite 结构化记忆(成功/失败墓地)。
+
+---
+
+## 安装
+
+需要 [uv](https://github.com/astral-sh/uv)。
 
 ```bash
-/
-├── README.md               # 也就是您现在看到的这份人类阅读文档
-├── darwin-st/              # ⬅️ 核心 Agent Skill 文件夹（纯净版）
-│   ├── SKILL.md            # Agent 所阅读的核心系统指令与工作流控制
-│   ├── scripts/            # 数据预处理与环境注册等 Python 挂载脚本
-│   └── references/         # Agent 执行突变时的时空架构“心智模式”先验指导
-├── pyproject.toml / uv.lock # Python 运行环境的依赖控制文件
-└── reference/              # 私有研究参考资料（不参与 Skill 发布层）
+uv sync          # 创建 .venv 并装依赖 (macOS 用 CPU/MPS torch, Linux 用 cu128)
+```
+
+`pythonpath=["src"]` 已在 pyproject 配好,导入直接 `from darwin_st...`,无需 `pip install`。
+
+跨域知识库与 Tier-2 创造层另需:Neo4j(可选,不可用自动回退内存图)、`sentence-transformers`(真实语义嵌入)、DeepSeek API key(`DEEPSEEK_API_KEY` 环境变量)。
+
+---
+
+## 运行
+
+所有入口在 `scripts/`,均由环境变量配置。
+
+| 脚本 | 用途 |
+|---|---|
+| `run_autoresearch.py` | Tier-1 自治优化(进化 NAS + HPO + MAP-Elites + 多卡) |
+| `run_creation_loop.py` | Tier-2 创造闭环端到端(真实 DeepSeek 合成 + 真实 PeMS04 训练评测) |
+| `build_kg.py` | 从文献语料构建跨域机制知识库(机制卡) |
+| `qc_mechanisms.py` | 机制库质检报告(DeepSeek 当质检员,只读) |
+| `apply_qc.py` | 按质检结果整理机制库(默认 dry-run,`--apply` 改库) |
+| `verify_retrieval.py` | 把机制库灌进检索栈跑跨域类比检索验收 |
+| `baseline_smoke.py` | 编译一个 genotype 在真实数据上训练的冒烟测试 |
+
+例:
+
+```bash
+# Tier-1 优化
+DATASET=PeMS04 N_GPUS=4 python scripts/run_autoresearch.py
+
+# Tier-2 创造闭环 (需 DeepSeek key)
+export DEEPSEEK_API_KEY=...
+KB_SOURCE=cards python scripts/run_creation_loop.py
 ```
 
 ---
 
-## ⚡ 安装说明 (Installation)
+## 测试
 
-**注意**：`darwin-st` 是一个 Agent 技能插件，而不是独立运行的普通 Python 包。你需要一个支持读取 Agent Skill 的运行环境（比如 [Geminicli](https://github.com/supratikpm/gemini-autoresearch)）。
+测试是正确性契约——每个模块都有 `tests/test_<module>.py`,设备无关,CPU 即可全绿。
 
-### 安装技能到 Agent
-您可以选择将本技能安装在特定工作区，或安装为您系统的全局技能。
-
-1. **工作区本地安装（推荐）**
-   克隆本项目后，直接将库中的 `darwin-st` 文件夹拖入您目标研究项目的 `.agents/skills/` 目录下即可：
-   ```bash
-   mkdir -p .agents/skills/
-   cp -r darwin-st/ .agents/skills/
-   ```
-
-2. **全局安装**
-   将其放入全局插件目录下，之后您在任何终端都能召唤它（以 Geminicli 为例）：
-   ```bash
-   cp -r darwin-st/ ~/.gemini/antigravity/skills/
-   ```
-
-### 准备 Python 环境
-本技能中的 Agent 循环在运行时会挂载 `scripts/` 下的 Python 脚本。请在使用前确保环境配齐：
 ```bash
-# 推荐使用 uv 同步依赖
-uv sync
+uv run pytest tests/ -q                          # 全套
+uv run pytest tests/test_metrics.py -v           # 单个文件
+uv run pytest tests/test_metrics.py::test_zeros_are_masked_out   # 单个测试
 ```
 
 ---
 
-## 🚀 使用指南 (How to Use)
+## 设计文档
 
-技能挂载成功后，直接通过自然语言与您的 Agent 对话来触发工作流。在聊天框中发送以下**触发词**：
+治理性设计在 `docs/`,做实质性改动前应先读:
 
-> *"帮我启动 AutoResearch"*
-> *"我要开始自动化研究，进行交通流预测实验"*
-> *"帮我演化一个时空网络架构"*
+- `ANALYSIS.md` — 原始诊断(项目为何这样重构)
+- `BLUEPRINT.md` — P0–P4 路线图
+- `P2_ALGORITHM_DESIGN.md` — NAS/HPO/MAP-Elites 决策 + 架构铁律(节点维约束)
+- `TIER2_DESIGN_DECISIONS.md` + `TIER2_RESEARCH_FINDINGS.md` — LLM 创造层
+- `SERVER_VALIDATION.md` — 真实硬件上实际跑过什么
 
-### 自动化工作流展示
-触发后，Agent 会严格接管下述流程：
-
-1. **需求问答**: Agent 会向您发送一张《AutoResearch 时空研究任务配置单》，向您索要创新点描述、目标数据集 (PeMS04/08等)、对比基线等参数。
-2. **物理隔离**: 自动新建 Git 分支剥离环境。
-3. **闭环演化**: 根据 `references/architecture-rules.md` 中的理论指导构造 `train.py`。
-4. **24/7 自主迭代**: 不断地通过 15 分钟级的训练来验证假设，好的代码会被保留 (KEEP) 到 `memory.md` 作为强基因，坏的代码会被记录并舍弃。直到您强行停止。
+面向开发者的总览见 `CLAUDE.md`。

@@ -9,7 +9,7 @@
     → 直接多步线性头 (一次出全部 T_out 步)          [B,T_out,N]
 
 设计要点:
-  - 张量全程 [B,T,N,F], 节点维 N 不丢 (architecture-rules 铁律)。
+  - 张量全程 [B,T,N,F], 节点维 N 不丢 (架构铁律, 见 docs/P2_ALGORITHM_DESIGN.md)。
   - 解码器固定为直接多步 (非迭代), 研究表明严格更优。
   - 邻接矩阵按 genotype.adj_mode 归一化后作为 buffer; 自学习/无图算子忽略它。
   - 时间索引 (tod/dow) 可选; 模型 forward 接受可选 tod_idx/dow_idx。
