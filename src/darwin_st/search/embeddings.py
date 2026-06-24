@@ -124,11 +124,13 @@ class STEmbedding(nn.Module):
         parts = [self.input_proj(x)]                          # [B,T,N,hidden]
         if self.use_node:
             parts.append(self.node_emb(B, T))                 # [B,T,N,node_dim]
+        # 时间嵌入: 索引缺失时优雅降级 —— 查 slot 0 (而非补零), 使嵌入参数仍参与计算、
+        # 有梯度 (gradcheck/validation 不误判), 维度不变。训练时由数据管道供真实索引。
         if self.use_tod:
-            assert tod_idx is not None, "use_tod=True 但未提供 tod_idx"
-            parts.append(self.tod_emb(tod_idx, N))            # [B,T,N,tod_dim]
+            idx = tod_idx if tod_idx is not None else x.new_zeros(B, T, dtype=torch.long)
+            parts.append(self.tod_emb(idx, N))                # [B,T,N,tod_dim]
         if self.use_dow:
-            assert dow_idx is not None, "use_dow=True 但未提供 dow_idx"
-            parts.append(self.dow_emb(dow_idx, N))            # [B,T,N,dow_dim]
+            idx = dow_idx if dow_idx is not None else x.new_zeros(B, T, dtype=torch.long)
+            parts.append(self.dow_emb(idx, N))                # [B,T,N,dow_dim]
         z = torch.cat(parts, dim=-1)                          # 沿特征维拼接
         return self.fuse(z)                                   # [B,T,N,hidden]

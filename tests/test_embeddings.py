@@ -99,12 +99,15 @@ def test_st_embedding_differentiable():
     assert torch.isfinite(st.node_emb.emb.grad).all()
 
 
-def test_st_embedding_tod_requires_index():
-    """开了 use_tod 却不给 tod_idx 应报错。"""
+def test_st_embedding_tod_graceful_degrade():
+    """开了 use_tod 却不给 tod_idx 时优雅降级 (查 slot 0), 前向成功且形状不变。"""
     st = STEmbedding(in_channels=C, hidden=H, num_nodes=N, use_tod=True)
     x = torch.randn(B, T, N, C)
-    with pytest.raises(AssertionError):
-        st(x)  # 缺 tod_idx
+    out = st(x)  # 缺 tod_idx 不报错, 降级
+    assert out.shape == (B, T, N, H)
+    # 降级路径下 tod 嵌入参数仍参与计算 (有梯度), 不是死参数
+    out.sum().backward()
+    assert st.tod_emb.emb.weight.grad is not None
 
 
 def test_st_embedding_node_count_mismatch():

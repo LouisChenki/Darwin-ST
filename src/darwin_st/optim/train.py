@@ -45,7 +45,7 @@ def train_one(
     device: str,
     trial: optuna.Trial | None = None,
     max_epochs: int = 27,
-    time_budget_s: float = 1200.0,
+    time_budget_s: float = 2400.0,
 ) -> float:
     """用给定超参训练一个架构, 返回最优 val-MAE(真实尺度 masked)。
 
@@ -63,14 +63,30 @@ def train_one(
     train_loader = P.load_split(data_dir, "train", batch_size=batch_size, device=device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
+    # lr schedule 作为 HPO 可择优的超参 (none/cosine/plateau), 不硬设 —— 让 HPO 自己选用不用、用哪种。
+    sched_kind = str(hps.get("lr_schedule", "none"))
+    if sched_kind == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_epochs)
+    elif sched_kind == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3)
+    else:
+        scheduler = None
+
     best_mae = float("inf")
     start = time.time()
     for epoch in range(max_epochs):
         model.train()
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+        for batch in train_loader:
+            if len(batch) == 4:                          # (x, tod, dow, y) STID 身份嵌入
+                x, tod, dow, y = batch
+                x, tod, dow, y = x.to(device), tod.to(device), dow.to(device), y.to(device)
+                pred = model(x, tod_idx=tod, dow_idx=dow)
+            else:                                        # (x, y) 回退
+                x, y = batch
+                x, y = x.to(device), y.to(device)
+                pred = model(x)
             opt.zero_grad()
-            loss = masked_mae(model(x), y)               # 归一化尺度训练 loss
+            loss = masked_mae(pred, y)                    # 归一化尺度训练 loss
             if torch.isnan(loss) or torch.isinf(loss):   # NaN 熔断
                 return best_mae if best_mae < float("inf") else float("inf")
             loss.backward()
@@ -83,6 +99,13 @@ def train_one(
         mae = met["mae"]
         if mae < best_mae:                               # best-checkpoint(取最优步)
             best_mae = mae
+
+        # lr schedule 步进: cosine 每 epoch 步, plateau 看 val-MAE
+        if scheduler is not None:
+            if sched_kind == "plateau":
+                scheduler.step(mae)
+            else:
+                scheduler.step()
 
         if trial is not None:
             trial.report(mae, epoch)

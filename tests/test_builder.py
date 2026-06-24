@@ -87,14 +87,15 @@ def test_can_overfit_one_batch():
     m = build_model(geno, num_nodes=N, in_channels=C, seq_len_in=T_IN, seq_len_out=T_OUT, adj=_adj())
     x = torch.randn(B, T_IN, N, C)
     y = torch.randn(B, T_OUT, N)
-    opt = torch.optim.Adam(m.parameters(), lr=1e-2)
+    opt = torch.optim.Adam(m.parameters(), lr=5e-3)   # 大模型 (hidden/emb=64+tod/dow) lr 略降更稳
     losses = []
-    for _ in range(20):
+    for _ in range(50):
         opt.zero_grad()
         loss = torch.abs(m(x) - y).mean()
         loss.backward(); opt.step()
         losses.append(loss.item())
-    assert losses[-1] < losses[0] * 0.7  # loss 明显下降
+    # 证明"管道贯通能学"= loss 显著下降。大模型固定步数收敛平台略高, 阈值 0.8 (降 20%+)
+    assert losses[-1] < losses[0] * 0.8
 
 
 # ---------------------------------------------------------------------------

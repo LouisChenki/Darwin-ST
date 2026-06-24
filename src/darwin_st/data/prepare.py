@@ -40,6 +40,7 @@ __all__ = [
     "DATASET_URLS",
     "data_dir_for",
     "generate_windows",
+    "make_time_indices",
     "prepare_dataset",
     "load_split",
     "load_scaler",
@@ -217,6 +218,22 @@ def _load_raw_array(profile: DatasetProfile, raw_path: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def make_time_indices(num_samples: int, seq_len_in: int,
+                      steps_per_day: int = 288) -> tuple[np.ndarray, np.ndarray]:
+    """为每个输入窗口生成 time-of-day / day-of-week 索引 (STID 式身份嵌入用)。
+
+    PeMS 等固定 5min 间隔采样, **无需原始时间戳**: 样本序号即时间槽。
+    窗口 i 的输入是 data[i : i+seq_len_in], 故其第 t 步绝对时刻 = i+t。
+      tod = (i+t) % steps_per_day         (一天 288 槽, 0..287)
+      dow = ((i+t) // steps_per_day) % 7  (一周 7 天, 0..6)
+    返回 (tod[S, seq_len_in], dow[S, seq_len_in]) int64。
+    """
+    base = np.arange(num_samples)[:, None] + np.arange(seq_len_in)[None, :]  # [S, T_in] 绝对时刻
+    tod = (base % steps_per_day).astype(np.int64)
+    dow = ((base // steps_per_day) % 7).astype(np.int64)
+    return tod, dow
+
+
 def generate_windows(
     data: np.ndarray, seq_len_in: int, seq_len_out: int, target_channel: int = 0
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -267,9 +284,11 @@ def prepare_dataset(dataset_name: str, force: bool = False) -> str:
     data = _load_raw_array(profile, raw_path)  # [T, N, C]
 
     X, Y = generate_windows(data, profile.seq_len_in, profile.seq_len_out, profile.target_channel)
+    tod, dow = make_time_indices(X.shape[0], profile.seq_len_in)  # [S, T_in] 时间槽 (STID 身份嵌入)
     tr, va, te = chronological_split(X.shape[0], profile)
 
     splits = {"train": (X[tr], Y[tr]), "val": (X[va], Y[va]), "test": (X[te], Y[te])}
+    time_splits = {"train": (tod[tr], dow[tr]), "val": (tod[va], dow[va]), "test": (tod[te], dow[te])}
 
     # train-only scaler, 仅目标通道
     train_x = splits["train"][0]
@@ -281,6 +300,10 @@ def prepare_dataset(dataset_name: str, force: bool = False) -> str:
         sy = scaler.transform(sy.copy())  # 标签同尺度归一化 (评测时再 inverse)
         np.save(os.path.join(data_dir, f"{name}_x.npy"), sx)
         np.save(os.path.join(data_dir, f"{name}_y.npy"), sy)
+        # 时间索引 (tod/dow) 与 x/y 同切分对齐落盘, 供 STID 身份嵌入
+        stod, sdow = time_splits[name]
+        np.save(os.path.join(data_dir, f"{name}_tod.npy"), stod)
+        np.save(os.path.join(data_dir, f"{name}_dow.npy"), sdow)
 
     np.save(os.path.join(data_dir, "scaler.npy"), np.array([scaler.mean, scaler.std], dtype=np.float64))
 
@@ -320,7 +343,12 @@ def load_adj(data_dir: str) -> np.ndarray | None:
 def load_split(
     data_dir: str, split: str, batch_size: int, device: str = "cpu", drop_last: bool | None = None
 ) -> DataLoader:
-    """加载某切分的 DataLoader。train 默认 shuffle+drop_last, val/test 不丢尾。"""
+    """加载某切分的 DataLoader。train 默认 shuffle+drop_last, val/test 不丢尾。
+
+    若该切分有时间索引 (tod/dow) 落盘, 每个 batch 产出 (x, tod, dow, y) 四元组
+    (供 STID 身份嵌入); 否则回退 (x, y) 二元组 (旧缓存/无时间特征)。
+    消费方 (train_one/evaluate) 用 len(batch) 区分两种形态。
+    """
     x_path = os.path.join(data_dir, f"{split}_x.npy")
     y_path = os.path.join(data_dir, f"{split}_y.npy")
     if not os.path.exists(x_path):
@@ -332,8 +360,17 @@ def load_split(
     if drop_last is None:
         drop_last = split == "train"
 
+    tod_path = os.path.join(data_dir, f"{split}_tod.npy")
+    dow_path = os.path.join(data_dir, f"{split}_dow.npy")
+    if os.path.exists(tod_path) and os.path.exists(dow_path):
+        tod = torch.from_numpy(np.load(tod_path)).long()
+        dow = torch.from_numpy(np.load(dow_path)).long()
+        dataset: TensorDataset = TensorDataset(X, tod, dow, Y)   # (x, tod, dow, y)
+    else:
+        dataset = TensorDataset(X, Y)                            # (x, y) 回退
+
     return DataLoader(
-        TensorDataset(X, Y),
+        dataset,
         batch_size=batch_size,
         shuffle=(split == "train"),
         pin_memory=is_accel,
@@ -354,9 +391,15 @@ def evaluate(
     scaler = load_scaler(data_dir)
 
     preds_all, labels_all = [], []
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        preds = model(x)
+    for batch in loader:
+        if len(batch) == 4:                       # (x, tod, dow, y)
+            x, tod, dow, y = batch
+            x, tod, dow, y = x.to(device), tod.to(device), dow.to(device), y.to(device)
+            preds = model(x, tod_idx=tod, dow_idx=dow)
+        else:                                     # (x, y) 回退
+            x, y = batch
+            x, y = x.to(device), y.to(device)
+            preds = model(x)
         if torch.isnan(preds).any():
             return {"mae": float("inf"), "rmse": float("inf"), "mape": float("inf")}
         # inverse-transform 回真实交通流尺度后再算指标

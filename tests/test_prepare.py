@@ -142,9 +142,13 @@ def test_load_split_returns_loader(fake_pems):
     profile, data_dir, raw = fake_pems
     P.prepare_dataset("PeMS04")
     loader = P.load_split(data_dir, "test", batch_size=8, drop_last=False)
-    x, y = next(iter(loader))
+    batch = next(iter(loader))
+    assert len(batch) == 4          # (x, tod, dow, y) —— 时间索引已接通
+    x, tod, dow, y = batch
     assert x.shape[1:] == (12, profile.num_nodes, 3)  # [B, T_in, N, C]
     assert y.shape[1:] == (12, profile.num_nodes)     # [B, T_out, N]
+    assert tod.shape[1:] == (12,)   # [B, T_in] 时间槽
+    assert dow.shape[1:] == (12,)
 
 
 def test_evaluate_identity_model_low_error(fake_pems):
@@ -161,7 +165,7 @@ def test_evaluate_identity_model_low_error(fake_pems):
             self._y = torch.from_numpy(np.load(f"{data_dir}/test_y.npy")).float()
             self._cursor = 0
 
-        def forward(self, x):
+        def forward(self, x, **kwargs):   # 容忍 evaluate 传入的 tod_idx/dow_idx
             b = x.shape[0]
             out = self._y[self._cursor : self._cursor + b]
             self._cursor += b
@@ -180,7 +184,7 @@ def test_evaluate_nan_fuse(fake_pems):
     P.prepare_dataset("PeMS04")
 
     class NaNModel(torch.nn.Module):
-        def forward(self, x):
+        def forward(self, x, **kwargs):   # 容忍 evaluate 传入的 tod_idx/dow_idx
             out = torch.zeros(x.shape[0], 12, x.shape[2])
             out[0, 0, 0] = float("nan")
             return out

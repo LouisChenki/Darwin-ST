@@ -56,13 +56,13 @@ class EmbeddingConfig:
     """
 
     use_node: bool = True
-    node_dim: int = 32
-    use_tod: bool = False
-    tod_dim: int = 32
-    use_dow: bool = False
-    dow_dim: int = 32
+    node_dim: int = 64
+    use_tod: bool = True
+    tod_dim: int = 64
+    use_dow: bool = True
+    dow_dim: int = 64
 
-    VALID_DIMS = (16, 32, 64)
+    VALID_DIMS = (32, 64, 96, 128)
 
     def validate(self) -> None:
         for label, dim in (("node", self.node_dim), ("tod", self.tod_dim), ("dow", self.dow_dim)):
@@ -75,7 +75,7 @@ class Genotype:
     """完整架构基因型。"""
 
     blocks: list[STBlock]
-    hidden: int = 32
+    hidden: int = 64
     adj_mode: str = "sym"
     # 身份嵌入配置 (一等基因, 默认开节点嵌入)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)

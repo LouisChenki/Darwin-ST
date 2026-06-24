@@ -60,6 +60,25 @@ def test_train_one_returns_finite_mae(tiny_data):
     assert mae > 0  # 真实尺度 MAE
 
 
+def test_train_one_with_tod_dow_and_lr_schedule(tiny_data):
+    """tod/dow 时间索引接通 + lr_schedule=cosine: 4 元组路径走通, 返回有限 MAE。
+
+    锁住冲 SOTA 的两项关键能力: STID 身份嵌入数据链 + HPO 可择优的 lr schedule。
+    """
+    prof, data_dir, adj = tiny_data
+    # 给 tiny_data 补 tod/dow 索引 (触发 load_split 的 4 元组路径 + STEmbedding 真实时间嵌入)
+    for split, n in (("train", 64), ("val", 24), ("test", 24)):
+        tod = (np.arange(n)[:, None] + np.arange(12)[None, :]) % 288
+        dow = ((np.arange(n)[:, None] + np.arange(12)[None, :]) // 288) % 7
+        np.save(os.path.join(data_dir, f"{split}_tod.npy"), tod.astype(np.int64))
+        np.save(os.path.join(data_dir, f"{split}_dow.npy"), dow.astype(np.int64))
+    geno = random_genotype(depth=1, spatial="gcn", temporal="tcn", hidden=16)
+    # geno 默认 use_tod/use_dow=True → 模型会消费 tod/dow
+    mae = train_one(geno, {"lr": 1e-2, "batch_size": 16, "lr_schedule": "cosine"},
+                    data_dir, prof, adj, device="cpu", max_epochs=3)
+    assert np.isfinite(mae) and mae > 0
+
+
 def test_train_one_time_budget(tiny_data):
     """时间熔断: 预算 0 秒 → 至多跑 1 epoch 即停, 仍返回有限值。"""
     prof, data_dir, adj = tiny_data

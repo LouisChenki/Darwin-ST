@@ -150,11 +150,11 @@ def test_protected_can_still_tune_hidden():
 # -- 身份嵌入基因 (研究结论: 比图算子更提精度) --
 
 def test_default_genotype_enables_node_embedding():
-    """默认应开节点嵌入(免费的最大杠杆), tod/dow 默认关。"""
+    """默认应开节点嵌入(免费的最大杠杆); tod/dow 也默认开(数据管道已供时间索引)。"""
     g = random_genotype(depth=2)
     assert g.embedding.use_node is True
-    assert g.embedding.use_tod is False
-    assert g.embedding.use_dow is False
+    assert g.embedding.use_tod is True
+    assert g.embedding.use_dow is True
 
 
 def test_embedding_in_serialization():
@@ -171,7 +171,7 @@ def test_embedding_affects_signature():
     """嵌入配置不同 → 签名不同 (它是一等基因)。"""
     g1 = random_genotype(depth=1)
     g2 = g1.copy()
-    g2.embedding.use_tod = True
+    g2.embedding.use_tod = False   # 翻转一个开关 (默认开 → 关)
     assert g1.signature() != g2.signature()
 
 
@@ -185,10 +185,10 @@ def test_backward_compat_no_embedding_field():
 
 
 def test_mutate_toggle_embedding_enable():
-    g = random_genotype(depth=1)  # tod 默认关
-    g2 = mutate(g, "toggle_embedding", which="tod", enable=True)
-    assert g2.embedding.use_tod is True
-    assert g.embedding.use_tod is False  # 原件不变
+    g = random_genotype(depth=1)  # tod 默认开
+    g2 = mutate(g, "toggle_embedding", which="tod", enable=False)
+    assert g2.embedding.use_tod is False
+    assert g.embedding.use_tod is True  # 原件不变
 
 
 def test_mutate_toggle_embedding_dim():

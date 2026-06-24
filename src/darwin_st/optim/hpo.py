@@ -65,6 +65,8 @@ def suggest_hps(trial: optuna.Trial, genotype: Genotype, cfg: HPOConfig) -> dict
         "weight_decay": trial.suggest_float("weight_decay", *cfg.wd_range, log=True),
         "dropout": trial.suggest_float("dropout", *cfg.dropout_range),
         "batch_size": trial.suggest_categorical("batch_size", list(cfg.batch_choices)),
+        # lr schedule 种类作为可择优超参 (扩搜索空间, 让 HPO 自己选用不用、用哪种)
+        "lr_schedule": trial.suggest_categorical("lr_schedule", ["none", "cosine", "plateau"]),
     }
     # 条件超参: 架构用到注意力才调头数
     uses_attn = any(b.spatial_op == "gat" or b.temporal_op == "attn" for b in genotype.blocks)

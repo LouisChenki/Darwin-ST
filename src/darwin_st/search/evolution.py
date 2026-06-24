@@ -41,8 +41,8 @@ from darwin_st.search.genotype import (
 
 __all__ = ["Member", "AgingEvolution", "random_mutation", "seed_genotypes"]
 
-_HIDDEN_CHOICES = (16, 32, 64, 128)
-_EMB_DIM_CHOICES = EmbeddingConfig.VALID_DIMS  # (16, 32, 64)
+_HIDDEN_CHOICES = (64, 128, 192, 256)
+_EMB_DIM_CHOICES = EmbeddingConfig.VALID_DIMS  # (32, 64, 96, 128)
 
 
 # ---------------------------------------------------------------------------
