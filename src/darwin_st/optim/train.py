@@ -70,7 +70,14 @@ def train_one(
 
     每 epoch 向 trial.report 上报 val-MAE 供 ASHA 剪枝(trial 为 None 则跳过剪枝)。
     NaN/时间熔断触发时提前返回当前最优(或 inf)。
+
+    多卡并发铁律: 必须 set_device 把**当前线程的 CUDA 默认上下文**切到目标卡。
+    只 .to(device) 不够 —— 张量在目标卡但临时分配/stream/cuDNN handle 仍挤在 cuda:0,
+    多线程并发大模型时竞争同一上下文 → 死锁 (标定跑实测: 117线程全 futex_wait)。
     """
+    # 把当前线程默认 CUDA 上下文切到目标卡 (多卡并发防上下文竞争死锁)
+    if isinstance(device, str) and device.startswith("cuda"):
+        torch.cuda.set_device(device)
     model = build_model(
         genotype, num_nodes=profile.num_nodes, in_channels=profile.num_channels,
         seq_len_in=profile.seq_len_in, seq_len_out=profile.seq_len_out, adj=adj,
