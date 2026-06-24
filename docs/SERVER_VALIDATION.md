@@ -192,17 +192,29 @@ memory.db正常累积24+架构KEEP(死锁时0进展)。**40epoch初步水位 MAE
 进程查PID要认准 python -u 主进程(非bash包装); 判死锁看memory.db进度+GPU占用(非线程futex_wait,
 GPU训练时CPU线程idle等待本就futex_wait)。
 
-### 待查专项: 80epoch充分训练 CPU busy / GPU 低占 (第3个性能问题, 未根治)
+### 专项已结案: "80epoch CPU busy" 是误判, 非bug (2026-06-24)
 
-修了前两个并发bug后, 80epoch充分训练仍卡: POP12 和 POP30 都触发, 故**与种群无关, 与长训练强相关**。
-- 现象: 真训练子进程 19核满载(%CPU 1900+)/ 283线程 / GPU仅12-22% / memory.db 30+分钟零产出。
-- 对比: 40epoch (POP12) 正常 — GPU 91%满载, memory.db 累积24+架构KEEP, 水位20.8。
-- 即 CPU 在并行狂算某段东西, GPU 没真训练。非死锁(有CPU活动), 非前两bug(已修)。
-- **疑点(待 py-spy/cProfile 验证)**: epoch内某CPU计算随epoch累积? DataLoader/数据搬运? ASHA长训练调度退化? 某算子未走GPU? lr schedule的plateau分支? tod/dow嵌入CPU路径?
-- **专项调试入口**: 服务器单架构 max_epochs=80 直接 train_one 计时, 对比40epoch, 看是否单架构就慢(排除调度); py-spy dump 卡住进程看283线程CPU栈; 二分关掉 tod/dow / lr_schedule / 大hidden 看哪个触发。
-- **绕过**: 冲SOTA暂用 max_epochs≤40 (已验证稳, 水位20.8); 根治后再上80ep。
+**结论: 不存在第3个bug。之前把"充分训练慢 + 观测窗口太短"误判成"卡死"。**
 
-## 冲SOTA本轮小结 (2026-06-24)
-**成果**: 简化档全还原(tod/dow+lr schedule+扩容量) + 修2个真并发bug(线程过订阅 b67fd5c前 / CUDA上下文死锁 b67fd5c) + 拿到40ep真实水位 **MAE 20.80** (距SOTA 17.80 gap +3.0, 趋势随epoch降)。
-**受阻**: 80epoch充分训练触发第3个性能问题(上述), 未根治, 列专项。
-**判断**: 纯NAS+HPO到20.8, 距17.8还有gap —— 符合项目论点(纯AutoML有天花板, 靠Tier2跨域创造补)。但要验证这点, 需先解决80ep性能问题让充分训练能跑完, 或用40ep连体闭环(Tier1+Tier2)先看创造能补多少。
+判定实验: 服务器单架构 train_one(GPU cuda:0, hidden128, **80epoch**)直接计时 →
+**total 327s (5.5min), per_epoch 4.09s, 正常完成 MAE 25.5**。单架构 GPU 训练完全正常。
+
+复盘误判链:
+- 算账: 单trial 80ep=5.5min; 第一个架构完整HPO study(HPO_TRIALS=20, ASHA剪枝后~10个满trial)
+  = **30-50分钟才出第一条db记录**。我每次只等9-30分钟就判"卡死" —— 太心急。
+- 那些"GPU 50-69% / 17个R线程 / db零产出"全是**正常充分训练的样子**, 不是CPU busy bug。
+  (GPU训练时CPU线程做数据搬运/小算子本就占核; db是整个study完成才写, 不是每trial。)
+- 越查越焦虑, 在配置间反复横跳, 是自己制造的问题。
+
+**前两个修复仍有效且必要**: limit_cpu_threads + set_device 确实把GPU利用率从14%提到50-91%,
+是真实改进(只是没解决一个本不存在的卡死)。
+
+**真实预算账 (基于4.09s/epoch实测)**: 单架构完整HPO(HPO=6 ASHA后~3满trial)≈16min,
+4卡并行≈4min/架构, POP12一轮≈12min, 8轮纯Tier1≈1.5-2h。**HPO_TRIALS别设太大**(20会让
+单架构study拖很久加剧"迟迟不出db"错觉), 设4-6 + 给足时间即可正常充分训练。
+
+## 冲SOTA本轮小结 (2026-06-24, 修正版)
+**成果**: 简化档全还原(tod/dow+lr schedule+扩容量) + 修2个真并发bug(线程过订阅 1ef0864 /
+CUDA上下文死锁 b67fd5c, GPU利用率14%→50-91%) + 真实水位 **40ep MAE 20.80 / 单架构80ep MAE 25.5(未调优)**。
+**关键教训**: "慢"≠"卡死"。判定长跑健康看 memory.db进度增量 + 单架构计时基准, 不是观测窗口内有没有出round。充分训练 HPO_TRIALS 要小、耐心要够。
+**判断**: 纯NAS+HPO水位约20(距17.8 gap~2-3) —— 符合项目论点(纯AutoML有天花板靠Tier2创造补)。下一步: 合理预算(HPO小+给足时间)跑完整40-80ep连体闭环(Tier1+Tier2), 看创造能否补足gap冲17.8。
