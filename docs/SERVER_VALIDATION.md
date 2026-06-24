@@ -218,3 +218,21 @@ GPU训练时CPU线程idle等待本就futex_wait)。
 CUDA上下文死锁 b67fd5c, GPU利用率14%→50-91%) + 真实水位 **40ep MAE 20.80 / 单架构80ep MAE 25.5(未调优)**。
 **关键教训**: "慢"≠"卡死"。判定长跑健康看 memory.db进度增量 + 单架构计时基准, 不是观测窗口内有没有出round。充分训练 HPO_TRIALS 要小、耐心要够。
 **判断**: 纯NAS+HPO水位约20(距17.8 gap~2-3) —— 符合项目论点(纯AutoML有天花板靠Tier2创造补)。下一步: 合理预算(HPO小+给足时间)跑完整40-80ep连体闭环(Tier1+Tier2), 看创造能否补足gap冲17.8。
+
+## 🎯 SOTA连体闭环关键结果 (2026-06-25) — 项目核心论点实证
+
+**配置**: run_creation_loop POP12 ROUNDS10 HPO5 EPOCHS60 STAGNATION3 615库 flash 线程版(4卡GIL效率~50%但能用)。
+
+**决定性证据链(论文核心论证成立)**:
+| 阶段 | 最优MAE | 谁达成 |
+|---|---|---|
+| 纯Tier1进化(round1-2停滞) | **20.67** | NAS+HPO天花板 |
+| Tier2创造介入后(round3起) | **18.69** | **跨域合成算子** |
+| 基准 | STAEformer 18.22(可发表档) / STD-MAE 17.80(SOTA) | |
+
+- round2纯进化停滞在20.67 → **round3触发创造后直接降到18.69**, 时序铁证: 跨域创造打破纯NAS天花板。
+- 18.69由合成算子达成(memory.db id81 spatial_op=`synth_seq_lka_sasf_residual` —— LKA大核注意力[CV]+SASF+残差的跨域融合)。top3最优全是synth算子(synth_seq_lka_sasf_residual / synth_gated_routed_spatial_mixer / synth_fusion_parallel_triple_res)。21个含synth试验最优18.69。
+- round3-8创造触发4次, best稳定18.69(持续产新算子)。
+- **逼近可发表档STAEformer 18.22, 距SOTA 17.80仅gap +0.89**。
+
+**意义**: 这是项目核心研究赌注的实证 —— **纯AutoML(NAS+HPO)卡在20.67天花板, LLM跨域类比创造(615库+flash合成)把它推到18.69**, 逼近可发表档。论文主张"用LLM跨域知识涌现闭合AutoML与手工SOTA的gap"在真实PeMS04+真实训练上成立。剩余gap+0.89可能靠: 更充分训练(80ep, 需先修GIL多进程提速)/更多样瓶颈诊断触发更丰富创造/更大HPO预算。
