@@ -73,6 +73,8 @@ def _domain_dist(mechs):
 def main():
     ds = os.environ.get("DATASET", "PeMS04")
     n_gpus = _env_int("N_GPUS", torch.cuda.device_count() or 1)
+    from darwin_st.optim.train import limit_cpu_threads
+    limit_cpu_threads(n_gpus)  # 防多 worker 并发训练 CPU 线程过订阅 (见 train.limit_cpu_threads)
     pop = _env_int("POP_SIZE", 6)
     max_rounds = _env_int("MAX_ROUNDS", 6)
     hpo_trials = _env_int("HPO_TRIALS", 3)

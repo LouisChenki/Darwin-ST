@@ -48,6 +48,10 @@ def main():
     ds = os.environ.get("DATASET", "PeMS04")
     run_tag = os.environ.get("RUN_TAG", f"exp/{ds.lower()}-auto")
     n_gpus = _env_int("N_GPUS", torch.cuda.device_count() or 1)
+    # 防多 worker 并发训练时 CPU 线程过订阅 (208 vCPU 上 torch 默认 ~100 线程 × n_gpus worker
+    # → thrashing 卡死)。按 worker 数限制每训练的 intra-op 线程。
+    from darwin_st.optim.train import limit_cpu_threads
+    limit_cpu_threads(n_gpus)
     pop = _env_int("POP_SIZE", 8)
     max_rounds = _env_int("MAX_ROUNDS", 3)
     max_evals = _env_int("MAX_EVALS", 0) or None

@@ -19,6 +19,7 @@ make_eval_fn(...) 工厂返回一个绑定了数据规格的 eval_fn, 注入给 
 
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -33,7 +34,25 @@ from darwin_st.optim.scheduler import EvalResult
 from darwin_st.search.builder import build_model, count_params
 from darwin_st.search.genotype import Genotype
 
-__all__ = ["train_one", "evaluate_architecture", "make_eval_fn"]
+__all__ = ["train_one", "evaluate_architecture", "make_eval_fn", "limit_cpu_threads"]
+
+
+def limit_cpu_threads(n_workers: int) -> None:
+    """限制 PyTorch CPU intra-op 线程数, 防多 worker 并发训练时线程过订阅 (oversubscription)。
+
+    根因 (标定跑卡死实测): 多卡机 208 vCPU 上 torch 默认开 ~100 intra-op 线程, 4 个
+    ThreadPoolExecutor worker 并发 → 400 线程争 208 核 → 严重 thrashing, 训练几乎停滞。
+    GPU 训练时 CPU 线程只管数据搬运/小算子, 不需要那么多。按 总核数/worker 分配, 留有余量。
+    可被 DARWIN_ST_THREADS env 覆盖。串行/CPU 测试 (n_workers<=1) 不限制。
+    """
+    env = os.environ.get("DARWIN_ST_THREADS")
+    if env:
+        torch.set_num_threads(max(1, int(env)))
+        return
+    if n_workers and n_workers > 1:
+        ncpu = os.cpu_count() or 8
+        per = max(2, min(8, ncpu // (2 * n_workers)))  # 每 worker 限几线程, 上限 8 (GPU 训练够用)
+        torch.set_num_threads(per)
 
 
 def train_one(
