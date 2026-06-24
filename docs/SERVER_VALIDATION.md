@@ -164,3 +164,30 @@ warmup+相对退化标定修复后, 同配置(3轮×4架构, 12 epoch)复跑:
 **诚实观察**: 本次检索主要拉回dilated_causal_convolution(长程依赖对症), 合成算子全是它的融合变体(残差/门控/并行多尺度)。615库丰富性体现在"检索精准命中对症机制", 但单瓶颈下融合的机制种类不算多样——受瓶颈诊断措辞影响, 可调。
 
 **结论**: 615定稿库在创造闭环跑通, flash模型合成成功率与速度俱佳, 大库较小库MAE显著提升。论文核心创新(LLM跨域涌现合成有效算子)在定稿库+flash上再次验证。下一步可: 更丰富瓶颈触发多样融合 / P4收尾 / 正式冲SOTA长跑。
+
+## 冲SOTA标定 + 两个并发训练bug修复 (2026-06-24)
+
+冲SOTA前先把开发期"简化档"还原为冲刺档(commit cdfd55b): 接通tod/dow身份嵌入 +
+lr schedule作HPO超参 + 扩容量空间(hidden 64-256, emb 32-128) + max_epochs env配。
+随后标定跑(80epoch充分训练)暴露**两个之前短epoch冒烟从未触发的并发bug**:
+
+**Bug1 CPU线程过订阅** (commit 1ef0864): 208 vCPU机torch默认~100 intra-op线程,
+4 ThreadPool worker并发 → 400线程争208核thrashing。修: limit_cpu_threads 按worker限线程。
+
+**Bug2 多卡CUDA上下文竞争死锁** (commit b67fd5c, 关键): 标定跑80epoch启动后日志长时间
+零进展, 117线程全futex_wait, GPU仅14-20%占用。**用户反问"之前4卡跑通过为何现在卡死"
+点醒** —— 非ThreadPool固有缺陷。真根因: train_one只 .to(device) 从不 set_device,
+当前线程CUDA默认上下文恒cuda:0, 临时分配/stream/cuDNN handle全挤cuda:0; 小模型短训练
+侥幸不冲突, 大模型(hidden64-256)+长训练+高并发放大竞争窗口 → 多线程争同一上下文死锁。
+修: train_one入口 torch.cuda.set_device(device)。与"历史能跑/现在回归"现象自洽。
+
+**修复验证**: 中等配置(POP12/40epoch/4卡)实跑 —— GPU回到65-91%满载(死锁时仅14%),
+memory.db正常累积24+架构KEEP(死锁时0进展)。**40epoch初步水位 MAE=20.80**(对比10epoch
+22.4 / 8epoch创造闭环21.94, 训练越充分越低), 距SOTA 17.80 gap≈+3.0, 趋势对。
+
+**充分训练标定calib3已启动** (PID随run变, POP=30 ROUNDS=8 HPO=20 EPOCHS=80 TARGET=17.80,
+独立DB sota_calib3.db): 看80epoch+大种群+HPO充分搜索(lr schedule择优/更大hidden)的真实天花板。
+
+**服务器SSH运维教训**: 这台机SSH返回常截断; echo/注释含中文圆括号()破坏bash解析(屡踩);
+进程查PID要认准 python -u 主进程(非bash包装); 判死锁看memory.db进度+GPU占用(非线程futex_wait,
+GPU训练时CPU线程idle等待本就futex_wait)。
