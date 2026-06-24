@@ -191,3 +191,18 @@ memory.db正常累积24+架构KEEP(死锁时0进展)。**40epoch初步水位 MAE
 **服务器SSH运维教训**: 这台机SSH返回常截断; echo/注释含中文圆括号()破坏bash解析(屡踩);
 进程查PID要认准 python -u 主进程(非bash包装); 判死锁看memory.db进度+GPU占用(非线程futex_wait,
 GPU训练时CPU线程idle等待本就futex_wait)。
+
+### 待查专项: 80epoch充分训练 CPU busy / GPU 低占 (第3个性能问题, 未根治)
+
+修了前两个并发bug后, 80epoch充分训练仍卡: POP12 和 POP30 都触发, 故**与种群无关, 与长训练强相关**。
+- 现象: 真训练子进程 19核满载(%CPU 1900+)/ 283线程 / GPU仅12-22% / memory.db 30+分钟零产出。
+- 对比: 40epoch (POP12) 正常 — GPU 91%满载, memory.db 累积24+架构KEEP, 水位20.8。
+- 即 CPU 在并行狂算某段东西, GPU 没真训练。非死锁(有CPU活动), 非前两bug(已修)。
+- **疑点(待 py-spy/cProfile 验证)**: epoch内某CPU计算随epoch累积? DataLoader/数据搬运? ASHA长训练调度退化? 某算子未走GPU? lr schedule的plateau分支? tod/dow嵌入CPU路径?
+- **专项调试入口**: 服务器单架构 max_epochs=80 直接 train_one 计时, 对比40epoch, 看是否单架构就慢(排除调度); py-spy dump 卡住进程看283线程CPU栈; 二分关掉 tod/dow / lr_schedule / 大hidden 看哪个触发。
+- **绕过**: 冲SOTA暂用 max_epochs≤40 (已验证稳, 水位20.8); 根治后再上80ep。
+
+## 冲SOTA本轮小结 (2026-06-24)
+**成果**: 简化档全还原(tod/dow+lr schedule+扩容量) + 修2个真并发bug(线程过订阅 b67fd5c前 / CUDA上下文死锁 b67fd5c) + 拿到40ep真实水位 **MAE 20.80** (距SOTA 17.80 gap +3.0, 趋势随epoch降)。
+**受阻**: 80epoch充分训练触发第3个性能问题(上述), 未根治, 列专项。
+**判断**: 纯NAS+HPO到20.8, 距17.8还有gap —— 符合项目论点(纯AutoML有天花板, 靠Tier2跨域创造补)。但要验证这点, 需先解决80ep性能问题让充分训练能跑完, 或用40ep连体闭环(Tier1+Tier2)先看创造能补多少。
