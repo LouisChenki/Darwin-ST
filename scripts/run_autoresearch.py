@@ -29,6 +29,7 @@ except Exception:
 
 from darwin_st.optim.hpo import HPOConfig
 from darwin_st.optim.orchestrator import Orchestrator, OrchestratorConfig
+from darwin_st.optim.scheduler import EvalSpec
 from darwin_st.optim.train import make_eval_fn
 from darwin_st.memory.store import MemoryStore
 from darwin_st.search.genotype import random_genotype
@@ -80,6 +81,9 @@ def main():
 
     mem = MemoryStore(mem_db)
     eval_fn = make_eval_fn(ds, hpo_cfg=hpo_cfg)
+    # 进程后端: worker 自建 eval_fn (避闭包 pickle), 真正 4 卡并行 (绕 GIL)
+    backend = os.environ.get("BACKEND", "auto")
+    eval_spec = EvalSpec(dataset=ds, hpo_cfg=hpo_cfg)
 
     def on_round(state):
         b = state.best_mae
@@ -90,7 +94,8 @@ def main():
               + (f" gap={gap:+.3f}" if gap is not None else ""))
 
     orch = Orchestrator(cfg, eval_fn, devices=n_gpus, memory=mem,
-                        base_genotype=base, on_round=on_round)
+                        base_genotype=base, on_round=on_round,
+                        eval_spec=eval_spec, backend=backend)
 
     t0 = time.time()
     state = orch.run()

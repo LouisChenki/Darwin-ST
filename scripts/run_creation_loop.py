@@ -26,6 +26,7 @@ import torch
 
 from darwin_st.optim.hpo import HPOConfig
 from darwin_st.optim.orchestrator import Orchestrator, OrchestratorConfig
+from darwin_st.optim.scheduler import EvalSpec
 from darwin_st.optim.train import make_eval_fn
 from darwin_st.memory.store import MemoryStore
 from darwin_st.search.genotype import Genotype, STBlock
@@ -130,6 +131,10 @@ def main():
     hpo_cfg = HPOConfig(n_trials=hpo_trials, max_epochs=max_epochs,
                         min_resource=2, reduction_factor=3, n_startup_trials=2)
     eval_fn = make_eval_fn(ds, hpo_cfg=hpo_cfg)
+    # 进程后端: worker 自建 eval_fn + 从 persist_dir 重载 synth 算子 (spawn 子进程丢进程全局 SPATIAL_OPS)
+    backend = os.environ.get("BACKEND", "auto")
+    eval_spec = EvalSpec(dataset=ds, hpo_cfg=hpo_cfg,
+                         synth_persist_dir=os.path.join(cache, "dynamic_ops"))
     base = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64)  # 故意弱基线, 逼出创造
 
     cfg = OrchestratorConfig(dataset=ds, run_tag=f"exp/{ds.lower()}-creation",
@@ -144,7 +149,8 @@ def main():
               f"best_MAE={b if b<1e9 else 'inf'} 创造次数={n_creat}")
 
     orch = Orchestrator(cfg, eval_fn, devices=n_gpus, memory=mem, base_genotype=base,
-                        on_round=on_round, creation_loop=cloop)
+                        on_round=on_round, creation_loop=cloop,
+                        eval_spec=eval_spec, backend=backend)
     orch.archive.stagnation_patience = stagnation  # 快速触发创造
 
     t0 = time.time()

@@ -99,13 +99,15 @@ class Orchestrator:
     def __init__(
         self,
         config: OrchestratorConfig,
-        eval_fn: EvalFn,
+        eval_fn: EvalFn | None = None,
         devices: list[str] | int | None = None,
         memory=None,                       # MemoryStore: 落库 + graveyard
         base_genotype: Genotype | None = None,
         protected: list[str] | None = None,
         on_round: Callable[[RunState], None] | None = None,
         creation_loop=None,                # Tier-2 CreationLoop: 停滞时触发跨域创造 (可选)
+        eval_spec=None,                    # EvalSpec: 进程后端 worker 自建 eval_fn (避闭包pickle)
+        backend: str = "auto",             # "auto"/"thread"/"process"; auto下无eval_spec→线程
     ):
         self.cfg = config
         self.memory = memory
@@ -122,7 +124,8 @@ class Orchestrator:
             base_genotype=base_genotype,
         )
         self.archive = MAPElitesArchive(seed=config.seed)
-        self.scheduler = GPUScheduler(eval_fn, devices=devices)
+        self.scheduler = GPUScheduler(
+            eval_fn, devices=devices, eval_spec=eval_spec, backend=backend)
         self.state = RunState()
 
         # SOTA 锚点 (程序化停止依据)
@@ -240,16 +243,19 @@ class Orchestrator:
     # -- 主循环 (永不暂停问人) --
     def run(self) -> RunState:
         """跑到满足停止条件。无 max_* 与可达 target → 真 24/7 (由外部中断)。"""
-        while True:
-            reason = self.should_stop()
-            if reason is not None:
-                self.state.stop_reason = reason
-                break
-            self.step()
-            # 停滞 → Tier-2 跨域创造(若接入)+ 岛屿重置
-            if self.archive.stagnated():
-                self._try_creation()
-                self.archive.island_reset()
+        try:
+            while True:
+                reason = self.should_stop()
+                if reason is not None:
+                    self.state.stop_reason = reason
+                    break
+                self.step()
+                # 停滞 → Tier-2 跨域创造(若接入)+ 岛屿重置
+                if self.archive.stagnated():
+                    self._try_creation()
+                    self.archive.island_reset()
+        finally:
+            self.scheduler.close()   # 进程后端清理持久池 (线程后端 no-op)
         return self.state
 
     def _try_creation(self) -> None:
@@ -271,6 +277,9 @@ class Orchestrator:
                 self.state.history.append({"event": "creation", "operators": outcome.operator_names,
                                            "bottleneck": outcome.bottleneck,
                                            "n_success": outcome.n_success})
+                # 进程后端: 新 synth 算子已 persist, 回收旧池 → 下批 worker load_persisted 拿到最新
+                # (线程后端 no-op; 主进程 SPATIAL_OPS 已含新算子, 无需 refresh)
+                self.scheduler.refresh_workers()
         except Exception as e:
             # 创造出错不中止优化
             self.state.history.append({"event": "creation_failed", "error": str(e)[:120]})
