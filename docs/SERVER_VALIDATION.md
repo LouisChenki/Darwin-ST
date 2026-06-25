@@ -288,3 +288,29 @@ CUDA上下文死锁 b67fd5c, GPU利用率14%→50-91%) + 真实水位 **40ep MAE
 
 **意义**: 阶段2核心论点实证 —— **训练动态驱动的LLM诊断让跨域检索真正多样化**(频域/时空patch而非单一dilated), 这是闭合最后gap冲SOTA的关键机理。bug由真实实跑揪出(单元测试测不到推理模型的token耗尽行为), 修复后多样化立即生效。run继续观察best能否进一步破18.69→18.22→17.80。
 
+### v2 完整跑完 (10轮 12543s≈3.5h, 程序化 max_rounds 停)
+
+**最终: best 18.951, 创造6次, 40 KEEP / 0 CRASH, diag_fail=0 (LLM诊断全程零fallback)。**
+
+**6次创造 = 6个完全不同的跨域机制 (多样化彻底坐实, 对比原18.69 run的6次全dilated_causal)**:
+| 创造 | 机制 | 域类别 |
+|---|---|---|
+| 1 | frequency_band_feature_reweighting | 频域 |
+| 2 | spatio_temporal_patchifying | 时空分块 |
+| 3 | selective_loss_masking | 损失层 |
+| 4 | diffusion_convolution | 扩散/图 |
+| 5 | cluster_balanced_sampling + distribution_aware_experience_replay | 采样/回放 |
+| 6 | tweedie_distribution_modeling | 分布建模 |
+
+top2最优算子来自**两个不同机制**: synth_sequential_clean_then_baseline(18.951, 源自创造3 selective_loss_masking的"先去噪再baseline") / synth_parallel_freq_and_dilated(18.957, 源自创造1频域)。
+
+**诚实结论 (关键, 需正视)**: v2 best **18.951 略差于**原线程版的 **18.69**。**诊断多样化机理完全成功**(6个不同机制 vs 6个同一机制, 这是论文卖点), **但多样化没换来更低MAE**。可能原因:
+1. **探索分散**: 6个不同方向各得较少进化精修, 不如18.69那次"集中refine dilated_causal融合(LKA+SASF)"深入。多样性↔精修深度的权衡。
+2. **18.69可能是强命中**: 那次的 synth_seq_lka_sasf_residual(LKA大核注意力)恰好是PeMS04对症的强算子, 多样探索未必撞到同等强的。
+3. **轮数/HPO预算**: 10轮×HPO5 对"广撒网"不够; 多样化要发挥需要更多轮让每个方向充分进化。
+4. **随机性**: 两次run起始架构不同, 18.69 vs 18.95 的0.26差在噪声量级内(合成算子MAE分布18.7-19.2)。
+
+**净判断**: 阶段2达成了它**设计要解决的问题**(诊断同质化), 这是确定的成功且可写进论文。但"多样化→破18.69冲SOTA"这一步**未实现**——多样性本身不直接降MAE, 还需配合(a)更长跑让优势方向充分精修, 或(b)诊断+检索更精准命中对症强机制。这是诚实的负结果, 不掩盖。
+
+**附带验证 (全部通过)**: 多进程4卡全程满载0崩溃 + 创造6次refresh_workers衔接稳 + run隔离(独立db+run_tag可干净读) + max_tokens修复(diag_fail=0) + 8192预算下LLM诊断稳定。工程层面全绿。
+
