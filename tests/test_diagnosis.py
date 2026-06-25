@@ -203,6 +203,32 @@ def test_llm_diagnosis_none_llm_returns_none():
     assert diagnose_bottleneck_llm(_summary(), [], 0, None) is None
 
 
+def test_llm_diagnosis_retries_on_empty_then_succeeds():
+    """推理模型 max_tokens 太小返回空 → 加倍预算重试一次 → 第二次成功 (踩过的真 bug 守卫)。"""
+    calls = {"n": 0, "max_tokens": []}
+    good = json.dumps({"diagnosis": "z", "preconditions": ["long_range_dependency"]})
+
+    def responder(msgs):
+        calls["n"] += 1
+        return "" if calls["n"] == 1 else good   # 首次空 (reasoning 吃光), 重试成功
+
+    class _MT(MockLLM):
+        def chat(self, messages, temperature=0.7, max_tokens=4096):
+            calls["max_tokens"].append(max_tokens)
+            return self.responder(messages)
+
+    diag = diagnose_bottleneck_llm(_summary(), [], 0, _MT(responder))
+    assert diag is not None and diag.preconditions == ["long_range_dependency"]
+    assert calls["n"] == 2                          # 重试了一次
+    assert calls["max_tokens"][1] == calls["max_tokens"][0] * 2   # 第二次预算加倍
+
+
+def test_llm_diagnosis_empty_both_attempts_returns_none():
+    """两次都空 (极端) → 退回 None (规则版兜底), 不崩。"""
+    diag = diagnose_bottleneck_llm(_summary(), [], 0, MockLLM(lambda m: ""))
+    assert diag is None
+
+
 # ---- prompt 工程要素 (文献修正版) ----
 
 def test_prompt_has_no_persona():

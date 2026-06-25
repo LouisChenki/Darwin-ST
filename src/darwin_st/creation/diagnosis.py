@@ -346,10 +346,17 @@ def _parse_diagnosis(text: str) -> BottleneckDiagnosis | None:
 
 
 def diagnose_bottleneck_llm(summary: DiagnosisSummary, history: list[dict],
-                            round_idx: int, llm, temperature: float = 0.7) -> BottleneckDiagnosis | None:
+                            round_idx: int, llm, temperature: float = 0.7,
+                            max_tokens: int = 8192) -> BottleneckDiagnosis | None:
     """LLM 瓶颈诊断: 摘要 + 历史 → 严格 JSON → BottleneckDiagnosis。
 
     返回 None 表示任何失败 (LLM 异常 / 坏 JSON / 全非法前提词) → 调用方退回规则版。
+
+    **max_tokens 必须给足 (关键, 踩过坑)**: DeepSeek-v4 是推理模型, 内部 reasoning trace 先吃
+    token, 之后才吐可见 JSON。可见 JSON 很短 (~200 token), 但 reasoning 可能很长且不定长。
+    预算太小 → reasoning 把额度耗尽 → 可见内容为空 → 解析失败静默退回规则版 (诊断多样化失效)。
+    实测: max_tokens=10 必空; 1024 在 temperature>0 下概率性返回空; 故默认给 8192 留足 reasoning
+    余量。若仍空 (极长 reasoning), 重试一次加倍预算; 再不行才退规则版 (并打日志, 不再静默)。
     """
     if llm is None:
         return None
@@ -357,8 +364,17 @@ def diagnose_bottleneck_llm(summary: DiagnosisSummary, history: list[dict],
         {"role": "system", "content": _build_system()},
         {"role": "user", "content": _build_user(summary, history, round_idx)},
     ]
-    try:
-        text = llm.chat(messages, temperature=temperature, max_tokens=1024)
-    except Exception:
-        return None
-    return _parse_diagnosis(text)
+    for attempt, mt in enumerate((max_tokens, max_tokens * 2)):
+        try:
+            text = llm.chat(messages, temperature=temperature, max_tokens=mt)
+        except Exception as e:
+            print(f"[诊断] LLM 调用异常 (attempt {attempt}): {type(e).__name__}: {str(e)[:120]}")
+            return None
+        diag = _parse_diagnosis(text)
+        if diag is not None:
+            return diag
+        # 空/不可解析 → 多半是 reasoning 吃光额度; 重试加倍预算 (仅一次)
+        print(f"[诊断] 第 {attempt+1} 次解析失败 (max_tokens={mt}, 返回长度={len(text or '')}), "
+              + ("加倍重试" if attempt == 0 else "退回规则版"))
+    return None
+

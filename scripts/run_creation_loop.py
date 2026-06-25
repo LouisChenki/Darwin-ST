@@ -121,7 +121,7 @@ def main():
     registry = OperatorRegistry(persist_dir=os.path.join(cache, "dynamic_ops"))
     registry.load_persisted()  # 加载之前合成的算子
 
-    mem = MemoryStore(os.path.join(cache, "memory_creation.db"))
+    mem = MemoryStore(os.environ.get("MEMORY_DB", os.path.join(cache, "memory_creation.db")))
     from darwin_st.creation import CreationConfig
     n_hypo = _env_int("N_HYPOTHESES", 4)
     cloop = CreationLoop(store, embedder, synth, registry, memory=mem,
@@ -137,7 +137,8 @@ def main():
                          synth_persist_dir=os.path.join(cache, "dynamic_ops"))
     base = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64)  # 故意弱基线, 逼出创造
 
-    cfg = OrchestratorConfig(dataset=ds, run_tag=f"exp/{ds.lower()}-creation",
+    cfg = OrchestratorConfig(dataset=ds,
+                             run_tag=os.environ.get("RUN_TAG", f"exp/{ds.lower()}-creation"),
                              population_size=pop, tournament_size=min(3, pop),
                              max_rounds=max_rounds, target_mae=0.0,  # 不可达 → 靠 max_rounds 停
                              warmup_keep=pop * 2, seed=0)
