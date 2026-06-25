@@ -300,3 +300,32 @@ def test_creation_none_does_not_break():
     orch.archive.stagnation_patience = 2
     state = orch.run()
     assert state.rounds == 4  # 正常跑完
+
+
+def test_try_creation_refreshes_workers_and_closes(monkeypatch):
+    """衔接点②→③ orchestrator 级: 创造成功后必须 refresh_workers (让进程后端下批重载新 synth),
+    run 结束必须 close。这是多进程下 Tier-2 算子能被 Tier-1 评测的关键 (否则 spawn worker 没新算子)。
+    """
+    from darwin_st.search.genotype import Genotype, STBlock
+
+    class _SpyCreationLoop:
+        def maybe_create(self, best_genotype, sota_gap=None, run_tag="", dataset="", best_trace=None):
+            from darwin_st.creation.creation_loop import CreationOutcome
+            seed = Genotype(blocks=[STBlock("gcn", "tcn")])
+            return CreationOutcome(True, operator_names=["synth_x"], seed_genotypes=[seed],
+                                   bottleneck="b", n_success=1)
+
+    calls = {"refresh": 0, "close": 0}
+    cfg = OrchestratorConfig(population_size=4, tournament_size=2, max_rounds=3, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=2, creation_loop=_SpyCreationLoop())
+    # 监听 scheduler 的 refresh/close (线程后端是 no-op, 但 orchestrator 仍应调用)
+    monkeypatch.setattr(orch.scheduler, "refresh_workers",
+                        lambda: calls.__setitem__("refresh", calls["refresh"] + 1))
+    monkeypatch.setattr(orch.scheduler, "close",
+                        lambda: calls.__setitem__("close", calls["close"] + 1))
+    orch.archive.stagnation_patience = 1  # 立即触发创造
+    orch.run()
+
+    assert calls["refresh"] >= 1, "创造成功后未调 refresh_workers (多进程下 worker 拿不到新 synth)"
+    assert calls["close"] == 1, "run 结束未 close 进程池"
+
