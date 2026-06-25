@@ -216,6 +216,25 @@ class MemoryStore:
         scored.sort(key=lambda t: t[0])
         return [d for _, d in scored[:k]]
 
+    def list_trials(
+        self, dataset: str | None = None, status: str | None = None,
+        run_tag: str | None = None,
+    ) -> list[dict]:
+        """列出实验行 (供排行榜导出等离线聚合)。可按 dataset/status/run_tag 过滤。
+
+        与 best_so_far 不同: 返回**全部**匹配行 (不取最优), 已解析 genotype/hp。
+        """
+        clauses, params = [], []
+        for col, val in (("dataset", dataset), ("status", status), ("run_tag", run_tag)):
+            if val is not None:
+                clauses.append(f"{col}=?")
+                params.append(val)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM experiments {where} ORDER BY id", params
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
     def get_children(self, parent_id: int) -> list[dict]:
         rows = self.conn.execute(
             """

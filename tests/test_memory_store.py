@@ -142,6 +142,34 @@ def test_best_so_far_dataset_scoped(store):
 
 
 # ---------------------------------------------------------------------------
+# list_trials (排行榜导出用: 返回全部匹配, 非最优)
+# ---------------------------------------------------------------------------
+
+
+def test_list_trials_filters_and_parses(store):
+    store.record_trial(_trial(dataset="PeMS04", status="KEEP", val_mae=18.0,
+                              genotype={"depth": 2}))
+    store.record_trial(_trial(dataset="PeMS04", status="DISCARD", val_mae=99.0,
+                              genotype={"depth": 3}))
+    store.record_trial(_trial(dataset="PeMS08", status="KEEP", val_mae=14.0,
+                              genotype={"depth": 4}))
+    # 全部 (无过滤)
+    assert len(store.list_trials()) == 3
+    # 按 dataset+status 过滤, 且 genotype/hp 已解析回 dict
+    keep04 = store.list_trials(dataset="PeMS04", status="KEEP")
+    assert len(keep04) == 1
+    assert keep04[0]["genotype"] == {"depth": 2}
+    assert isinstance(keep04[0]["hp"], dict)
+
+
+def test_list_trials_run_tag_isolation(store):
+    store.record_trial(_trial(run_tag="exp/now", val_mae=18.0))
+    store.record_trial(_trial(run_tag="exp/old", val_mae=19.0, genotype={"depth": 3}))
+    rows = store.list_trials(dataset="PeMS04", run_tag="exp/now")
+    assert len(rows) == 1 and rows[0]["run_tag"] == "exp/now"
+
+
+# ---------------------------------------------------------------------------
 # 最近邻检索
 # ---------------------------------------------------------------------------
 
