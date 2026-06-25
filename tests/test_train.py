@@ -54,10 +54,18 @@ def tiny_data(tmp_path, monkeypatch):
 def test_train_one_returns_finite_mae(tiny_data):
     prof, data_dir, adj = tiny_data
     geno = random_genotype(depth=1, spatial="gcn", temporal="tcn", hidden=16)
-    mae = train_one(geno, {"lr": 1e-3, "weight_decay": 1e-4, "batch_size": 16},
-                    data_dir, prof, adj, device="cpu", max_epochs=2)
+    mae, trace = train_one(geno, {"lr": 1e-3, "weight_decay": 1e-4, "batch_size": 16},
+                           data_dir, prof, adj, device="cpu", max_epochs=2)
     assert np.isfinite(mae)
     assert mae > 0  # 真实尺度 MAE
+    # TrainTrace 采集: 逐 epoch 曲线长度 = 实际 epoch 数, 梯度范数被捡回 (非空)
+    assert trace.n_epochs_run == 2
+    assert len(trace.train_loss) == 2 and len(trace.val_mae) == 2
+    assert len(trace.grad_norm_mean) == 2 and len(trace.grad_norm_max) == 2
+    assert all(g >= 0 for g in trace.grad_norm_mean)   # 梯度范数非负 (clip 前)
+    assert 0 <= trace.best_epoch < 2
+    assert trace.lr == 1e-3 and trace.lr_schedule == "none"
+    assert not trace.nan_hit
 
 
 def test_train_one_with_tod_dow_and_lr_schedule(tiny_data):
@@ -74,18 +82,20 @@ def test_train_one_with_tod_dow_and_lr_schedule(tiny_data):
         np.save(os.path.join(data_dir, f"{split}_dow.npy"), dow.astype(np.int64))
     geno = random_genotype(depth=1, spatial="gcn", temporal="tcn", hidden=16)
     # geno 默认 use_tod/use_dow=True → 模型会消费 tod/dow
-    mae = train_one(geno, {"lr": 1e-2, "batch_size": 16, "lr_schedule": "cosine"},
-                    data_dir, prof, adj, device="cpu", max_epochs=3)
+    mae, trace = train_one(geno, {"lr": 1e-2, "batch_size": 16, "lr_schedule": "cosine"},
+                           data_dir, prof, adj, device="cpu", max_epochs=3)
     assert np.isfinite(mae) and mae > 0
+    assert trace.lr_schedule == "cosine" and trace.n_epochs_run == 3
 
 
 def test_train_one_time_budget(tiny_data):
     """时间熔断: 预算 0 秒 → 至多跑 1 epoch 即停, 仍返回有限值。"""
     prof, data_dir, adj = tiny_data
     geno = random_genotype(depth=1, hidden=16)
-    mae = train_one(geno, {"lr": 1e-3, "batch_size": 16}, data_dir, prof, adj,
-                    device="cpu", max_epochs=50, time_budget_s=0.0)
+    mae, trace = train_one(geno, {"lr": 1e-3, "batch_size": 16}, data_dir, prof, adj,
+                           device="cpu", max_epochs=50, time_budget_s=0.0)
     assert np.isfinite(mae)  # 第一个 epoch 后熔断
+    assert trace.stopped_early and trace.n_epochs_run <= 2
 
 
 def test_evaluate_architecture_returns_result(tiny_data):

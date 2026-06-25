@@ -197,3 +197,32 @@ def test_find_cross_domain_allow_same_domain(store):
     res = find_cross_domain_analogy("节点身份难以区分", store, store.embedder,
                                     cross_domain_only=False)
     assert len(res.mechanisms) >= 1
+
+
+def test_override_preconditions_bypasses_keyword_match(store):
+    """override_preconditions 直接驱动 FAC, 绕过 bottleneck 字符串的关键词匹配。
+
+    瓶颈字符串故意'无关键词'(不含长程/冗余等线索), 但 override 指定 label_scarcity+
+    redundant_structure → 仍应拉回 masked_autoencoding (LLM 直出前提词绕过脆弱 decompose)。
+    """
+    res = find_cross_domain_analogy(
+        "模型表现不够好需要改进", store, store.embedder,   # 无线索词, decompose 会落空
+        override_preconditions=["label_scarcity", "redundant_structure"])
+    assert "label_scarcity" in res.target_preconditions
+    assert "redundant_structure" in res.target_preconditions
+    names = {m.name for m in res.mechanisms}
+    assert "masked_autoencoding" in names
+
+
+def test_override_preconditions_filters_illegal(store):
+    """override 含非法词 → 过滤; 全非法 → 退回关键词分解 (不崩)。"""
+    # 一个合法 + 一个非法 → 只保留合法的
+    res = find_cross_domain_analogy(
+        "随便什么", store, store.embedder,
+        override_preconditions=["long_range_dependency", "not_a_vocab_word"])
+    assert res.target_preconditions == ["long_range_dependency"]
+    # 全非法 → 退回对 bottleneck 的关键词分解 (不报错)
+    res2 = find_cross_domain_analogy(
+        "长程时序依赖捕获不好", store, store.embedder,
+        override_preconditions=["bogus1", "bogus2"])
+    assert "long_range_dependency" in res2.target_preconditions

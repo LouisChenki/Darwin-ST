@@ -77,6 +77,7 @@ class RunState:
     n_crash: int = 0
     best_mae: float = float("inf")
     best_genotype: Genotype | None = None
+    best_trace: dict | None = None       # 最优架构的训练动态轨迹 (供 Tier-2 LLM 瓶颈诊断)
     beat_sota: bool = False
     sota_name: str | None = None
     sota_mae: float | None = None
@@ -210,6 +211,7 @@ class Orchestrator:
             if res.mae < self.state.best_mae:
                 self.state.best_mae = res.mae
                 self.state.best_genotype = geno
+                self.state.best_trace = res.extra.get("train_trace")  # 同步存最优架构训练轨迹
                 if self._target is not None and res.mae < self._target:
                     self.state.beat_sota = True
         elif status == "DISCARD":
@@ -271,7 +273,8 @@ class Orchestrator:
         try:
             outcome = self.creation_loop.maybe_create(
                 self.state.best_genotype, sota_gap=gap,
-                run_tag=self.cfg.run_tag, dataset=self.cfg.dataset)
+                run_tag=self.cfg.run_tag, dataset=self.cfg.dataset,
+                best_trace=self.state.best_trace)
             if outcome.success and outcome.seed_genotypes:
                 self._pending_seed_genotypes.extend(outcome.seed_genotypes)
                 self.state.history.append({"event": "creation", "operators": outcome.operator_names,

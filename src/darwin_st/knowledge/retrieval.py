@@ -25,7 +25,7 @@ from typing import Callable
 
 import numpy as np
 
-from darwin_st.knowledge.ontology import Mechanism
+from darwin_st.knowledge.ontology import Mechanism, PRECONDITION_VOCAB
 
 __all__ = ["RetrievalResult", "tokenize", "token_overlap_similarity",
            "decompose_to_preconditions", "cross_domain_analogy",
@@ -204,6 +204,7 @@ def find_cross_domain_analogy(
     cross_domain_only: bool = True,
     max_results: int = 4,
     mac_top_k: int = 8,
+    override_preconditions: list[str] | None = None,
 ) -> RetrievalResult:
     """正式跨域类比检索 (P3 对外主接口)。
 
@@ -213,8 +214,17 @@ def find_cross_domain_analogy(
 
     与 demo 版 cross_domain_analogy 同逻辑, 但相似度走真实 embedding + 图遍历召回,
     语义模糊匹配更准, 且 FAC 保证"前提共享"的机制即使语义不相似也能被拉到。
+
+    override_preconditions: Tier-2 LLM 诊断直出的受控前提词 (∈ PRECONDITION_VOCAB)。给定时
+    **跳过** decompose_to_preconditions 的脆弱关键词匹配, 直接用 LLM 前提词做 FAC 图召回
+    (MAC 语义召回仍走 bottleneck 字符串, 双路保留)。非法词在调用方 (diagnosis) 已过滤。
     """
-    target_preconds = decompose_to_preconditions(bottleneck)
+    if override_preconditions:
+        target_preconds = [p for p in override_preconditions if p in PRECONDITION_VOCAB]
+        if not target_preconds:                       # 全非法 → 退回关键词分解
+            target_preconds = decompose_to_preconditions(bottleneck)
+    else:
+        target_preconds = decompose_to_preconditions(bottleneck)
     excl = target_domain if (cross_domain_only and target_domain) else None
 
     # MAC: 语义向量召回

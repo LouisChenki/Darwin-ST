@@ -33,6 +33,7 @@ class CreationConfig:
     max_mechanisms: int = 3        # 跨域互补集大小
     n_hypotheses: int = 4          # 一次生成多少个融合假设 (单 Generator 生 N 个)
     seed: int = 0
+    use_llm_diagnosis: bool = True  # 优先用 LLM 诊断瓶颈 (训练信号驱动多样化); 失败退回规则版
 
 
 @dataclass
@@ -90,25 +91,64 @@ class CreationLoop:
     """Tier-2 创造步骤。orchestrator 在停滞时调 maybe_create()。"""
 
     def __init__(self, store, embedder, synthesizer: OperatorSynthesizer,
-                 registry: OperatorRegistry, memory=None, config: CreationConfig | None = None):
+                 registry: OperatorRegistry, memory=None, config: CreationConfig | None = None,
+                 llm=None):
         self.store = store
         self.embedder = embedder
         self.synthesizer = synthesizer
         self.registry = registry
         self.memory = memory
         self.cfg = config or CreationConfig()
+        self.llm = llm                       # OpenAICompatLLM (注入); None 时 _diagnose 退规则版
+        self._round_idx = 0                  # 第几次创造 (OPRO 轨迹用)
+        self._history: list[dict] = []       # 历轮诊断: [{preconditions, bottleneck, result_mae}]
+
+    def _diagnose(self, best_genotype: Genotype | None, sota_gap: float | None,
+                  best_trace: dict | None) -> tuple[str, list[str] | None]:
+        """诊断瓶颈, 返回 (bottleneck 字符串, override_preconditions 或 None)。
+
+        LLM 优先 (有 llm + 有 trace + 开关开): 训练信号 → 摘要 → LLM 诊断 → 受控前提词 (绕过关键词匹配)。
+        任何失败 (无 llm / 无 trace / 解析失败) 退回规则版 diagnose_bottleneck, override=None (走原 decompose)。
+        """
+        if self.cfg.use_llm_diagnosis and self.llm is not None and best_trace is not None:
+            try:
+                from darwin_st.creation.diagnosis import (
+                    diagnose_bottleneck_llm,
+                    summarize_trace,
+                )
+
+                summary = summarize_trace(best_trace, best_genotype, sota_gap)
+                diag = diagnose_bottleneck_llm(summary, self._history, self._round_idx, self.llm)
+                if diag is not None and diag.preconditions:
+                    return diag.bottleneck, diag.preconditions
+            except Exception:
+                pass  # 任何 LLM/解析异常 → 规则兜底 (创造闭环不中止)
+        return diagnose_bottleneck(best_genotype, sota_gap), None
 
     def maybe_create(self, best_genotype: Genotype | None, sota_gap: float | None = None,
-                     run_tag: str = "exp/auto", dataset: str = "PeMS04") -> CreationOutcome:
-        """尝试一次跨域创造。返回 CreationOutcome(含待评 genotype)。"""
-        # 1) 诊断瓶颈
-        bottleneck = diagnose_bottleneck(best_genotype, sota_gap)
+                     run_tag: str = "exp/auto", dataset: str = "PeMS04",
+                     best_trace: dict | None = None) -> CreationOutcome:
+        """尝试一次跨域创造。返回 CreationOutcome(含待评 genotype)。
 
-        # 2) 跨域检索互补机制集
+        best_trace: 最优架构的训练动态轨迹 (TrainTrace asdict)。给定且 LLM 可用时走 LLM 诊断
+        (训练信号驱动多样化瓶颈诊断); 否则退回规则版 diagnose_bottleneck。见 creation/diagnosis.py。
+        """
+        # 1) 诊断瓶颈 (LLM 优先, 规则兜底)
+        bottleneck, override_precs = self._diagnose(best_genotype, sota_gap, best_trace)
+        # OPRO 轨迹: 记本轮诊断方向 + 当前水位 (result_mae 用 best_trace 的 best_mae, 缺则用 gap 推)
+        cur_mae = None
+        if best_trace is not None and best_trace.get("best_mae") not in (None, float("inf")):
+            cur_mae = best_trace.get("best_mae")
+        self._history.append({"round": self._round_idx, "bottleneck": bottleneck,
+                              "preconditions": override_precs or [], "result_mae": cur_mae})
+        self._round_idx += 1
+
+        # 2) 跨域检索互补机制集 (override_precs 非空则直接用 LLM 给的前提词做 FAC 召回, 绕过关键词匹配)
         res = find_cross_domain_analogy(
             bottleneck, self.store, self.embedder,
             target_domain=self.cfg.target_domain, cross_domain_only=True,
-            max_results=self.cfg.max_mechanisms)
+            max_results=self.cfg.max_mechanisms,
+            override_preconditions=override_precs)
         mech_names = [m.name for m in res.mechanisms]
         if not res.mechanisms:
             return CreationOutcome(False, bottleneck=bottleneck, reason="跨域检索无结果")

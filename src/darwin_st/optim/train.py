@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import asdict
 
 import numpy as np
 import optuna
@@ -31,6 +32,7 @@ from darwin_st.data.metrics import masked_mae
 from darwin_st.data.protocol import DatasetProfile, get_profile
 from darwin_st.optim.hpo import HPOConfig, optimize_architecture
 from darwin_st.optim.scheduler import EvalResult
+from darwin_st.optim.trace import TrainTrace
 from darwin_st.search.builder import build_model, count_params
 from darwin_st.search.genotype import Genotype
 
@@ -65,11 +67,14 @@ def train_one(
     trial: optuna.Trial | None = None,
     max_epochs: int = 27,
     time_budget_s: float = 2400.0,
-) -> float:
-    """用给定超参训练一个架构, 返回最优 val-MAE(真实尺度 masked)。
+) -> tuple[float, TrainTrace]:
+    """用给定超参训练一个架构, 返回 (最优 val-MAE 真实尺度 masked, TrainTrace 训练动态轨迹)。
 
     每 epoch 向 trial.report 上报 val-MAE 供 ASHA 剪枝(trial 为 None 则跳过剪枝)。
     NaN/时间熔断触发时提前返回当前最优(或 inf)。
+
+    TrainTrace 在 epoch 边界聚合训练动态 (loss 曲线/梯度范数/收敛标志), 供 Tier-2 LLM 瓶颈诊断。
+    采集点全在现有边界, 开销 <0.1% (每 epoch 几个 .item() + append, 相对一次全量 val evaluate 可忽略)。
 
     多卡并发铁律: 必须 set_device 把**当前线程的 CUDA 默认上下文**切到目标卡。
     只 .to(device) 不够 —— 张量在目标卡但临时分配/stream/cuDNN handle 仍挤在 cuda:0,
@@ -98,10 +103,13 @@ def train_one(
     else:
         scheduler = None
 
+    trace = TrainTrace(max_epochs=max_epochs, lr_schedule=sched_kind, lr=lr)
     best_mae = float("inf")
     start = time.time()
     for epoch in range(max_epochs):
         model.train()
+        loss_sum, n_batches = 0.0, 0           # epoch 内训练 loss 累加 (epoch 末求均值)
+        gn_sum, gn_max = 0.0, 0.0              # epoch 内梯度范数累加 + 最大 (clip 前)
         for batch in train_loader:
             if len(batch) == 4:                          # (x, tod, dow, y) STID 身份嵌入
                 x, tod, dow, y = batch
@@ -114,10 +122,19 @@ def train_one(
             opt.zero_grad()
             loss = masked_mae(pred, y)                    # 归一化尺度训练 loss
             if torch.isnan(loss) or torch.isinf(loss):   # NaN 熔断
-                return best_mae if best_mae < float("inf") else float("inf")
+                trace.nan_hit = True
+                trace.n_epochs_run = epoch
+                trace.best_mae = best_mae
+                return (best_mae if best_mae < float("inf") else float("inf")), trace
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)  # 梯度裁剪
+            # clip_grad_norm_ 返回 **clip 前**的梯度总范数 (零额外计算) —— 之前丢弃, 现采集供梯度诊断
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
+            loss_sum += float(loss.detach())             # epoch 末一次性聚合, 不在 batch 内 sync
+            gn_val = float(gn)
+            gn_sum += gn_val
+            gn_max = max(gn_max, gn_val)
+            n_batches += 1
 
         # 真实尺度 masked 评测
         met = P.evaluate(model, data_dir, "val", batch_size=batch_size, device=device,
@@ -125,6 +142,13 @@ def train_one(
         mae = met["mae"]
         if mae < best_mae:                               # best-checkpoint(取最优步)
             best_mae = mae
+            trace.best_epoch = epoch
+
+        # 采集本 epoch 动态信号 (epoch 边界, 低开销)
+        trace.train_loss.append(loss_sum / max(n_batches, 1))
+        trace.val_mae.append(float(mae))
+        trace.grad_norm_mean.append(gn_sum / max(n_batches, 1))
+        trace.grad_norm_max.append(gn_max)
 
         # lr schedule 步进: cosine 每 epoch 步, plateau 看 val-MAE
         if scheduler is not None:
@@ -136,12 +160,19 @@ def train_one(
         if trial is not None:
             trial.report(mae, epoch)
             if trial.should_prune():
+                trace.n_epochs_run = epoch + 1
+                trace.best_mae = best_mae
+                trace.final_train_loss = trace.train_loss[-1] if trace.train_loss else float("inf")
                 raise optuna.TrialPruned()
 
         if time.time() - start > time_budget_s:          # 时间熔断
+            trace.stopped_early = True
             break
 
-    return best_mae
+    trace.n_epochs_run = len(trace.val_mae)
+    trace.best_mae = best_mae
+    trace.final_train_loss = trace.train_loss[-1] if trace.train_loss else float("inf")
+    return best_mae, trace
 
 
 def evaluate_architecture(
@@ -164,8 +195,14 @@ def evaluate_architecture(
     del probe
 
     def train_eval_fn(geno, hps, trial):
-        return train_one(geno, hps, data_dir, profile, adj, device, trial=trial,
-                         max_epochs=hpo_cfg.max_epochs)
+        mae, trace = train_one(geno, hps, data_dir, profile, adj, device, trial=trial,
+                               max_epochs=hpo_cfg.max_epochs)
+        # 把训练轨迹挂到 trial user_attr (存 dict: Optuna 要求 JSON-able + 跨进程更稳)
+        try:
+            trial.set_user_attr("trace", asdict(trace))
+        except Exception:
+            pass  # user_attr 失败不影响调参 (诊断信号缺失退回规则版)
+        return mae
 
     res = optimize_architecture(
         genotype, train_eval_fn, hpo_cfg,
@@ -182,7 +219,8 @@ def evaluate_architecture(
         fail_reason=None if status == "OK" else "all_hpo_trials_failed",
         extra={"num_params": n_params,
                "hpo_complete": res.n_complete, "hpo_pruned": res.n_pruned,
-               "hpo_failed": res.n_failed},
+               "hpo_failed": res.n_failed,
+               "train_trace": res.best_trace},   # 最优 trial 的训练动态轨迹 (供 LLM 诊断)
     )
 
 

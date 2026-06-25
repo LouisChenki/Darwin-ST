@@ -125,7 +125,7 @@ def main():
     from darwin_st.creation import CreationConfig
     n_hypo = _env_int("N_HYPOTHESES", 4)
     cloop = CreationLoop(store, embedder, synth, registry, memory=mem,
-                         config=CreationConfig(n_hypotheses=n_hypo))
+                         config=CreationConfig(n_hypotheses=n_hypo), llm=llm)
 
     # --- 优化引擎 (真实训练) ---
     hpo_cfg = HPOConfig(n_trials=hpo_trials, max_epochs=max_epochs,

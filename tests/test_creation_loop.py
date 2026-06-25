@@ -101,6 +101,65 @@ def test_diagnose_sota_gap():
 
 
 # ---------------------------------------------------------------------------
+# LLM 诊断接线 (层2/3): _diagnose 优先 LLM, 缺则规则兜底; override 流进检索
+# ---------------------------------------------------------------------------
+
+
+def _trace_dict():
+    """构造一个收敛平台的训练轨迹 (供 summarize_trace)。"""
+    return {
+        "train_loss": [1.0, 0.6, 0.4, 0.35, 0.33], "val_mae": [30, 22, 19, 18.7, 18.69],
+        "grad_norm_mean": [1.0] * 5, "grad_norm_max": [2.0] * 5,
+        "n_epochs_run": 5, "max_epochs": 5, "best_epoch": 4, "best_mae": 18.69,
+        "stopped_early": False, "nan_hit": False, "lr_schedule": "cosine", "lr": 1e-3,
+    }
+
+
+def test_diagnose_uses_llm_preconditions(store):
+    """有 llm + trace → _diagnose 返回 LLM 的受控前提词 (override)。"""
+    import json as _json
+    diag_llm = MockLLM(lambda msgs: _json.dumps(
+        {"reasoning": "r", "evidence": "e", "diagnosis": "缺多尺度建模",
+         "preconditions": ["multi_scale_structure"], "direction": "多尺度分解"}))
+    synth = OperatorSynthesizer(MockLLM(lambda m: ""), SynthesisConfig(max_retries=1))
+    loop = CreationLoop(store, store.embedder, synth, OperatorRegistry(), llm=diag_llm)
+    bottleneck, override = loop._diagnose(
+        Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=0.89, best_trace=_trace_dict())
+    assert override == ["multi_scale_structure"]
+    assert "多尺度" in bottleneck
+
+
+def test_diagnose_falls_back_to_rules_without_llm(store):
+    """无 llm → 退回规则版 diagnose_bottleneck, override=None。"""
+    synth = OperatorSynthesizer(MockLLM(lambda m: ""), SynthesisConfig(max_retries=1))
+    loop = CreationLoop(store, store.embedder, synth, OperatorRegistry(), llm=None)
+    bottleneck, override = loop._diagnose(
+        Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=1.0, best_trace=_trace_dict())
+    assert override is None
+    assert isinstance(bottleneck, str) and bottleneck
+
+
+def test_diagnose_falls_back_without_trace(store):
+    """有 llm 但无 trace → 仍退规则版 (无训练信号无从诊断)。"""
+    diag_llm = MockLLM(lambda msgs: '{"diagnosis":"x","preconditions":["heterogeneity"]}')
+    synth = OperatorSynthesizer(MockLLM(lambda m: ""), SynthesisConfig(max_retries=1))
+    loop = CreationLoop(store, store.embedder, synth, OperatorRegistry(), llm=diag_llm)
+    _, override = loop._diagnose(Genotype(blocks=[STBlock("gcn", "tcn")]),
+                                 sota_gap=1.0, best_trace=None)
+    assert override is None
+
+
+def test_maybe_create_records_opro_history(store):
+    """maybe_create 累积 OPRO 历史轨迹 (跨轮去重用)。"""
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0,
+                      best_trace=_trace_dict())
+    assert len(loop._history) == 1
+    assert loop._round_idx == 1
+    assert "bottleneck" in loop._history[0]
+
+
+# ---------------------------------------------------------------------------
 # 创造 (端到端 mock)
 # ---------------------------------------------------------------------------
 

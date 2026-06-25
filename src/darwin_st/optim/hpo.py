@@ -109,6 +109,7 @@ class HPOResult:
     n_pruned: int
     n_failed: int
     all_trials: list[dict] = field(default_factory=list)
+    best_trace: dict | None = None    # 最优 trial 的 TrainTrace (asdict), 供 Tier-2 LLM 诊断
 
 
 # 训练函数签名: (genotype, hps, trial) -> final_mae
@@ -164,8 +165,9 @@ def _summarize(study: optuna.Study) -> HPOResult:
     if completed:
         best = min(completed, key=lambda t: t.value)
         best_mae, best_hps = float(best.value), dict(best.params)
+        best_trace = best.user_attrs.get("trace")   # 最优 trial 的训练轨迹 (train_eval_fn 设的)
     else:
-        best_mae, best_hps = float("inf"), {}
+        best_mae, best_hps, best_trace = float("inf"), {}, None
 
     all_trials = [
         {"params": dict(t.params), "value": t.value, "state": t.state.name}
@@ -174,5 +176,5 @@ def _summarize(study: optuna.Study) -> HPOResult:
     return HPOResult(
         best_mae=best_mae, best_hps=best_hps,
         n_complete=n_complete, n_pruned=n_pruned, n_failed=n_failed,
-        all_trials=all_trials,
+        all_trials=all_trials, best_trace=best_trace,
     )
