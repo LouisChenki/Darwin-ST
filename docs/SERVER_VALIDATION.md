@@ -265,3 +265,26 @@ CUDA上下文死锁 b67fd5c, GPU利用率14%→50-91%) + 真实水位 **40ep MAE
 
 **结论**: 阶段1 GIL修复在真实4×5090验证通过, 真并行+生命周期干净+衔接经得起多进程。下一步: Tier1+2一体长跑 (BACKEND=process + 615库 + flash + LLM诊断), 看4卡满载下创造能否破18.69。
 
+## 🎯🎯 阶段2 LLM诊断多样化验证成功 (2026-06-25, HEAD 408a4d3) — 论文核心改进实证
+
+**背景**: 连体闭环18.69的根因已确诊=瓶颈诊断措辞固定→6次创造全检索同一机制dilated_causal_convolution。阶段2用训练动态(TrainTrace)驱动LLM诊断破此局。
+
+**实跑揪出真bug (max_tokens)**: 首跑(v1)第一次创造仍退回dilated_causal。排查: diagnose_bottleneck_llm用max_tokens=1024, 但DeepSeek-v4是**推理模型**(reasoning trace先吃token才吐JSON), 1024在temp>0下概率性返回空→解析失败**静默退回规则版**→多样化失效。修(commit 408a4d3): max_tokens默认8192 + 空则加倍重试 + fallback打日志不再静默。**教训: 推理模型max_tokens按 reasoning+输出 总量给, 可见输出短≠预算可小。**
+
+**v2修复后实跑 (BACKEND=process, POP12 ROUNDS10 HPO5 EPOCHS80, 隔离db+run_tag)**:
+| 轮 | best MAE | 创造 | 诊断(读TrainTrace) | 检索机制(跨域) |
+|---|---|---|---|---|
+| 1-2 | 22.14→20.31 | 0 | — | 纯Tier1天花板~20.3 |
+| 3 | 20.31停滞 | 0 | — | (停滞累积) |
+| **4** | **18.95** | **1** | "容量过小, 缺**多尺度时间结构**, 欠拟合" | **frequency_band_feature_reweighting (频域, TimeSeries/CV)** |
+| 5 | 18.95 | **2** | "深度过浅, 未用**时空平滑+周期性先验**, 欠拟合陷局部最优" | **spatio_temporal_patchifying (时空分块)** |
+
+**决定性证据 (多样化坐实)**:
+- **两次创造检索到两个完全不同的跨域机制** (频域 vs 时空patch), 各由**不同的训练动态证据**驱动 (多尺度 vs 平滑/周期) —— 彻底打破v1/原18.69的"6次全dilated_causal"同质化。`[诊断]`失败日志=0, 两次LLM诊断均一次成功无fallback。
+- best 20.31(纯Tier1) → **18.95**(创造1的频域+膨胀并行算子synth_parallel_freq_and_dilated), round4即破, 早于v1同期(v1 round4还19.63)。
+- **多进程↔创造衔接(连接点③)实跑确认**: 创造后refresh_workers真回收旧池(etime4368s)建新池(etime1269s), 新worker load_persisted拿到新算子续评。集成测试预测的行为真跑发生。
+
+**一个虚惊(已澄清)**: 创造后GPU瞬时0%差点误判卡死, 实为8worker全56-403%CPU(新旧池交替+每worker重载60持久算子+建模编译), CPU-busy非停滞。再次印证"瞬时nvidia-smi不可靠看db增量"。
+
+**意义**: 阶段2核心论点实证 —— **训练动态驱动的LLM诊断让跨域检索真正多样化**(频域/时空patch而非单一dilated), 这是闭合最后gap冲SOTA的关键机理。bug由真实实跑揪出(单元测试测不到推理模型的token耗尽行为), 修复后多样化立即生效。run继续观察best能否进一步破18.69→18.22→17.80。
+
