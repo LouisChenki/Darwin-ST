@@ -241,3 +241,27 @@ CUDA上下文死锁 b67fd5c, GPU利用率14%→50-91%) + 真实水位 **40ep MAE
 - 合成算子真实MAE分布: 主流18.7-19.2(远好于纯进化20.67), 少数22-23, 个别CRASH。跨域创造**稳定**把架构带到18.7-19区间。
 - **未突破18.69的根因(已确诊)**: memory insights显示6次创造的瓶颈诊断措辞几乎相同, **全部检索到同一机制`dilated_causal_convolution`**, 合成的都是它的融合变体 → 探索同一区域无法突破。这印证deferred记录的"瓶颈诊断多样化"问题: `diagnose_bottleneck`措辞固定导致检索单一。
 - **结论**: 核心论点成功(20.67→18.69跨天花板), 但要冲最后gap+0.89到SOTA, 关键改进=**瓶颈诊断多样化**(让6次创造检索到不同机制而非反复dilated_causal)+ 更充分训练(80ep需先修GIL)。这两项是冲SOTA的明确下一步, 已记deferred。
+
+## ✅ 阶段1 多进程后端 4卡满载验证 (2026-06-25, HEAD 48449c5)
+
+**目的**: 验证 ProcessPoolExecutor+spawn 进程后端真并行修掉 GIL 串行化 (线程版4卡~40%波动)。
+
+**配置**: run_autoresearch 纯Tier1, `BACKEND=process`, POP12 ROUNDS4 HPO4 EPOCHS30, 独立db。
+
+**决定性证据 (GPU 连续采样, 关键看显存列)**:
+| GPU | 利用率采样 | 显存 |
+|---|---|---|
+| 0 | 61,63,39,0,47,52% | 2012 MiB |
+| 1 | 80,83,82,82,83,84% | 4399 MiB |
+| 2 | 0,89,92,93,91,92% | 8047 MiB |
+| 3 | 61,62,53,56,65,64% | 4273 MiB |
+- **4卡各持不同模型显存** (4个独立架构, 各在自己 spawn worker + 独立 CUDA 上下文) → 真并行铁证。三卡持续60-93%, 对比线程版"4卡~40%剧烈波动"(GIL弹跳)。
+- 进程结构: 5个 spawn_main worker (4池+1管理) + 主进程, 符合设计。
+- GPU0 偏低且波动是负载不均 (抽到小快架构提前完等barrier), 非GIL, 属调度细节。
+
+**完整run收尾 (1569s, 4轮)**: 16 evals **16 KEEP / 0 DISCARD / 0 CRASH**, 无 Traceback/BrokenProcessPool, 程序化 max_rounds 停。结束后 GPU 全回 0%/2MiB (close() 清池干净)。best 21.57→21.46 (短纯Tier1冒烟, 验证并行非精度)。
+
+**衔接铁律验证 (test_tier_integration.py, CPU真spawn)**: 衔接点③ "Tier-1评测Tier-2算子" 在多进程下经得起 —— spawn worker靠 synth_persist_dir→load_persisted 从盘补回 synth 算子。正路解析成功 / 负对照(不给persist_dir)CRASH不静默假成功 / refresh_workers后下轮拿到新算子。orchestrator级spy验证创造成功后调refresh_workers + run末close。
+
+**结论**: 阶段1 GIL修复在真实4×5090验证通过, 真并行+生命周期干净+衔接经得起多进程。下一步: Tier1+2一体长跑 (BACKEND=process + 615库 + flash + LLM诊断), 看4卡满载下创造能否破18.69。
+
