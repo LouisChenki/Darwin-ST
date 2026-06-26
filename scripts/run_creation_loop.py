@@ -138,6 +138,17 @@ def main():
     eval_spec = EvalSpec(dataset=ds, hpo_cfg=hpo_cfg,
                          synth_persist_dir=os.path.join(cache, "dynamic_ops"))
     base = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64)  # 故意弱基线, 逼出创造
+    # RESUME=1 (看门狗重启续跑用): 从 memory 已有最优 KEEP 暖启动 base, 不从弱基线重头。
+    # synth 算子已由 registry.load_persisted 续上; 这里再续上进化起点 → 崩溃重启不丢搜索进度。
+    if os.environ.get("RESUME", "0") == "1":
+        try:
+            prev = mem.best_so_far(ds, metric="val_mae")
+            if prev and prev.get("genotype"):
+                base = Genotype.from_dict(prev["genotype"])
+                print(f"[续跑] 从 memory 最优暖启动 base: val_mae={prev.get('val_mae')} "
+                      f"sig={prev.get('signature', '?')[:10]}")
+        except Exception as e:
+            print(f"[续跑] 暖启动失败({type(e).__name__}), 用弱基线: {str(e)[:80]}")
 
     # target_mae: 默认 0.0 不可达(靠 max_rounds 停); 24h 冲 SOTA 设 TARGET_MAE=17.80 程序化停。
     target_mae = float(os.environ.get("TARGET_MAE", "0.0"))
