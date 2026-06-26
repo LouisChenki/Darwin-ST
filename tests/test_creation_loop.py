@@ -184,6 +184,43 @@ def test_maybe_create_seed_genotype_uses_new_op(store):
     assert outcome.seed_genotype.blocks[0].spatial_op == outcome.operator_name
 
 
+def test_seed_genotype_carries_seed_meta(store):
+    """A: 创造 seed 挂 _seed_meta (warm_start_hps + hpo_trials), 标记走专项大 HPO。"""
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    best = Genotype(blocks=[STBlock("gcn", "tcn")])
+    parent_hps = {"lr": 1e-3, "dropout": 0.1}
+    outcome = loop.maybe_create(best, sota_gap=3.0, best_hps=parent_hps)
+    seed = outcome.seed_genotype
+    meta = getattr(seed, "_seed_meta", None)
+    assert meta is not None
+    assert meta["warm_start_hps"] == parent_hps     # 继承父最优超参 (warm-start)
+    assert meta["hpo_trials"] == loop.cfg.seed_hpo_trials   # 专项大 HPO 预算 (默认 20)
+    assert meta["is_creation_seed"] is True
+
+
+def test_seed_meta_survives_pickle_and_not_in_to_dict(store):
+    """A 铁律: _seed_meta 跨 spawn pickle 保留 + 不进 to_dict/signature (graveyard dedup 安全)。"""
+    import pickle
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    best = Genotype(blocks=[STBlock("gcn", "tcn")])
+    seed = loop.maybe_create(best, sota_gap=3.0, best_hps={"lr": 1e-3}).seed_genotype
+    # to_dict 不含 _seed_meta
+    assert "_seed_meta" not in str(seed.to_dict())
+    # pickle 往返保留 (进程后端 worker 靠它判大 HPO)
+    back = pickle.loads(pickle.dumps(seed))
+    assert getattr(back, "_seed_meta", None) is not None
+    assert back._seed_meta["hpo_trials"] == loop.cfg.seed_hpo_trials
+
+
+def test_seed_meta_default_warm_start_none_without_best_hps(store):
+    """不传 best_hps → warm_start_hps=None (首轮无父超参时不崩, 走纯大 HPO)。"""
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    best = Genotype(blocks=[STBlock("gcn", "tcn")])
+    seed = loop.maybe_create(best, sota_gap=3.0).seed_genotype   # best_hps 默认 None
+    assert seed._seed_meta["warm_start_hps"] is None
+    assert seed._seed_meta["hpo_trials"] == loop.cfg.seed_hpo_trials
+
+
 def test_maybe_create_seed_genotype_compiles(store):
     """产出的待评 genotype 能 builder 编译 + 前向 (闭环到进化)。"""
     loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])

@@ -183,8 +183,13 @@ def evaluate_architecture(
     adj: np.ndarray | None,
     hpo_cfg: HPOConfig | None = None,
     warm_start_hps: dict | None = None,
+    n_trials: int | None = None,
 ) -> EvalResult:
-    """对单个架构做内层 HPO + 训练, 返回最优结果(orchestrator 的 eval 单元)。"""
+    """对单个架构做内层 HPO + 训练, 返回最优结果(orchestrator 的 eval 单元)。
+
+    n_trials: 覆盖 hpo_cfg.n_trials 的本次预算 (创造 seed 走大预算"优胜者深评"; None=用 cfg 默认)。
+    warm_start_hps: 父架构最优超参, 作为第一个 trial 暖启动 (创造 seed 继承父超参省冷启动)。
+    """
     hpo_cfg = hpo_cfg or HPOConfig()
     t0 = time.time()
 
@@ -208,6 +213,7 @@ def evaluate_architecture(
         genotype, train_eval_fn, hpo_cfg,
         study_name=f"arch_{genotype.signature()[:10]}",
         warm_start_hps=warm_start_hps,
+        n_trials=n_trials,
     )
 
     status = "OK" if res.best_mae < float("inf") else "CRASH"
@@ -234,6 +240,12 @@ def make_eval_fn(dataset: str, hpo_cfg: HPOConfig | None = None):
     adj = P.load_adj(data_dir)
 
     def eval_fn(genotype: Genotype, device: str) -> EvalResult:
-        return evaluate_architecture(genotype, device, data_dir, profile, adj, hpo_cfg=hpo_cfg)
+        # 创造 seed 带非字段元数据 _seed_meta (随 genotype pickle 到 worker): 大 HPO 预算 + warm-start。
+        # 普通进化架构无此属性, 走默认 (行为完全不变)。
+        meta = getattr(genotype, "_seed_meta", None)
+        warm_start_hps = meta.get("warm_start_hps") if meta else None
+        n_trials = meta.get("hpo_trials") if meta else None     # None → 用 hpo_cfg.n_trials
+        return evaluate_architecture(genotype, device, data_dir, profile, adj, hpo_cfg=hpo_cfg,
+                                     warm_start_hps=warm_start_hps, n_trials=n_trials)
 
     return eval_fn

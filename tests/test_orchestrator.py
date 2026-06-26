@@ -309,7 +309,8 @@ def test_try_creation_refreshes_workers_and_closes(monkeypatch):
     from darwin_st.search.genotype import Genotype, STBlock
 
     class _SpyCreationLoop:
-        def maybe_create(self, best_genotype, sota_gap=None, run_tag="", dataset="", best_trace=None):
+        def maybe_create(self, best_genotype, sota_gap=None, run_tag="", dataset="",
+                         best_trace=None, best_hps=None):
             from darwin_st.creation.creation_loop import CreationOutcome
             seed = Genotype(blocks=[STBlock("gcn", "tcn")])
             return CreationOutcome(True, operator_names=["synth_x"], seed_genotypes=[seed],
@@ -328,4 +329,56 @@ def test_try_creation_refreshes_workers_and_closes(monkeypatch):
 
     assert calls["refresh"] >= 1, "创造成功后未调 refresh_workers (多进程下 worker 拿不到新 synth)"
     assert calls["close"] == 1, "run 结束未 close 进程池"
+
+
+def test_creation_cooldown_window_throttles_creation():
+    """B: 创造成功后进精修窗口 (creation_refine_rounds 轮内不再创造), 修高频创造过早收敛。
+
+    patience=1 让每轮都停滞; 若无冷却窗口会每轮创造。冷却=3 应让创造稀疏 (不再每轮)。
+    """
+    from darwin_st.search.genotype import Genotype, STBlock
+
+    class _CountingCreationLoop:
+        def __init__(self):
+            self.calls = 0
+
+        def maybe_create(self, best_genotype, sota_gap=None, run_tag="", dataset="",
+                         best_trace=None, best_hps=None):
+            from darwin_st.creation.creation_loop import CreationOutcome
+            self.calls += 1
+            seed = Genotype(blocks=[STBlock("gcn", "tcn")])
+            return CreationOutcome(True, operator_names=[f"synth_{self.calls}"],
+                                   seed_genotypes=[seed], bottleneck="b", n_success=1)
+
+    cloop = _CountingCreationLoop()
+    cfg = OrchestratorConfig(population_size=4, tournament_size=2, max_rounds=12, target_mae=0.0,
+                             creation_refine_rounds=3)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=2, creation_loop=cloop)
+    orch.archive.stagnation_patience = 1   # 每轮都"停滞"
+    orch.run()
+
+    # 12 轮, 冷却窗口 3 → 创造应明显少于 12 (每次创造后 3 轮静默)。约 12/4=3 次量级。
+    assert cloop.calls <= 5, f"冷却窗口未限流, 创造 {cloop.calls} 次 (应 ~3-4)"
+    assert cloop.calls >= 1, "完全没创造"
+
+
+def test_creation_cooldown_resets_since_improve():
+    """B: 创造成功后手动重置 archive._since_improve=0 (精修窗口干净计数)。"""
+    from darwin_st.search.genotype import Genotype, STBlock
+
+    class _OnceCreationLoop:
+        def maybe_create(self, best_genotype, sota_gap=None, run_tag="", dataset="",
+                         best_trace=None, best_hps=None):
+            from darwin_st.creation.creation_loop import CreationOutcome
+            seed = Genotype(blocks=[STBlock("gcn", "tcn")])
+            return CreationOutcome(True, operator_names=["synth_x"], seed_genotypes=[seed],
+                                   bottleneck="b", n_success=1)
+
+    cfg = OrchestratorConfig(population_size=4, tournament_size=2, max_rounds=8, target_mae=0.0,
+                             creation_refine_rounds=4, warmup_keep=2)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=2, creation_loop=_OnceCreationLoop())
+    orch.archive.stagnation_patience = 1
+    orch.run()
+    # 创造后设了冷却窗口 (rounds + refine_rounds)
+    assert orch._creation_cooldown_until > 0
 

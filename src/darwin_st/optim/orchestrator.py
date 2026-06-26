@@ -64,6 +64,9 @@ class OrchestratorConfig:
     discard_above: float | None = None    # 绝对阈值; None = 用相对/warmup 策略
     warmup_keep: int = 16                 # 冷启动期一律 KEEP 的有效评估数
     discard_regression_factor: float = 1.5  # MAE > best*此倍数 → DISCARD
+    # 创造节奏 (修两阶段衔接: 创造后给 NAS+HPO 充分发挥新算子的窗口, 别立刻再创造):
+    #   创造成功后 creation_refine_rounds 轮内不再触发创造 (NAS 围绕新算子换骨架/精修), 也不 island_reset。
+    creation_refine_rounds: int = 4       # 创造后精修窗口轮数 (冷却期)
 
 
 @dataclass
@@ -78,6 +81,7 @@ class RunState:
     best_mae: float = float("inf")
     best_genotype: Genotype | None = None
     best_trace: dict | None = None       # 最优架构的训练动态轨迹 (供 Tier-2 LLM 瓶颈诊断)
+    best_hps: dict = field(default_factory=dict)  # 最优架构的最优超参 (供创造 seed warm-start)
     beat_sota: bool = False
     sota_name: str | None = None
     sota_mae: float | None = None
@@ -115,6 +119,7 @@ class Orchestrator:
         self.on_round = on_round
         self.creation_loop = creation_loop
         self._pending_seed_genotypes: list = []   # 创造产出的待评 genotype 队列
+        self._creation_cooldown_until = 0         # 创造后精修窗口: rounds 到此前不再触发创造
 
         self.evo = AgingEvolution(
             population_size=config.population_size,
@@ -212,6 +217,7 @@ class Orchestrator:
                 self.state.best_mae = res.mae
                 self.state.best_genotype = geno
                 self.state.best_trace = res.extra.get("train_trace")  # 同步存最优架构训练轨迹
+                self.state.best_hps = res.hps or {}                   # 最优超参 (供创造 seed warm-start)
                 if self._target is not None and res.mae < self._target:
                     self.state.beat_sota = True
         elif status == "DISCARD":
@@ -252,21 +258,29 @@ class Orchestrator:
                     self.state.stop_reason = reason
                     break
                 self.step()
-                # 停滞 → Tier-2 跨域创造(若接入)+ 岛屿重置
+                # 停滞 → Tier-2 跨域创造(若接入)。创造后进精修窗口: N 轮内不再创造也不 island_reset,
+                # 让 NAS+HPO 充分围绕新算子换骨架/精修 (修两阶段衔接节奏: 别浅评一次就又创造)。
                 if self.archive.stagnated():
-                    self._try_creation()
-                    self.archive.island_reset()
+                    if self.state.rounds >= self._creation_cooldown_until and self._try_creation():
+                        # 创造成功: 设冷却窗口, 不立即 island_reset (避免清掉刚注入算子的邻域)
+                        self._creation_cooldown_until = self.state.rounds + self.cfg.creation_refine_rounds
+                        self.archive._since_improve = 0   # 精修窗口干净计数 (窗口内真改进会刷新)
+                    elif self.state.rounds >= self._creation_cooldown_until:
+                        # 没接创造层 / 创造无产出 → 岛屿重置解停滞 (FunSearch 式)
+                        self.archive.island_reset()
+                    # 冷却窗口内停滞: 啥都不做, 靠 aging 进化噪声继续围猎新算子
         finally:
             self.scheduler.close()   # 进程后端清理持久池 (线程后端 no-op)
         return self.state
 
-    def _try_creation(self) -> None:
-        """停滞时触发 Tier-2 跨域创造: 合成新算子 → 待评 genotype 入队。
+    def _try_creation(self) -> bool:
+        """停滞时触发 Tier-2 跨域创造: 合成新算子 → 待评 genotype 入队。返回是否成功注入。
 
-        失败/无创造层都不中止循环(自主性: 创造是低频增益, 非必需)。
+        失败/无创造层都不中止循环(自主性: 创造是低频增益, 非必需)。返回 True 表示有 seed 入队
+        (调用方据此进精修窗口); False 表示无创造层/无产出/出错(调用方走 island_reset)。
         """
         if self.creation_loop is None:
-            return
+            return False
         gap = None
         if self.state.sota_mae is not None and self.state.best_mae < float("inf"):
             gap = self.state.best_mae - self.state.sota_mae
@@ -274,7 +288,7 @@ class Orchestrator:
             outcome = self.creation_loop.maybe_create(
                 self.state.best_genotype, sota_gap=gap,
                 run_tag=self.cfg.run_tag, dataset=self.cfg.dataset,
-                best_trace=self.state.best_trace)
+                best_trace=self.state.best_trace, best_hps=self.state.best_hps)
             if outcome.success and outcome.seed_genotypes:
                 self._pending_seed_genotypes.extend(outcome.seed_genotypes)
                 self.state.history.append({"event": "creation", "operators": outcome.operator_names,
@@ -283,6 +297,9 @@ class Orchestrator:
                 # 进程后端: 新 synth 算子已 persist, 回收旧池 → 下批 worker load_persisted 拿到最新
                 # (线程后端 no-op; 主进程 SPATIAL_OPS 已含新算子, 无需 refresh)
                 self.scheduler.refresh_workers()
+                return True
+            return False
         except Exception as e:
             # 创造出错不中止优化
             self.state.history.append({"event": "creation_failed", "error": str(e)[:120]})
+            return False

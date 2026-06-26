@@ -34,6 +34,7 @@ class CreationConfig:
     n_hypotheses: int = 4          # 一次生成多少个融合假设 (单 Generator 生 N 个)
     seed: int = 0
     use_llm_diagnosis: bool = True  # 优先用 LLM 诊断瓶颈 (训练信号驱动多样化); 失败退回规则版
+    seed_hpo_trials: int = 20      # 创造 seed 专项大 HPO 预算 (AlphaEvolve 式优胜者深评; 普通架构走 hpo_cfg)
 
 
 @dataclass
@@ -127,11 +128,12 @@ class CreationLoop:
 
     def maybe_create(self, best_genotype: Genotype | None, sota_gap: float | None = None,
                      run_tag: str = "exp/auto", dataset: str = "PeMS04",
-                     best_trace: dict | None = None) -> CreationOutcome:
+                     best_trace: dict | None = None, best_hps: dict | None = None) -> CreationOutcome:
         """尝试一次跨域创造。返回 CreationOutcome(含待评 genotype)。
 
         best_trace: 最优架构的训练动态轨迹 (TrainTrace asdict)。给定且 LLM 可用时走 LLM 诊断
         (训练信号驱动多样化瓶颈诊断); 否则退回规则版 diagnose_bottleneck。见 creation/diagnosis.py。
+        best_hps: 最优架构的最优超参。作为创造 seed 的 warm-start (继承父超参省冷启动)。
         """
         # 1) 诊断瓶颈 (LLM 优先, 规则兜底)
         bottleneck, override_precs = self._diagnose(best_genotype, sota_gap, best_trace)
@@ -175,7 +177,7 @@ class CreationLoop:
         for r in successes:
             reg_name = self.registry.register(r.operator)
             op_names.append(reg_name)
-            seeds.append(self._make_seed_genotype(best_genotype, reg_name))
+            seeds.append(self._make_seed_genotype(best_genotype, reg_name, best_hps))
 
         compositions = [r.plan.composition for r in successes]
         insight = (f"融合 {mech_names} 解决'{bottleneck}': {len(results)} 假设中 "
@@ -188,14 +190,23 @@ class CreationLoop:
             n_hypotheses=len(results), n_success=len(successes),
             reason="合成并注入成功", insight=insight)
 
-    def _make_seed_genotype(self, best: Genotype | None, op_name: str) -> Genotype:
-        """用新算子产出一个待评 genotype。以最优为基(若有), 否则新建。"""
+    def _make_seed_genotype(self, best: Genotype | None, op_name: str,
+                            best_hps: dict | None = None) -> Genotype:
+        """用新算子产出一个待评 genotype。以最优为基(若有), 否则新建。
+
+        给 seed 挂非字段元数据 _seed_meta: 标记走专项大 HPO (seed_hpo_trials) + 父超参 warm-start。
+        _seed_meta 不进 to_dict/signature (graveyard dedup 安全), 随 genotype pickle 到 worker (进程后端),
+        copy() 不带过去 (走 to_dict/from_dict, 故挂在副本上无父代泄漏)。见 train.make_eval_fn 的检测。
+        """
         if best is not None:
             g = best.copy()
             g.blocks[0].spatial_op = op_name   # 把第一块空间算子换成新合成算子
         else:
             g = Genotype(blocks=[STBlock(spatial_op=op_name, temporal_op="tcn")], hidden=64)
         g.validate()
+        g._seed_meta = {"warm_start_hps": best_hps or None,
+                        "hpo_trials": self.cfg.seed_hpo_trials,
+                        "is_creation_seed": True}
         return g
 
     def _record_insight(self, text: str, dataset: str, mechs: list[str], success: bool) -> None:

@@ -314,3 +314,19 @@ top2最优算子来自**两个不同机制**: synth_sequential_clean_then_baseli
 
 **附带验证 (全部通过)**: 多进程4卡全程满载0崩溃 + 创造6次refresh_workers衔接稳 + run隔离(独立db+run_tag可干净读) + max_tokens修复(diag_fail=0) + 8192预算下LLM诊断稳定。工程层面全绿。
 
+### v3 加预算重跑 (ROUNDS20 HPO6, 2026-06-26) — 暴露衔接节奏根因
+
+**最终: best 19.27 (25657s≈7h), 16次创造 16个不同机制, diag_fail=0。比v2(18.95)还差。**
+
+**确诊根因 = 两阶段衔接节奏太碎 (用户诊断, 文献坐实)**:
+- **top5全是 `[synth_xxx, cheb]` 两层结构**, 从头困在 cheb 第二块弱盆地 (19.3-20.6), 远差于18.69/v2的**单block** `[synth]` 架构(18.7-19)。
+- **16创造/20轮 ≈ 每轮都创造**。`stagnation_patience=3` 太小 → 高频"注入新算子" → 种群来不及消化 → **过早收敛陷弱盆地**。
+- 文献精确预言此现象 (island model: "高频迁移→过早收敛陷局部最优, 迁移间隔是主导因素" — On the behavior of parallel island models, ScienceDirect 2023)。创造在本系统=注入新基因/移民。
+
+**NAS的作用被节奏掐断**: Tier-2只发明算子(积木), **NAS负责把算子组装进对的架构骨架**(单block?配什么时序?多大hidden), HPO再调参。18.69成功=NAS恰好把LKA算子放进单block一拍即合; v3失败=NAS把算子塞进`[_,cheb]`弱骨架, **而每轮创造分散注意力, NAS没足够轮次给新算子换骨架救出盆地**。
+
+**修复方向 (A+B, 文献加固)**:
+- **A 创造后专项大HPO**: 新synth seed走大预算HPO(榨干其潜力)+ warm-start父超参 (AlphaEvolve/FunSearch级联评估: 轻量筛+优胜者深评; NAS weight/hp inheritance省成本)。
+- **B 拉大stagnation_patience + 创造后重置消化期**: 3→~10, 给NAS围绕新算子换骨架/精修的时间 (island model: 中等迁移间隔避免过早收敛; adaptive>static)。
+- 核心洞察: 失败不在Tier-2(诊断多样化已成功)也不在NAS/HPO算法, 而在**三层节奏没协调** —— Tier-2创造频率压过NAS+HPO消化速度。"创造→充分NAS+HPO发挥→再创造"才是AlphaEvolve式正确节奏。
+

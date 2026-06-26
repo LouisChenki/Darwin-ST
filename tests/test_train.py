@@ -109,6 +109,37 @@ def test_evaluate_architecture_returns_result(tiny_data):
     assert res.hps  # 最优超参非空
 
 
+def test_make_eval_fn_routes_seed_meta(tiny_data, monkeypatch):
+    """A: 创造 seed 带 _seed_meta → eval_fn 把 warm_start_hps + n_trials 透传给 evaluate_architecture;
+    普通架构(无 meta)走默认(warm_start_hps=None, n_trials=None)。"""
+    import darwin_st.optim.train as train_mod
+    from darwin_st.optim.scheduler import EvalResult
+    from darwin_st.optim.train import make_eval_fn
+
+    captured = []
+
+    def fake_eval(genotype, device, data_dir, profile, adj, hpo_cfg=None,
+                  warm_start_hps=None, n_trials=None):
+        captured.append({"warm_start_hps": warm_start_hps, "n_trials": n_trials})
+        return EvalResult(genotype=genotype, status="OK", mae=10.0, device=device,
+                          extra={"num_params": 1})
+
+    monkeypatch.setattr(train_mod, "evaluate_architecture", fake_eval)
+    cfg = HPOConfig(n_trials=3, max_epochs=2)
+    eval_fn = make_eval_fn("TINY", hpo_cfg=cfg)   # tiny_data 已预置 TINY 处理好的 npy + 注入 PROFILES
+
+    # 普通架构: 无 _seed_meta → 默认
+    g_plain = random_genotype(depth=1, spatial="gcn", hidden=16)
+    eval_fn(g_plain, "cpu")
+    assert captured[-1] == {"warm_start_hps": None, "n_trials": None}
+
+    # 创造 seed: 带 _seed_meta → 透传
+    g_seed = random_genotype(depth=1, spatial="gcn", hidden=16)
+    g_seed._seed_meta = {"warm_start_hps": {"lr": 1e-3}, "hpo_trials": 20, "is_creation_seed": True}
+    eval_fn(g_seed, "cpu")
+    assert captured[-1] == {"warm_start_hps": {"lr": 1e-3}, "n_trials": 20}
+
+
 def test_evaluate_architecture_as_orchestrator_eval_fn(tiny_data):
     """evaluate_architecture 闭包可直接当 orchestrator 的 eval_fn 用。"""
     prof, data_dir, adj = tiny_data

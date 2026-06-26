@@ -80,7 +80,7 @@ def main():
     max_rounds = _env_int("MAX_ROUNDS", 6)
     hpo_trials = _env_int("HPO_TRIALS", 3)
     max_epochs = _env_int("MAX_EPOCHS", 10)
-    stagnation = _env_int("STAGNATION", 2)
+    stagnation = _env_int("STAGNATION", 8)   # 停滞耐心 (修衔接节奏: 别太小导致高频创造过早收敛)
     cache = os.environ.get("DARWIN_ST_CACHE", ".")
 
     print(f"=== Tier-2 创造闭环端到端实跑: {ds} ===")
@@ -124,8 +124,10 @@ def main():
     mem = MemoryStore(os.environ.get("MEMORY_DB", os.path.join(cache, "memory_creation.db")))
     from darwin_st.creation import CreationConfig
     n_hypo = _env_int("N_HYPOTHESES", 4)
+    seed_hpo_trials = _env_int("SEED_HPO_TRIALS", 20)   # 创造 seed 专项大 HPO (AlphaEvolve 式深评)
     cloop = CreationLoop(store, embedder, synth, registry, memory=mem,
-                         config=CreationConfig(n_hypotheses=n_hypo), llm=llm)
+                         config=CreationConfig(n_hypotheses=n_hypo, seed_hpo_trials=seed_hpo_trials),
+                         llm=llm)
 
     # --- 优化引擎 (真实训练) ---
     hpo_cfg = HPOConfig(n_trials=hpo_trials, max_epochs=max_epochs,
@@ -141,7 +143,8 @@ def main():
                              run_tag=os.environ.get("RUN_TAG", f"exp/{ds.lower()}-creation"),
                              population_size=pop, tournament_size=min(3, pop),
                              max_rounds=max_rounds, target_mae=0.0,  # 不可达 → 靠 max_rounds 停
-                             warmup_keep=pop * 2, seed=0)
+                             warmup_keep=pop * 2, seed=0,
+                             creation_refine_rounds=_env_int("REFINE_ROUNDS", 4))  # 创造后精修窗口
 
     def on_round(state):
         b = state.best_mae
