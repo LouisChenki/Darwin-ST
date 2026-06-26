@@ -180,8 +180,12 @@ def test_maybe_create_seed_genotype_uses_new_op(store):
     loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
     best = Genotype(blocks=[STBlock("gcn", "tcn")])
     outcome = loop.maybe_create(best, sota_gap=3.0)
-    # 产出的 genotype 第一块用了新算子
-    assert outcome.seed_genotype.blocks[0].spatial_op == outcome.operator_name
+    # 产出的 genotype 第一块用了新算子 (Stage 1: 时空一体算子默认进 joint 槽, 非空间槽)
+    b0 = outcome.seed_genotype.blocks[0]
+    used = {b0.spatial_op, b0.temporal_op, b0.joint_op}
+    assert outcome.operator_name in used, f"新算子未被用到: {b0}"
+    # 默认 spatiotemporal → joint 槽 (修了"强塞空间槽"的语义错位)
+    assert b0.joint_op == outcome.operator_name
 
 
 def test_seed_genotype_carries_seed_meta(store):

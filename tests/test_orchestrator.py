@@ -265,10 +265,11 @@ def test_creation_triggered_on_stagnation():
     created = {"ops": []}
 
     def eval_fn(geno, device):
-        # 记录是否评估到了 synth 算子
+        # 记录是否评估到了 synth 算子 (Stage 1: 可能在 spatial/temporal/joint 任一槽)
         for b in geno.blocks:
-            if b.spatial_op.startswith("synth_"):
-                created["ops"].append(b.spatial_op)
+            for op in (b.spatial_op, b.temporal_op, b.joint_op):
+                if op and op.startswith("synth_"):
+                    created["ops"].append(op)
         return EvalResult(genotype=geno, status="OK", mae=20.0, device=device,
                           extra={"num_params": 50_000})
 

@@ -105,5 +105,6 @@ class SynthesizedOperator:
     plan: FusionPlan
     needs_adj: bool = False                # forward 是否需要邻接
     validated: bool = False                # 是否已过验证 harness
+    category: str = "spatiotemporal"       # 算子类别 spatial/temporal/spatiotemporal (融合算子默认时空一体)
     validation_gate: str = ""              # 验证停在哪个门 (或 "all")
     real_mae: float | None = None          # 真实评测 MAE (注入算子库后)

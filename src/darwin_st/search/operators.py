@@ -23,6 +23,10 @@ import torch.nn.functional as F
 __all__ = [
     "SPATIAL_OPS",
     "TEMPORAL_OPS",
+    "SPATIOTEMPORAL_OPS",
+    "OP_CATEGORY",
+    "op_category",
+    "build_op",
     "build_spatial_op",
     "build_temporal_op",
     "Identity",
@@ -34,6 +38,8 @@ __all__ = [
     "DilatedTCN",
     "GRUTemporal",
     "TemporalAttention",
+    "STSeparableConv",
+    "STGraphAttn",
 ]
 
 
@@ -231,6 +237,77 @@ class TemporalAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# 时空一体算子 (Spatio-Temporal Joint): 单个算子同时在 N 维与 T 维交互。
+# 一条边即完成时空建模, 取代"空间算子+时序算子"对 (genotype 的 joint block 模式)。
+# 仍保持 [B,T,N,F] 进出 + 节点维 N 不丢 (架构铁律)。
+# ---------------------------------------------------------------------------
+
+
+class STSeparableConv(nn.Module):
+    """时空可分离卷积 (深度可分离式): 空间图卷积 (N 维聚合) + 时序因果卷积 (T 维) 打包为一个算子。
+
+    类比 depthwise-separable: 先在 N 维按邻接做轻量聚合 (空间 depthwise),
+    再在 T 维做因果卷积 (时序), 最后线性融合特征。一条边完成时空建模。
+    无图 (adj=None) 时退化为纯时序卷积 (空间聚合跳过)。
+    """
+
+    def __init__(self, dim: int, num_nodes: int | None = None, kernel_size: int = 2, **kw):
+        super().__init__()
+        self.pad = kernel_size - 1
+        self.tconv = nn.Conv1d(dim, dim, kernel_size)       # 时序因果卷积
+        self.lin = nn.Linear(dim, dim)                      # 空间聚合后特征变换
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        B, T, N, Fd = x.shape
+        # 空间 depthwise: N 维按对称归一化邻接聚合 (有图才做)
+        if adj is not None:
+            a_hat = _normalize_adj_sym(adj)                 # [N,N]
+            h = torch.einsum("nm,btmf->btnf", a_hat, x)     # [B,T,N,F]
+            h = self.lin(h)
+        else:
+            h = self.lin(x)
+        # 时序: [B,T,N,F] -> [B*N,F,T] 因果卷积 -> 还原
+        ht = h.permute(0, 2, 3, 1).reshape(B * N, Fd, T)    # [B*N,F,T]
+        ht = F.pad(ht, (self.pad, 0))                       # 因果左填充
+        ht = self.tconv(ht)                                 # [B*N,F,T]
+        ht = ht.reshape(B, N, Fd, T).permute(0, 3, 1, 2)    # [B,T,N,F]
+        assert ht.shape == x.shape, f"STSeparableConv 形状漂移: {ht.shape} vs {x.shape}"
+        return ht
+
+
+class STGraphAttn(nn.Module):
+    """图卷积引导的时序注意力 (复杂时空交互范例): 空间邻接调制时序注意力。
+
+    每个节点在 T 维做自注意力, 但 value 先经空间图卷积聚合邻居信息 ——
+    即"时序注意力 + 空间引导"的耦合: 注意力决定看哪些时刻, 图卷积决定融合哪些节点。
+    一条边完成"时序注意力引导的动态空间交互"(用户举例的复杂时空算子)。
+    """
+
+    def __init__(self, dim: int, num_nodes: int | None = None, num_heads: int = 4, **kw):
+        super().__init__()
+        h = num_heads if dim % num_heads == 0 else 1
+        self.attn = nn.MultiheadAttention(dim, h, batch_first=True)
+        self.lin = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        B, T, N, Fd = x.shape
+        # 空间引导: value 先经图卷积聚合邻居 (有图才做)
+        if adj is not None:
+            a_hat = _normalize_adj_sym(adj)                 # [N,N]
+            v = torch.einsum("nm,btmf->btnf", a_hat, x)     # 空间聚合后的 value
+            v = self.lin(v)
+        else:
+            v = self.lin(x)
+        # 时序注意力: 每节点在 T 维, query/key=x, value=空间聚合后
+        xq = x.permute(0, 2, 1, 3).reshape(B * N, T, Fd)    # [B*N,T,F]
+        vv = v.permute(0, 2, 1, 3).reshape(B * N, T, Fd)    # [B*N,T,F]
+        out, _ = self.attn(xq, xq, vv)                      # [B*N,T,F]
+        out = out.reshape(B, N, T, Fd).permute(0, 2, 1, 3)  # [B,T,N,F]
+        return self.norm(out + x)                           # 残差 + 稳定
+
+
+# ---------------------------------------------------------------------------
 # 注册表 + 工厂 (genotype 用算子名引用; 新增创新点算子在此登记)
 # ---------------------------------------------------------------------------
 
@@ -250,21 +327,75 @@ TEMPORAL_OPS = {
     "attn": TemporalAttention,
 }
 
+# 时空一体算子 (joint block 用): 单算子同时建模时空。Tier-2 合成的时空算子也归此类。
+SPATIOTEMPORAL_OPS = {
+    "st_separable": STSeparableConv,
+    "st_graph_attn": STGraphAttn,
+}
 
-def build_spatial_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Module:
-    """按名实例化空间算子。adaptive 与合成算子(synth_前缀)需要 num_nodes。"""
-    if name not in SPATIAL_OPS:
-        raise KeyError(f"未知空间算子 '{name}'. 可选: {sorted(SPATIAL_OPS)}")
-    cls = SPATIAL_OPS[name]
-    if name == "adaptive" or name.startswith("synth_"):
+# 算子类别 (spatial/temporal/spatiotemporal): 让 genotype/builder 正确放槽。
+# synth 算子的类别由 registry 在注入时登记 (默认 spatiotemporal), 见 op_category()。
+OP_CATEGORY: dict[str, str] = (
+    {name: "spatial" for name in SPATIAL_OPS}
+    | {name: "temporal" for name in TEMPORAL_OPS}
+    | {name: "spatiotemporal" for name in SPATIOTEMPORAL_OPS}
+)
+# identity 同时在三表, 归为通用 (任何槽可用); 不强制类别
+OP_CATEGORY["identity"] = "any"
+
+
+def op_category(name: str) -> str:
+    """查算子类别。内置查 OP_CATEGORY; synth_ 前缀查 registry 登记的类别, 兜底 spatiotemporal。"""
+    if name in OP_CATEGORY:
+        return OP_CATEGORY[name]
+    if name.startswith("synth_"):
+        # registry 注入时把类别写进 OP_CATEGORY; 若没写 (旧算子) 默认时空一体 (诚实兜底)
+        return "spatiotemporal"
+    return "spatiotemporal"
+
+
+def _all_ops() -> dict:
+    """合并视图: 三类算子 + 已注入的 synth (synth 注册进 SPATIAL_OPS dict)。"""
+    return {**SPATIAL_OPS, **TEMPORAL_OPS, **SPATIOTEMPORAL_OPS}
+
+
+def build_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Module:
+    """统一算子工厂 (不分槽): 按名从合并视图实例化任意类别算子。
+
+    adaptive / synth_ / spatiotemporal 类算子可能需要 num_nodes; 缺则报错。
+    joint block 与未来 DAG 边用它; build_spatial_op/build_temporal_op 是它的分类 wrapper。
+    """
+    ops = _all_ops()
+    if name not in ops:
+        raise KeyError(f"未知算子 '{name}'. 可选: {sorted(ops)}")
+    cls = ops[name]
+    needs_nodes = (name == "adaptive" or name.startswith("synth_")
+                   or name in SPATIOTEMPORAL_OPS)
+    if needs_nodes:
         if num_nodes is None:
             raise ValueError(f"算子 '{name}' 需要 num_nodes")
         return cls(dim, num_nodes=num_nodes, **kw)
     return cls(dim, **kw)
 
 
-def build_temporal_op(name: str, dim: int, **kw) -> nn.Module:
-    """按名实例化时序算子。"""
-    if name not in TEMPORAL_OPS:
-        raise KeyError(f"未知时序算子 '{name}'. 可选: {sorted(TEMPORAL_OPS)}")
-    return TEMPORAL_OPS[name](dim, **kw)
+def build_spatial_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Module:
+    """按名实例化空间算子。adaptive 与合成算子(synth_前缀)需要 num_nodes。
+
+    放宽: 也接受时空一体算子坐空间槽 (类别兼容, 签名相同) —— 经 build_op 统一处理。
+    """
+    if name in SPATIAL_OPS:
+        cls = SPATIAL_OPS[name]
+        if name == "adaptive" or name.startswith("synth_"):
+            if num_nodes is None:
+                raise ValueError(f"算子 '{name}' 需要 num_nodes")
+            return cls(dim, num_nodes=num_nodes, **kw)
+        return cls(dim, **kw)
+    # 时空一体 / 其他类别算子放空间槽: 走统一工厂
+    return build_op(name, dim, num_nodes=num_nodes, **kw)
+
+
+def build_temporal_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Module:
+    """按名实例化时序算子。放宽: 也接受时空一体算子坐时序槽 (类别兼容)。"""
+    if name in TEMPORAL_OPS:
+        return TEMPORAL_OPS[name](dim, **kw)
+    return build_op(name, dim, num_nodes=num_nodes, **kw)

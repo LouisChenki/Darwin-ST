@@ -55,8 +55,10 @@ class OperatorRegistry:
         if not (isinstance(cls, type) and issubclass(cls, nn.Module)):
             raise ValueError(f"{op.name} 不是 nn.Module")
 
-        # 注入到 SPATIAL_OPS (build_spatial_op 用 cls(dim, **kw); 合成算子签名 (channels, num_nodes))
+        # 注入到 SPATIAL_OPS (物理统一存储; build_op/build_spatial_op 都能取)
         ops_mod.SPATIAL_OPS[reg_name] = _make_factory(cls)
+        # 登记类别元数据 → op_category() 据此正确放槽 (spatiotemporal → joint block)
+        ops_mod.OP_CATEGORY[reg_name] = getattr(op, "category", "spatiotemporal")
         self._registered[reg_name] = _RegisteredOp(reg_name, op.name, op.code, op.needs_adj)
 
         if self.persist_dir:
@@ -65,6 +67,7 @@ class OperatorRegistry:
 
     def unregister(self, reg_name: str) -> None:
         ops_mod.SPATIAL_OPS.pop(reg_name, None)
+        ops_mod.OP_CATEGORY.pop(reg_name, None)
         self._registered.pop(reg_name, None)
 
     def registered_names(self) -> list[str]:
@@ -83,6 +86,7 @@ class OperatorRegistry:
                        "needs_adj": op.needs_adj, "plan_name": op.plan.operator_name,
                        "composition": op.plan.composition,
                        "source_mechanisms": op.plan.source_mechanisms,
+                       "category": getattr(op, "category", "spatiotemporal"),
                        "real_mae": op.real_mae}, f, ensure_ascii=False, indent=2)
 
     def load_persisted(self) -> list[str]:
@@ -105,6 +109,7 @@ class OperatorRegistry:
             try:
                 cls = exec_operator_code(code, meta["class_name"])
                 ops_mod.SPATIAL_OPS[reg_name] = _make_factory(cls)
+                ops_mod.OP_CATEGORY[reg_name] = meta.get("category", "spatiotemporal")
                 self._registered[reg_name] = _RegisteredOp(
                     reg_name, meta["class_name"], code, meta.get("needs_adj", False))
                 loaded.append(reg_name)

@@ -24,41 +24,64 @@ import torch.nn as nn
 from darwin_st.data.adjacency import random_walk_normalize, symmetric_normalize
 from darwin_st.search.embeddings import STEmbedding
 from darwin_st.search.genotype import Genotype, STBlock
-from darwin_st.search.operators import build_spatial_op, build_temporal_op
+from darwin_st.search.operators import build_op, build_spatial_op, build_temporal_op
 
 __all__ = ["STBlockModule", "STModel", "build_model", "count_params"]
 
 
 class STBlockModule(nn.Module):
-    """单个 ST-block: 空间算子 + 时序算子, 按 fusion 方式组合。保持 [B,T,N,hidden]。
+    """单个 ST-block。两种模式:
+      - 一体 (joint_op 非空): 单个时空算子一条边建模时空。
+      - 分离 (joint_op=None): 空间算子 + 时序算子, 按 fusion 接线。
 
-    fusion:
-      - sequential: x → 空间 → 时序 (串联)
-      - parallel:   空间(x) + 时序(x) (并联相加)
-      - residual:   x + sequential(x) (残差, 抗过平滑/利于深层)
-    每块后接 LayerNorm (稳定时序训练, 不用 BatchNorm)。
+    fusion (分离模式):
+      - sequential:    x → 空间 → 时序 (先S后T)
+      - sequential_ts: x → 时序 → 空间 (先T后S)
+      - parallel:      空间(x) + 时序(x) (并联相加)
+      - residual:      x + (空间→时序) (残差, 抗过平滑/利于深层)
+      - cross:         时序(x) * sigmoid(空间(x)) (门控交叉交互, 时空互相调制)
+      - iterative:     S→T→S→T (双向迭代两轮, 加残差)
+    每块后接 LayerNorm。全程 [B,T,N,hidden]。
     """
 
     def __init__(self, block: STBlock, hidden: int, num_nodes: int):
         super().__init__()
         self.fusion = block.fusion
-        self.spatial = build_spatial_op(block.spatial_op, dim=hidden, num_nodes=num_nodes)
-        self.temporal = build_temporal_op(block.temporal_op, dim=hidden)
+        self.joint = None
+        if block.joint_op is not None:
+            self.joint = build_op(block.joint_op, dim=hidden, num_nodes=num_nodes)
+        else:
+            self.spatial = build_spatial_op(block.spatial_op, dim=hidden, num_nodes=num_nodes)
+            self.temporal = build_temporal_op(block.temporal_op, dim=hidden, num_nodes=num_nodes)
         self.norm = nn.LayerNorm(hidden)
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor | None) -> torch.Tensor:
-        if self.fusion == "sequential":
-            h = self.spatial(x, adj)            # 空间聚合
-            h = self.temporal(h, adj)           # 再时序建模
-        elif self.fusion == "parallel":
+        if self.joint is not None:
+            return self.norm(self.joint(x, adj))    # 一体模式: 一条边
+        f = self.fusion
+        if f == "sequential":
+            h = self.spatial(x, adj)                 # 先空间
+            h = self.temporal(h, adj)                # 再时序
+        elif f == "sequential_ts":
+            h = self.temporal(x, adj)                # 先时序
+            h = self.spatial(h, adj)                 # 再空间
+        elif f == "parallel":
             h = self.spatial(x, adj) + self.temporal(x, adj)  # 并联相加
-        elif self.fusion == "residual":
+        elif f == "residual":
             h = self.spatial(x, adj)
             h = self.temporal(h, adj)
-            h = x + h                           # 残差连接
+            h = x + h                                # 残差
+        elif f == "cross":
+            s = self.spatial(x, adj)                 # 空间作门
+            t = self.temporal(x, adj)                # 时序作值
+            h = t * torch.sigmoid(s) + x             # 门控交叉交互 + 残差
+        elif f == "iterative":
+            h = self.temporal(self.spatial(x, adj), adj)      # 第一轮 S→T
+            h = self.temporal(self.spatial(h, adj), adj)      # 第二轮 S→T
+            h = x + h                                # 双向迭代 + 残差
         else:
-            raise ValueError(f"未知 fusion: {self.fusion}")
-        return self.norm(h)                     # LayerNorm 稳定
+            raise ValueError(f"未知 fusion: {f}")
+        return self.norm(h)                          # LayerNorm 稳定
 
 
 class STModel(nn.Module):

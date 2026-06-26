@@ -194,15 +194,32 @@ class CreationLoop:
                             best_hps: dict | None = None) -> Genotype:
         """用新算子产出一个待评 genotype。以最优为基(若有), 否则新建。
 
+        按算子类别正确放槽 (Stage 1): 时空一体算子 → joint block (一条边管时空);
+        空间/时序类 → 对应槽。避免把时空算子强塞空间槽 (语义错位)。
+
         给 seed 挂非字段元数据 _seed_meta: 标记走专项大 HPO (seed_hpo_trials) + 父超参 warm-start。
         _seed_meta 不进 to_dict/signature (graveyard dedup 安全), 随 genotype pickle 到 worker (进程后端),
         copy() 不带过去 (走 to_dict/from_dict, 故挂在副本上无父代泄漏)。见 train.make_eval_fn 的检测。
         """
+        from darwin_st.search.operators import op_category
+        cat = op_category(op_name)
         if best is not None:
             g = best.copy()
-            g.blocks[0].spatial_op = op_name   # 把第一块空间算子换成新合成算子
+            b0 = g.blocks[0]
+            if cat == "temporal":
+                b0.temporal_op = op_name          # 时序类 → 时序槽
+            elif cat == "spatial":
+                b0.spatial_op = op_name           # 空间类 → 空间槽
+            else:                                  # spatiotemporal / any → joint block
+                b0.joint_op = op_name             # 一条边管时空 (取代 S+T)
         else:
-            g = Genotype(blocks=[STBlock(spatial_op=op_name, temporal_op="tcn")], hidden=64)
+            if cat == "temporal":
+                g = Genotype(blocks=[STBlock(spatial_op="gcn", temporal_op=op_name)], hidden=64)
+            elif cat == "spatial":
+                g = Genotype(blocks=[STBlock(spatial_op=op_name, temporal_op="tcn")], hidden=64)
+            else:
+                g = Genotype(blocks=[STBlock(spatial_op="identity", temporal_op="identity",
+                                             joint_op=op_name)], hidden=64)
         g.validate()
         g._seed_meta = {"warm_start_hps": best_hps or None,
                         "hpo_trials": self.cfg.seed_hpo_trials,

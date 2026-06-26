@@ -22,27 +22,58 @@ import hashlib
 import json
 from dataclasses import dataclass, field, asdict
 
-from darwin_st.search.operators import SPATIAL_OPS, TEMPORAL_OPS
+from darwin_st.search.operators import SPATIAL_OPS, SPATIOTEMPORAL_OPS, TEMPORAL_OPS
 
 __all__ = ["STBlock", "EmbeddingConfig", "Genotype", "mutate", "random_genotype"]
 
-VALID_FUSION = {"sequential", "parallel", "residual"}
+
+def _all_op_names() -> set[str]:
+    """全部可用算子名 (三类内置 + 已注入 synth)。synth 注册进 SPATIAL_OPS dict, 故已含。"""
+    return set(SPATIAL_OPS) | set(TEMPORAL_OPS) | set(SPATIOTEMPORAL_OPS)
+
+
+def _block_to_dict(b: "STBlock") -> dict:
+    """STBlock → dict, **省略 joint_op=None** (omit-None): 保旧线性 genotype 签名字节不变。"""
+    d = {"spatial_op": b.spatial_op, "temporal_op": b.temporal_op, "fusion": b.fusion}
+    if b.joint_op is not None:
+        d["joint_op"] = b.joint_op
+    return d
+
+VALID_FUSION = {
+    "sequential",      # 先空间后时序 (S→T, 现状默认)
+    "sequential_ts",   # 先时序后空间 (T→S)
+    "parallel",        # 空间(x) + 时序(x) 相加
+    "residual",        # x + (S→T)
+    "cross",           # 门控交叉交互: T(x) * sigmoid(S(x)) (时空互相调制)
+    "iterative",       # 双向迭代两轮: S→T→S→T
+}
 VALID_ADJ_MODE = {"sym", "rw", "none"}
 
 
 @dataclass
 class STBlock:
-    """单个时空块: 一个空间算子 + 一个时序算子 + 融合方式。"""
+    """单个时空块。两种模式:
+      - 分离模式 (joint_op=None): 一个空间算子 + 一个时序算子, 按 fusion 接线。
+      - 一体模式 (joint_op 非空): 单个时空一体算子 (joint) 直接建模时空, 取代 S+T 对。
+        joint_op 优先 (非空时 spatial_op/temporal_op 忽略, 但保留作占位)。
+    """
 
-    spatial_op: str          # SPATIAL_OPS 中的键
-    temporal_op: str         # TEMPORAL_OPS 中的键
-    fusion: str = "sequential"  # sequential(S后T) / parallel(S||T相加) / residual(+输入)
+    spatial_op: str          # SPATIAL_OPS 中的键 (joint 模式下作占位)
+    temporal_op: str         # TEMPORAL_OPS 中的键 (joint 模式下作占位)
+    fusion: str = "sequential"  # 见 VALID_FUSION (分离模式接线方式)
+    joint_op: str | None = None  # 非空 → 一体模式, 用此时空算子 (取代 S+T)
 
     def validate(self) -> None:
-        if self.spatial_op not in SPATIAL_OPS:
-            raise ValueError(f"未知空间算子: {self.spatial_op} (可选 {sorted(SPATIAL_OPS)})")
-        if self.temporal_op not in TEMPORAL_OPS:
-            raise ValueError(f"未知时序算子: {self.temporal_op} (可选 {sorted(TEMPORAL_OPS)})")
+        if self.joint_op is not None:
+            # 一体模式: 校验 joint 算子在算子库 (类别由 op_category 兜底, 签名相同任意类别都能跑)
+            if self.joint_op not in _all_op_names():
+                raise ValueError(f"未知时空一体算子: {self.joint_op}")
+        else:
+            # 分离模式: 类别兼容校验 (放宽 —— 允许 LLM 时空算子坐任一槽)
+            if self.spatial_op not in _all_op_names():
+                raise ValueError(f"未知空间算子: {self.spatial_op}")
+            if self.temporal_op not in _all_op_names():
+                raise ValueError(f"未知时序算子: {self.temporal_op}")
         if self.fusion not in VALID_FUSION:
             raise ValueError(f"未知融合方式: {self.fusion} (可选 {sorted(VALID_FUSION)})")
 
@@ -107,7 +138,7 @@ class Genotype:
     # -- 序列化 --
     def to_dict(self) -> dict:
         return {
-            "blocks": [asdict(b) for b in self.blocks],
+            "blocks": [_block_to_dict(b) for b in self.blocks],   # omit-None joint_op 保旧签名
             "hidden": self.hidden,
             "adj_mode": self.adj_mode,
             "embedding": asdict(self.embedding),
