@@ -67,6 +67,14 @@ class OrchestratorConfig:
     # 创造节奏 (修两阶段衔接: 创造后给 NAS+HPO 充分发挥新算子的窗口, 别立刻再创造):
     #   创造成功后 creation_refine_rounds 轮内不再触发创造 (NAS 围绕新算子换骨架/精修), 也不 island_reset。
     creation_refine_rounds: int = 4       # 创造后精修窗口轮数 (冷却期)
+    # 距离自适应创造调度 (Gap-Annealed Stagnation Patience): patience 随距 SOTA 远近自适应。
+    #   动机=边际收益递减: 逼近 SOTA 时每点提升边际成本陡增, 应给精修更多耐心别过早切换探索。
+    #   patience(gap) = min(cap, base + k/(gap+eps)), gap=best_mae-sota_mae。远→小(多探索), 近→大(重精修)。
+    adaptive_patience: bool = False       # True 启用距离自适应; False 用固定 stagnation_patience
+    patience_base: int = 3                # 远处基线耐心
+    patience_k: float = 5.0               # 反比强度
+    patience_cap: int = 12                # 上限 (防 gap→0 时发散)
+    patience_eps: float = 0.5             # 分母平滑
 
 
 @dataclass
@@ -161,6 +169,23 @@ class Orchestrator:
         return "KEEP", None
 
     # -- 停止判定 (纯代码, 非 LLM) --
+    def _adaptive_patience(self) -> int:
+        """距离自适应停滞耐心 (Gap-Annealed Stagnation Patience):
+        patience(gap)=min(cap, base + k/(gap+eps)), gap=best_mae-sota_mae。
+
+        远离 SOTA (gap 大) → 耐心小 → 快触发创造找新机制 (多探索);
+        逼近 SOTA (gap 小) → 耐心大 → 给 NAS+HPO 充分精修别打断 (边际收益递减下每点提升都难得)。
+        gap<=0 (已达/超 SOTA) 或 sota 未知 → 用 cap (最大耐心, 死磕精修)。
+        """
+        cfg = self.cfg
+        if self.state.sota_mae is None or self.state.best_mae >= float("inf"):
+            return cfg.patience_base
+        gap = self.state.best_mae - self.state.sota_mae
+        if gap <= 0:
+            return cfg.patience_cap
+        p = cfg.patience_base + cfg.patience_k / (gap + cfg.patience_eps)
+        return int(min(cfg.patience_cap, round(p)))
+
     def should_stop(self) -> str | None:
         """返回停止原因字符串, 或 None (继续)。"""
         if self._target is not None and self.state.best_mae < self._target:
@@ -260,6 +285,9 @@ class Orchestrator:
                 self.step()
                 # 停滞 → Tier-2 跨域创造(若接入)。创造后进精修窗口: N 轮内不再创造也不 island_reset,
                 # 让 NAS+HPO 充分围绕新算子换骨架/精修 (修两阶段衔接节奏: 别浅评一次就又创造)。
+                if self.cfg.adaptive_patience:
+                    # 距离自适应: 每轮按距 SOTA 远近重设耐心 (远→小快创造, 近→大重精修)
+                    self.archive.stagnation_patience = self._adaptive_patience()
                 if self.archive.stagnated():
                     if self.state.rounds >= self._creation_cooldown_until and self._try_creation():
                         # 创造成功: 设冷却窗口, 不立即 island_reset (避免清掉刚注入算子的邻域)

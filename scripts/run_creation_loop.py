@@ -139,18 +139,29 @@ def main():
                          synth_persist_dir=os.path.join(cache, "dynamic_ops"))
     base = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64)  # 故意弱基线, 逼出创造
 
+    # target_mae: 默认 0.0 不可达(靠 max_rounds 停); 24h 冲 SOTA 设 TARGET_MAE=17.80 程序化停。
+    target_mae = float(os.environ.get("TARGET_MAE", "0.0"))
     cfg = OrchestratorConfig(dataset=ds,
                              run_tag=os.environ.get("RUN_TAG", f"exp/{ds.lower()}-creation"),
                              population_size=pop, tournament_size=min(3, pop),
-                             max_rounds=max_rounds, target_mae=0.0,  # 不可达 → 靠 max_rounds 停
+                             max_rounds=max_rounds, target_mae=target_mae,
                              warmup_keep=pop * 2, seed=0,
-                             creation_refine_rounds=_env_int("REFINE_ROUNDS", 4))  # 创造后精修窗口
+                             creation_refine_rounds=_env_int("REFINE_ROUNDS", 4),  # 创造后精修窗口
+                             # 距离自适应停滞耐心 (Gap-Annealed): 远 SOTA 快创造, 近 SOTA 重精修
+                             adaptive_patience=os.environ.get("ADAPTIVE_PATIENCE", "0") == "1",
+                             patience_base=_env_int("PATIENCE_BASE", 3),
+                             patience_k=float(os.environ.get("PATIENCE_K", "5.0")),
+                             patience_cap=_env_int("PATIENCE_CAP", 12))
 
     def on_round(state):
         b = state.best_mae
         n_creat = sum(1 for h in state.history if h.get("event") == "creation")
+        gap = (b - state.sota_mae) if (state.sota_mae and b < 1e9) else None
+        pat = orch.archive.stagnation_patience
         print(f"[round {state.rounds}] evals={state.evals} KEEP={state.n_keep} "
-              f"best_MAE={b if b<1e9 else 'inf'} 创造次数={n_creat}")
+              f"best_MAE={b if b<1e9 else 'inf'} "
+              + (f"gap={gap:+.2f} " if gap is not None else "")
+              + f"patience={pat} 创造次数={n_creat}")
 
     orch = Orchestrator(cfg, eval_fn, devices=n_gpus, memory=mem, base_genotype=base,
                         on_round=on_round, creation_loop=cloop,

@@ -362,6 +362,36 @@ def test_creation_cooldown_window_throttles_creation():
     assert cloop.calls >= 1, "完全没创造"
 
 
+def test_adaptive_patience_grows_near_sota():
+    """距离自适应耐心: gap 大→耐心小(快创造多探索), gap 小→耐心大(重精修), 封顶 cap。"""
+    cfg = OrchestratorConfig(adaptive_patience=True, patience_base=3, patience_k=5.0,
+                             patience_cap=12, patience_eps=0.5)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    orch.state.sota_mae = 17.8
+    orch.state.best_mae = 21.8   # gap=4 → 耐心小
+    p_far = orch._adaptive_patience()
+    orch.state.best_mae = 18.0   # gap=0.2 → 耐心大
+    p_near = orch._adaptive_patience()
+    assert p_far < p_near, "耐心应随逼近 SOTA 而增大"
+    assert p_far <= 6 and p_near >= 9   # 方案C 区间
+    orch.state.best_mae = 17.0   # gap<0 (已超 SOTA) → 封顶 cap
+    assert orch._adaptive_patience() == 12
+    orch.state.sota_mae = None   # sota 未知 → base
+    assert orch._adaptive_patience() == 3
+    orch.state.sota_mae = 17.8
+    orch.state.best_mae = float("inf")   # 冷启动 → base
+    assert orch._adaptive_patience() == 3
+
+
+def test_adaptive_patience_applied_in_run():
+    """自适应开启时, run() 每轮按 gap 重设 archive.stagnation_patience (落在 [base,cap])。"""
+    cfg = OrchestratorConfig(population_size=4, tournament_size=2, max_rounds=3, target_mae=0.0,
+                             adaptive_patience=True, patience_base=3, patience_k=5.0, patience_cap=12)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=2)
+    orch.run()
+    assert 3 <= orch.archive.stagnation_patience <= 12
+
+
 def test_creation_cooldown_resets_since_improve():
     """B: 创造成功后手动重置 archive._since_improve=0 (精修窗口干净计数)。"""
     from darwin_st.search.genotype import Genotype, STBlock
