@@ -45,10 +45,17 @@ def train_one(name, make_geno, data_dir, prof, adj, device, epochs):
     for ep in range(epochs):
         model.train()
         tot, nb = 0.0, 0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+        for batch in train_loader:
+            if len(batch) == 4:                       # (x, tod, dow, y) —— STID 时间嵌入
+                x, tod, dow, y = batch
+                x, tod, dow, y = x.to(device), tod.to(device), dow.to(device), y.to(device)
+                pred = model(x, tod_idx=tod, dow_idx=dow)
+            else:                                     # (x, y) 回退
+                x, y = batch
+                x, y = x.to(device), y.to(device)
+                pred = model(x)
             opt.zero_grad()
-            loss = masked_mae(model(x), y)
+            loss = masked_mae(pred, y)
             if torch.isnan(loss) or torch.isinf(loss):
                 return {"op": name, "status": "NAN", "params": n_params,
                         "val_mae": float("nan"), "epoch": ep, "secs": time.time() - t0}
