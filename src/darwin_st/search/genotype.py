@@ -133,7 +133,10 @@ class Genotype:
                 raise ValueError(f"保护区算子 '{p}' 未在任何 block 中使用")
 
     def _uses_op(self, op_name: str) -> bool:
-        return any(b.spatial_op == op_name or b.temporal_op == op_name for b in self.blocks)
+        return any(
+            b.spatial_op == op_name or b.temporal_op == op_name or b.joint_op == op_name
+            for b in self.blocks
+        )
 
     # -- 序列化 --
     def to_dict(self) -> dict:
@@ -174,8 +177,9 @@ class Genotype:
 
 
 def _is_protected(geno: Genotype, block: STBlock) -> bool:
-    """该 block 是否触及保护区算子 (触及则其算子不可被替换/删除)。"""
-    return block.spatial_op in geno.protected or block.temporal_op in geno.protected
+    """该 block 是否触及保护区算子 (触及则其算子不可被替换/删除)。含 joint 槽。"""
+    return (block.spatial_op in geno.protected or block.temporal_op in geno.protected
+            or (block.joint_op is not None and block.joint_op in geno.protected))
 
 
 def mutate(geno: Genotype, op: str, rng_index: int = 0, **params) -> Genotype:
@@ -184,6 +188,8 @@ def mutate(geno: Genotype, op: str, rng_index: int = 0, **params) -> Genotype:
     op:
       - "swap_spatial":  把第 i 块的空间算子换成 new_op
       - "swap_temporal": 把第 i 块的时序算子换成 new_op
+      - "swap_joint":    把第 i 块 (一体模式) 的时空算子换成 new_op
+      - "toggle_joint":  第 i 块在 分离↔一体 模式间切换 (进/出 joint 模式)
       - "change_fusion": 改第 i 块融合方式
       - "add_block":     在末尾加一块 (new_block)
       - "remove_block":  删第 i 块 (保护区块拒删)
@@ -206,6 +212,25 @@ def mutate(geno: Genotype, op: str, rng_index: int = 0, **params) -> Genotype:
         if g.blocks[i].temporal_op in g.protected:
             raise ValueError(f"block[{i}] 时序算子在保护区, 不可替换")
         g.blocks[i].temporal_op = new_op
+
+    elif op == "swap_joint":
+        i, new_op = params["index"], params["new_op"]
+        if g.blocks[i].joint_op is None:
+            raise ValueError(f"block[{i}] 非一体模式, 无 joint 算子可换 (先 toggle_joint)")
+        if g.blocks[i].joint_op in g.protected:
+            raise ValueError(f"block[{i}] 时空一体算子在保护区, 不可替换")
+        g.blocks[i].joint_op = new_op
+
+    elif op == "toggle_joint":
+        # 分离↔一体 模式切换。进 joint: 设 joint_op (取代 S+T); 出 joint: 清空回分离。
+        i = params["index"]
+        b = g.blocks[i]
+        if b.joint_op is not None:
+            if b.joint_op in g.protected:
+                raise ValueError(f"block[{i}] 一体算子在保护区, 不可退出一体模式")
+            b.joint_op = None                    # 退回分离模式 (S+T 占位符复活)
+        else:
+            b.joint_op = params["new_op"]        # 进入一体模式
 
     elif op == "change_fusion":
         i, new_fusion = params["index"], params["new_fusion"]

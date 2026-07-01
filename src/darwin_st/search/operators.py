@@ -40,6 +40,13 @@ __all__ = [
     "TemporalAttention",
     "STSeparableConv",
     "STGraphAttn",
+    "MixHop",
+    "GWNetAdaptive",
+    "MultiScaleTCN",
+    "SeriesDecompAttn",
+    "DynamicGAT",
+    "STJointConv",
+    "DiagonalSSM",
 ]
 
 
@@ -308,6 +315,195 @@ class STGraphAttn(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Stage 2: 扩充原子算子集 (更丰富的搜索空间, 破线性天花板)
+# 全 [B,T,N,F]→同形, 节点维 N 不丢, CPU 安全。
+# ---------------------------------------------------------------------------
+
+
+class MixHop(nn.Module):
+    """MixHop 多跳图卷积: 拼接 A^0/A^1/A^2 x 再线性。多跳邻域混合, 抗过平滑 (不同跳分开保留)。"""
+
+    def __init__(self, dim: int, hops: int = 3, **kw):
+        super().__init__()
+        self.hops = hops
+        self.lin = nn.Linear(dim * hops, dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        assert adj is not None, "MixHop 需要邻接矩阵 adj"
+        a_hat = _normalize_adj_sym(adj)                  # [N,N]
+        outs = [x]                                       # A^0 x = x
+        z = x
+        for _ in range(self.hops - 1):
+            z = torch.einsum("nm,btmf->btnf", a_hat, z)  # 再传播一跳
+            outs.append(z)
+        cat = torch.cat(outs, dim=-1)                    # [B,T,N,F*hops]
+        return self.lin(cat)
+
+
+class GWNetAdaptive(nn.Module):
+    """Graph WaveNet 双邻接: 外部图 + 可学习自适应图 E1E2^T 联合聚合 (泛化 adaptive)。
+
+    无外部图 (adj=None) 时退化为纯自适应图 (等价 AdaptiveAdjConv)。
+    """
+
+    def __init__(self, dim: int, num_nodes: int, emb_dim: int = 10, **kw):
+        super().__init__()
+        self.e1 = nn.Parameter(torch.randn(num_nodes, emb_dim) * 0.01)
+        self.e2 = nn.Parameter(torch.randn(num_nodes, emb_dim) * 0.01)
+        self.lin = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        a_adp = torch.softmax(F.relu(self.e1 @ self.e2.t()), dim=1)  # 自适应图 [N,N]
+        out = torch.einsum("nm,btmf->btnf", a_adp, x)               # 自适应聚合
+        if adj is not None:
+            a_hat = _normalize_adj_sym(adj)
+            out = out + torch.einsum("nm,btmf->btnf", a_hat, x)     # 叠外部图 (双邻接)
+        return self.lin(out)
+
+
+class MultiScaleTCN(nn.Module):
+    """多尺度膨胀 TCN: 并行 dilation 1/2/4 因果卷积相加, 捕获多时间粒度周期。"""
+
+    def __init__(self, dim: int, kernel_size: int = 2, dilations=(1, 2, 4), **kw):
+        super().__init__()
+        self.branches = nn.ModuleList([
+            nn.Conv1d(dim, dim, kernel_size, dilation=d) for d in dilations
+        ])
+        self.pads = [(kernel_size - 1) * d for d in dilations]
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        B, T, N, Fd = x.shape
+        h = x.permute(0, 2, 3, 1).reshape(B * N, Fd, T)   # [B*N,F,T]
+        out = 0
+        for conv, pad in zip(self.branches, self.pads):
+            out = out + conv(F.pad(h, (pad, 0)))          # 各膨胀分支因果卷积相加
+        out = out.reshape(B, N, Fd, T).permute(0, 3, 1, 2)  # [B,T,N,F]
+        assert out.shape == x.shape, f"MultiScaleTCN 形漂移: {out.shape}"
+        return out
+
+
+class SeriesDecompAttn(nn.Module):
+    """Autoformer 式序列分解注意力: 分解 trend(移动平均)+seasonal(残差), seasonal 走时序注意力。
+
+    交通流有强 trend+周期; 分解后对 seasonal 建注意力比对原序列更干净。
+    """
+
+    def __init__(self, dim: int, num_heads: int = 4, kernel: int = 5, **kw):
+        super().__init__()
+        h = num_heads if dim % num_heads == 0 else 1
+        self.attn = nn.MultiheadAttention(dim, h, batch_first=True)
+        self.kernel = kernel
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        B, T, N, Fd = x.shape
+        # 移动平均取 trend (在 T 维), seasonal = x - trend
+        h = x.permute(0, 2, 3, 1).reshape(B * N, Fd, T)   # [B*N,F,T]
+        pad = self.kernel // 2
+        trend = F.avg_pool1d(F.pad(h, (pad, pad), mode="replicate"), self.kernel, stride=1)
+        trend = trend[..., :T]
+        seasonal = h - trend                              # [B*N,F,T]
+        # seasonal 走时序注意力
+        s = seasonal.permute(0, 2, 1)                     # [B*N,T,F]
+        s_attn, _ = self.attn(s, s, s)                    # [B*N,T,F]
+        out = s_attn + trend.permute(0, 2, 1)             # 注意力 seasonal + trend
+        out = out.reshape(B, N, T, Fd).permute(0, 2, 1, 3)  # [B,T,N,F]
+        return self.norm(out)
+
+
+class DynamicGAT(nn.Module):
+    """注意力引导动态图卷积 (时空一体): 每时刻按特征相似度动态重加权图边, 再 N 维聚合。
+
+    区别于静态 GAT: 注意力权重随时间步动态变化 (捕获时变空间依赖)。用户举例的复杂时空算子。
+    """
+
+    def __init__(self, dim: int, num_nodes: int | None = None, **kw):
+        super().__init__()
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.scale = dim ** -0.5
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        B, T, N, Fd = x.shape
+        q, k, v = self.q(x), self.k(x), self.v(x)         # [B,T,N,F]
+        # 每时刻动态注意力打分 [B,T,N,N] (节点对相似度)
+        e = torch.einsum("btnf,btmf->btnm", q, k) * self.scale
+        if adj is not None:
+            mask = (adj > 0).unsqueeze(0).unsqueeze(0)     # 限静态图可达边
+            e = e.masked_fill(~mask, float("-inf"))
+        att = torch.softmax(e, dim=-1)                    # 行归一
+        att = torch.nan_to_num(att, nan=0.0)
+        out = torch.einsum("btnm,btmf->btnf", att, v)     # 动态图聚合
+        return self.norm(out + x)                         # 残差
+
+
+class STJointConv(nn.Module):
+    """时空联合卷积 (时空一体): 图混合 + 时序卷积在一个算子内因子化融合。
+
+    与 STSeparableConv 区别: 这里空间/时序交替两轮 (S→T→S→T 内部), 交互更深。
+    """
+
+    def __init__(self, dim: int, num_nodes: int | None = None, kernel_size: int = 2, **kw):
+        super().__init__()
+        self.pad = kernel_size - 1
+        self.tconv1 = nn.Conv1d(dim, dim, kernel_size)
+        self.tconv2 = nn.Conv1d(dim, dim, kernel_size)
+        self.lin1 = nn.Linear(dim, dim)
+        self.lin2 = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+
+    def _tconv(self, x, conv):
+        B, T, N, Fd = x.shape
+        h = x.permute(0, 2, 3, 1).reshape(B * N, Fd, T)
+        h = conv(F.pad(h, (self.pad, 0)))
+        return h.reshape(B, N, Fd, T).permute(0, 3, 1, 2)
+
+    def _sconv(self, x, lin, adj):
+        if adj is not None:
+            a_hat = _normalize_adj_sym(adj)
+            return lin(torch.einsum("nm,btmf->btnf", a_hat, x))
+        return lin(x)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        h = self._sconv(x, self.lin1, adj)                # 空间1
+        h = self._tconv(h, self.tconv1)                   # 时序1
+        h = self._sconv(h, self.lin2, adj)                # 空间2
+        h = self._tconv(h, self.tconv2)                   # 时序2
+        return self.norm(h + x)                           # 残差
+
+
+class DiagonalSSM(nn.Module):
+    """对角状态空间模型 (S4/Mamba-lite): h_t = a·h_{t-1} + b·x_t, y = c·h + d·x。
+
+    O(T) 顺序扫描 (非 O(T²) 注意力), 长程线性复杂度。a=sigmoid(_a)∈(0,1) 保稳定 (谱半径<1)。
+    压轴算子: 单独测试门, 因扫描循环需验证数值稳定 + 梯度不爆。逐通道对角 (无跨通道混合矩阵)。
+    """
+
+    def __init__(self, dim: int, **kw):
+        super().__init__()
+        # 对角参数: 逐通道独立 SSM。_a 经 sigmoid 落 (0,1) → 保证 |a|<1 稳定
+        self._a = nn.Parameter(torch.randn(dim) * 0.1 - 1.0)  # sigmoid(-1)≈0.27 起步 (温和衰减)
+        self.b = nn.Parameter(torch.ones(dim) * 0.1)
+        self.c = nn.Parameter(torch.ones(dim) * 0.1)
+        self.d = nn.Parameter(torch.ones(dim))               # 直通项 (跳连, 类零初始残差稳定)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        B, T, N, Fd = x.shape
+        a = torch.sigmoid(self._a)                           # (0,1) 稳定衰减 [F]
+        h = torch.zeros(B, N, Fd, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(T):                                   # O(T) 扫描
+            h = a * h + self.b * x[:, t]                      # 状态递推 [B,N,F]
+            ys.append(self.c * h + self.d * x[:, t])          # 输出 = 状态读出 + 直通
+        out = torch.stack(ys, dim=1)                         # [B,T,N,F]
+        assert out.shape == x.shape, f"DiagonalSSM 形漂移: {out.shape}"
+        return self.norm(out)
+
+
+# ---------------------------------------------------------------------------
 # 注册表 + 工厂 (genotype 用算子名引用; 新增创新点算子在此登记)
 # ---------------------------------------------------------------------------
 
@@ -318,6 +514,8 @@ SPATIAL_OPS = {
     "gat": GATConv,
     "diffusion": DiffusionConv,
     "adaptive": AdaptiveAdjConv,
+    "mixhop": MixHop,                # Stage2: 多跳抗过平滑
+    "gwnet_adp": GWNetAdaptive,      # Stage2: 双邻接 (外部+自适应)
 }
 
 TEMPORAL_OPS = {
@@ -325,12 +523,17 @@ TEMPORAL_OPS = {
     "tcn": DilatedTCN,
     "gru": GRUTemporal,
     "attn": TemporalAttention,
+    "multiscale_tcn": MultiScaleTCN,     # Stage2: 多尺度膨胀
+    "series_decomp_attn": SeriesDecompAttn,  # Stage2: 序列分解注意力
+    "ssm": DiagonalSSM,                  # Stage2: 对角状态空间 (O(T) 长程扫描)
 }
 
 # 时空一体算子 (joint block 用): 单算子同时建模时空。Tier-2 合成的时空算子也归此类。
 SPATIOTEMPORAL_OPS = {
     "st_separable": STSeparableConv,
     "st_graph_attn": STGraphAttn,
+    "dynamic_gat": DynamicGAT,       # Stage2: 注意力引导动态图卷积
+    "stjoint_conv": STJointConv,     # Stage2: 时空交替深度融合
 }
 
 # 算子类别 (spatial/temporal/spatiotemporal): 让 genotype/builder 正确放槽。
@@ -342,6 +545,9 @@ OP_CATEGORY: dict[str, str] = (
 )
 # identity 同时在三表, 归为通用 (任何槽可用); 不强制类别
 OP_CATEGORY["identity"] = "any"
+
+# 需要 num_nodes 构造参数的空间/时序算子 (自学邻接类)。时空一体类 + synth_ 单独判。
+NEEDS_NODES: set[str] = {"adaptive", "gwnet_adp"}
 
 
 def op_category(name: str) -> str:
@@ -369,7 +575,8 @@ def build_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Modu
     if name not in ops:
         raise KeyError(f"未知算子 '{name}'. 可选: {sorted(ops)}")
     cls = ops[name]
-    needs_nodes = (name == "adaptive" or name.startswith("synth_")
+    # 需 num_nodes 的算子: adaptive/gwnet_adp (自学邻接) + synth_ (合成契约) + 时空一体类
+    needs_nodes = (name in NEEDS_NODES or name.startswith("synth_")
                    or name in SPATIOTEMPORAL_OPS)
     if needs_nodes:
         if num_nodes is None:
@@ -379,23 +586,14 @@ def build_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Modu
 
 
 def build_spatial_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Module:
-    """按名实例化空间算子。adaptive 与合成算子(synth_前缀)需要 num_nodes。
+    """按名实例化空间算子。adaptive/gwnet_adp 与合成算子(synth_前缀)需要 num_nodes。
 
-    放宽: 也接受时空一体算子坐空间槽 (类别兼容, 签名相同) —— 经 build_op 统一处理。
+    放宽: 也接受时空一体算子坐空间槽 (类别兼容, 签名相同)。全部委托 build_op 统一处理
+    (NEEDS_NODES / synth_ / 时空一体 的 num_nodes 判定是单一真源, 避免此处漂移)。
     """
-    if name in SPATIAL_OPS:
-        cls = SPATIAL_OPS[name]
-        if name == "adaptive" or name.startswith("synth_"):
-            if num_nodes is None:
-                raise ValueError(f"算子 '{name}' 需要 num_nodes")
-            return cls(dim, num_nodes=num_nodes, **kw)
-        return cls(dim, **kw)
-    # 时空一体 / 其他类别算子放空间槽: 走统一工厂
     return build_op(name, dim, num_nodes=num_nodes, **kw)
 
 
 def build_temporal_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Module:
-    """按名实例化时序算子。放宽: 也接受时空一体算子坐时序槽 (类别兼容)。"""
-    if name in TEMPORAL_OPS:
-        return TEMPORAL_OPS[name](dim, **kw)
+    """按名实例化时序算子。放宽: 也接受时空一体算子坐时序槽 (类别兼容)。委托 build_op 统一处理。"""
     return build_op(name, dim, num_nodes=num_nodes, **kw)

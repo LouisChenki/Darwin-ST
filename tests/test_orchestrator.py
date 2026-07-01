@@ -318,8 +318,14 @@ def test_try_creation_refreshes_workers_and_closes(monkeypatch):
                                    bottleneck="b", n_success=1)
 
     calls = {"refresh": 0, "close": 0}
+    # 常量 eval_fn: best 首评即定, 之后永不改进 → 停滞必触发 (与变异池动态无关, 不脆)。
+    # (用 _make_eval_fn 的单调 toy 会因 Stage2 更丰富变异池持续改进而永不停滞。)
+    def const_eval(geno, device):
+        return EvalResult(genotype=geno, status="OK", mae=20.0, rmse=30.0, device=device,
+                          hps={"lr": 1e-3}, extra={"num_params": 50_000})
+
     cfg = OrchestratorConfig(population_size=4, tournament_size=2, max_rounds=3, target_mae=0.0)
-    orch = Orchestrator(cfg, _make_eval_fn(), devices=2, creation_loop=_SpyCreationLoop())
+    orch = Orchestrator(cfg, const_eval, devices=2, creation_loop=_SpyCreationLoop())
     # 监听 scheduler 的 refresh/close (线程后端是 no-op, 但 orchestrator 仍应调用)
     monkeypatch.setattr(orch.scheduler, "refresh_workers",
                         lambda: calls.__setitem__("refresh", calls["refresh"] + 1))

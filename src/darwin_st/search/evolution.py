@@ -38,11 +38,43 @@ from darwin_st.search.genotype import (
     mutate,
     random_genotype,
 )
+from darwin_st.search.operators import SPATIOTEMPORAL_OPS, op_category
 
 __all__ = ["Member", "AgingEvolution", "random_mutation", "seed_genotypes"]
 
 _HIDDEN_CHOICES = (64, 128, 192, 256)
 _EMB_DIM_CHOICES = EmbeddingConfig.VALID_DIMS  # (32, 64, 96, 128)
+
+
+# ---------------------------------------------------------------------------
+# 类别兼容候选池 (Stage 2): 让新算子 + joint 时空算子进得了变异池
+# ---------------------------------------------------------------------------
+
+
+def _spatial_slot_pool() -> list[str]:
+    """可坐"空间槽"的算子: 空间类 + 时空一体类 (类别兼容, 放宽后签名相同)。
+
+    含运行时注入的 synth 算子 (它们登记进 SPATIAL_OPS dict + OP_CATEGORY)。
+    """
+    return [o for o in _all_search_ops() if op_category(o) in ("spatial", "spatiotemporal", "any")]
+
+
+def _temporal_slot_pool() -> list[str]:
+    """可坐"时序槽"的算子: 时序类 + 时空一体类 (类别兼容)。"""
+    return [o for o in _all_search_ops() if op_category(o) in ("temporal", "spatiotemporal", "any")]
+
+
+def _joint_pool() -> list[str]:
+    """可坐"一体槽"的时空算子: spatiotemporal 类 (含 synth_ 默认归此类)。"""
+    return [o for o in _all_search_ops() if op_category(o) == "spatiotemporal"]
+
+
+def _all_search_ops() -> list[str]:
+    """三表全部算子名 (含注入 synth)。去重保稳定顺序 (dict 有序)。"""
+    seen: dict[str, None] = {}
+    for name in (*SPATIAL_OPS, *TEMPORAL_OPS, *SPATIOTEMPORAL_OPS):
+        seen.setdefault(name, None)
+    return list(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -58,11 +90,14 @@ def random_mutation(geno: Genotype, rng: random.Random, max_attempts: int = 50) 
     所有尝试失败 (极少见) 则回退到必定合法的 change_hidden。
     """
     # (类型, 权重) —— op-swap 与 embedding-toggle 高权重(研究指明高价值)
+    # Stage2: swap 池纳入类别兼容全算子; 加 swap_joint/toggle_joint 让 joint 时空算子进搜索。
     choices = [
         ("swap_spatial", 3),
         ("swap_temporal", 3),
         ("toggle_embedding", 3),
         ("change_fusion", 2),
+        ("swap_joint", 2),
+        ("toggle_joint", 2),
         ("change_hidden", 2),
         ("change_adj_mode", 1),
         ("add_block", 1),
@@ -89,14 +124,36 @@ def _apply_random(geno: Genotype, op: str, rng: random.Random) -> Genotype:
     if op == "swap_spatial":
         i = rng.randrange(n)
         cur = geno.blocks[i].spatial_op
-        cands = [o for o in SPATIAL_OPS if o != cur]
+        cands = [o for o in _spatial_slot_pool() if o != cur]
         return mutate(geno, "swap_spatial", index=i, new_op=rng.choice(cands))
 
     if op == "swap_temporal":
         i = rng.randrange(n)
         cur = geno.blocks[i].temporal_op
-        cands = [o for o in TEMPORAL_OPS if o != cur]
+        cands = [o for o in _temporal_slot_pool() if o != cur]
         return mutate(geno, "swap_temporal", index=i, new_op=rng.choice(cands))
+
+    if op == "swap_joint":
+        # 仅对已处于一体模式的块生效 (否则 mutate 抛错→重采)
+        joint_idx = [j for j, b in enumerate(geno.blocks) if b.joint_op is not None]
+        if not joint_idx:
+            raise ValueError("无一体模式块可换 joint 算子")
+        i = rng.choice(joint_idx)
+        cur = geno.blocks[i].joint_op
+        cands = [o for o in _joint_pool() if o != cur]
+        if not cands:
+            raise ValueError("无候选时空一体算子")
+        return mutate(geno, "swap_joint", index=i, new_op=rng.choice(cands))
+
+    if op == "toggle_joint":
+        i = rng.randrange(n)
+        b = geno.blocks[i]
+        if b.joint_op is not None:
+            return mutate(geno, "toggle_joint", index=i)      # 退回分离模式
+        pool = _joint_pool()
+        if not pool:
+            raise ValueError("无时空一体算子, 不能进一体模式")
+        return mutate(geno, "toggle_joint", index=i, new_op=rng.choice(pool))  # 进一体模式
 
     if op == "change_fusion":
         i = rng.randrange(n)
@@ -113,11 +170,20 @@ def _apply_random(geno: Genotype, op: str, rng: random.Random) -> Genotype:
         return mutate(geno, "change_adj_mode", new_adj_mode=rng.choice(cands))
 
     if op == "add_block":
-        nb = STBlock(
-            spatial_op=rng.choice(list(SPATIAL_OPS)),
-            temporal_op=rng.choice(list(TEMPORAL_OPS)),
-            fusion=rng.choice(list(VALID_FUSION)),
-        )
+        # 低概率产 joint block (Stage2: 让一体时空块进入深度扩展); 多数仍分离块
+        joint_pool = _joint_pool()
+        if joint_pool and rng.random() < 0.25:
+            nb = STBlock(
+                spatial_op="identity", temporal_op="identity",
+                fusion=rng.choice(list(VALID_FUSION)),
+                joint_op=rng.choice(joint_pool),
+            )
+        else:
+            nb = STBlock(
+                spatial_op=rng.choice(_spatial_slot_pool()),
+                temporal_op=rng.choice(_temporal_slot_pool()),
+                fusion=rng.choice(list(VALID_FUSION)),
+            )
         return mutate(geno, "add_block", new_block=nb)
 
     if op == "remove_block":
@@ -139,10 +205,11 @@ def seed_genotypes(n: int, rng: random.Random, protected: list[str] | None = Non
     """生成 n 个多样化的初始 genotype (覆盖不同 空间×时序 算子组合)。
 
     用于 bootstrap 种群; 比全用同一个起点更利于早期探索。
+    Stage2: 候选池含新原子算子 (mixhop/multiscale_tcn/ssm 等) + 类别兼容时空算子。
     """
     # 偏好"有意义"的算子 (排除 identity 作为主算子, 但允许出现在变异中)
-    s_pool = [o for o in SPATIAL_OPS if o != "identity"]
-    t_pool = [o for o in TEMPORAL_OPS if o != "identity"]
+    s_pool = [o for o in _spatial_slot_pool() if o != "identity"]
+    t_pool = [o for o in _temporal_slot_pool() if o != "identity"]
     out = []
     for _ in range(n):
         g = random_genotype(
