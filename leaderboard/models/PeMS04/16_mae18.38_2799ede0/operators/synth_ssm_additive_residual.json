@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_ssm_additive_residual",
+  "class_name": "ssm_additive_residual",
+  "needs_adj": false,
+  "plan_name": "ssm_additive_residual",
+  "composition": "additive_residual",
+  "source_mechanisms": [
+    "state_space_modeling"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": null
+}

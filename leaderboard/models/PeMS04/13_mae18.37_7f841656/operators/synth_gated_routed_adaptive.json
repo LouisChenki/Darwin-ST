@@ -1,0 +1,13 @@
+{
+  "reg_name": "synth_gated_routed_adaptive",
+  "class_name": "gated_routed_adaptive",
+  "needs_adj": false,
+  "plan_name": "gated_routed_adaptive",
+  "composition": "gated_routed",
+  "source_mechanisms": [
+    "relational_spatial_encoding",
+    "masked_multi_modal_conditioning"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": null
+}

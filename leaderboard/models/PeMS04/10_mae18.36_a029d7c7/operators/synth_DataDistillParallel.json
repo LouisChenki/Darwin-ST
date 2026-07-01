@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_DataDistillParallel",
+  "class_name": "DataDistillParallel",
+  "needs_adj": false,
+  "plan_name": "DataDistillParallel",
+  "composition": "parallel",
+  "source_mechanisms": [
+    "dataset_distillation"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": null
+}

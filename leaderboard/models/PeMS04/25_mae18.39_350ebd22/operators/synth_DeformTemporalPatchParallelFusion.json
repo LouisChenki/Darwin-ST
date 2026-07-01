@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_DeformTemporalPatchParallelFusion",
+  "class_name": "DeformTemporalPatchParallelFusion",
+  "needs_adj": false,
+  "plan_name": "DeformTemporalPatchParallelFusion",
+  "composition": "parallel",
+  "source_mechanisms": [
+    "deformable_temporal_patching"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": null
+}

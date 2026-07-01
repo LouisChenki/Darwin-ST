@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_sparse_residual_subset",
+  "class_name": "sparse_residual_subset",
+  "needs_adj": false,
+  "plan_name": "sparse_residual_subset",
+  "composition": "additive_residual",
+  "source_mechanisms": [
+    "differentiable_k_subset_sampling"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": null
+}

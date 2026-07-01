@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_ParResDec",
+  "class_name": "ParResDec",
+  "needs_adj": false,
+  "plan_name": "ParResDec",
+  "composition": "parallel",
+  "source_mechanisms": [
+    "residual_decomposition"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": null
+}

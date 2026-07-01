@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_PotentialResidual",
+  "class_name": "PotentialResidual",
+  "needs_adj": false,
+  "plan_name": "PotentialResidual",
+  "composition": "additive_residual",
+  "source_mechanisms": [
+    "learnable_potential_field"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": null
+}

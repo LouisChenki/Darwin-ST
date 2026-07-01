@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_SequentialRandomGCN",
+  "class_name": "SequentialRandomGCN",
+  "needs_adj": false,
+  "plan_name": "SequentialRandomGCN",
+  "composition": "sequential",
+  "source_mechanisms": [
+    "domain_randomization"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": null
+}
