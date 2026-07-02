@@ -46,6 +46,24 @@ def _env_int(k, d):
     return int(v) if v else d
 
 
+def resolve_warmstart_base(mem, dataset, scope):
+    """RESUME 作用域匹配暖启动: 只在 (dataset, space_version) 有历史 KEEP 时返回最优 genotype。
+
+    不匹配/新作用域 → 返回 None → orchestrator 走 seed_genotypes 冷启动公平 bootstrap。
+    这是 Stage2 稀释 bug 的直接修复: 换代 (space_version 变) 时旧代最优查不到 → 不暖启动旧局部最优,
+    且新代 synth 目录为空 → 变异池不被旧算子碾压, 新原子算子公平竞争。
+    抽为纯函数便于单测 (见 test_scope / test_memory_store)。
+    """
+    try:
+        prev = mem.best_so_far(dataset, metric="val_mae", space_version=scope.space_version)
+    except Exception:
+        return None
+    if prev and prev.get("genotype"):
+        from darwin_st.search.genotype import Genotype
+        return Genotype.from_dict(prev["genotype"])
+    return None
+
+
 def _load_mechanisms(cache):
     """按 KB_SOURCE 选知识源: cards=615 定稿库 / seeds=16 种子卡。
 
@@ -83,6 +101,11 @@ def main():
     stagnation = _env_int("STAGNATION", 8)   # 停滞耐心 (修衔接节奏: 别太小导致高频创造过早收敛)
     cache = os.environ.get("DARWIN_ST_CACHE", ".")
 
+    # 实验作用域 (数据集 + 搜索空间代际): 隔离 synth 目录 / RESUME 暖启动 / trial 落库。
+    # space_version 默认自动哈希 (内置算子集变→自动新代→干净隔离); SPACE_VERSION 环境变量可覆盖。
+    from darwin_st.scope import ExperimentScope
+    scope = ExperimentScope.resolve(ds)
+
     print(f"=== Tier-2 创造闭环端到端实跑: {ds} ===")
     print(f"GPU={n_gpus} 种群={pop} 轮数={max_rounds} HPO/arch={hpo_trials} epochs={max_epochs} "
           f"停滞触发={stagnation}")
@@ -118,8 +141,10 @@ def main():
     backend = AiderBackend(AiderConfig(model=f"deepseek/{model}"))
     synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2, temperature=0.9),
                                 code_backend=backend)
-    registry = OperatorRegistry(persist_dir=os.path.join(cache, "dynamic_ops"))
-    registry.load_persisted()  # 加载之前合成的算子
+    registry = OperatorRegistry(persist_dir=scope.synth_dir(cache))
+    n_loaded = registry.load_persisted()  # 加载**本作用域**之前合成的算子 (换代/换数据集→空目录冷场)
+    print(f"[作用域] {scope.dataset}/{scope.space_version} synth_dir={scope.synth_dir(cache)} "
+          f"载回 {len(n_loaded)} 算子")
 
     mem = MemoryStore(os.environ.get("MEMORY_DB", os.path.join(cache, "memory_creation.db")))
     from darwin_st.creation import CreationConfig
@@ -136,24 +161,24 @@ def main():
     # 进程后端: worker 自建 eval_fn + 从 persist_dir 重载 synth 算子 (spawn 子进程丢进程全局 SPATIAL_OPS)
     backend = os.environ.get("BACKEND", "auto")
     eval_spec = EvalSpec(dataset=ds, hpo_cfg=hpo_cfg,
-                         synth_persist_dir=os.path.join(cache, "dynamic_ops"))
+                         synth_persist_dir=scope.synth_dir(cache))   # 同 registry 单一源, 主/worker 一致
     base = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64)  # 故意弱基线, 逼出创造
-    # RESUME=1 (看门狗重启续跑用): 从 memory 已有最优 KEEP 暖启动 base, 不从弱基线重头。
-    # synth 算子已由 registry.load_persisted 续上; 这里再续上进化起点 → 崩溃重启不丢搜索进度。
+    # RESUME=1 (看门狗重启续跑用): **作用域匹配**暖启动 —— 只从本 (dataset, space_version) 的最优 KEEP
+    # 暖启动。换代/换数据集 (space_version 变) 时查不到旧代最优 → base 留弱基线 → 冷启动公平 bootstrap
+    # (修 Stage2 稀释 bug: 不暖启动旧代局部最优, 且本作用域 synth 目录为空, 新算子不被旧算子碾压)。
     if os.environ.get("RESUME", "0") == "1":
-        try:
-            prev = mem.best_so_far(ds, metric="val_mae")
-            if prev and prev.get("genotype"):
-                base = Genotype.from_dict(prev["genotype"])
-                print(f"[续跑] 从 memory 最优暖启动 base: val_mae={prev.get('val_mae')} "
-                      f"sig={prev.get('signature', '?')[:10]}")
-        except Exception as e:
-            print(f"[续跑] 暖启动失败({type(e).__name__}), 用弱基线: {str(e)[:80]}")
+        warm = resolve_warmstart_base(mem, ds, scope)
+        if warm is not None:
+            base = warm
+            print(f"[续跑] 作用域匹配暖启动 base (scope={ds}/{scope.space_version})")
+        else:
+            print(f"[续跑] 本作用域 ({ds}/{scope.space_version}) 无历史 → 冷启动公平 seed (新代/新数据集)")
 
     # target_mae: 默认 0.0 不可达(靠 max_rounds 停); 24h 冲 SOTA 设 TARGET_MAE=17.80 程序化停。
     target_mae = float(os.environ.get("TARGET_MAE", "0.0"))
     cfg = OrchestratorConfig(dataset=ds,
                              run_tag=os.environ.get("RUN_TAG", f"exp/{ds.lower()}-creation"),
+                             space_version=scope.space_version,   # trial 落库带代际, best_so_far 隔离
                              population_size=pop, tournament_size=min(3, pop),
                              max_rounds=max_rounds, target_mae=target_mae,
                              warmup_keep=pop * 2, seed=0,

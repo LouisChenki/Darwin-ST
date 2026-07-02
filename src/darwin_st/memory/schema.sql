@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     run_tag         TEXT    NOT NULL,            -- 实验批次/分支标识
     dataset         TEXT    NOT NULL,            -- 目标数据集 (PeMS04 等)
+    space_version   TEXT,                        -- 搜索空间代际 (作用域隔离键; NULL=旧库/未知代)
     signature       TEXT    NOT NULL,            -- genotype+hp 稳定哈希 (Graveyard 查重键)
     genotype_json   TEXT    NOT NULL,            -- 架构基因型 (JSON)
     hp_json         TEXT    NOT NULL DEFAULT '{}', -- 超参 (JSON)
@@ -55,6 +56,8 @@ CREATE INDEX IF NOT EXISTS idx_exp_signature ON experiments(signature);
 CREATE INDEX IF NOT EXISTS idx_exp_dataset_status ON experiments(dataset, status);
 CREATE INDEX IF NOT EXISTS idx_exp_val_mae ON experiments(dataset, val_mae);
 CREATE INDEX IF NOT EXISTS idx_exp_run_tag ON experiments(run_tag);
+-- 注: idx_exp_scope (含 space_version 列) 由 store._migrate() 创建, 不在此处 —— 旧库经
+-- CREATE TABLE IF NOT EXISTS 是 no-op 不会加列, 若在此引用 space_version 会在迁移前崩。
 
 -- 谱系表: 显式记录变异关系 (一条变异边 = 父 → 子, 附变异算子)
 CREATE TABLE IF NOT EXISTS lineage (

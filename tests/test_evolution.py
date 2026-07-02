@@ -220,3 +220,50 @@ def test_evolution_improves_on_synthetic_fitness():
             late.append(f)
     # 后期平均 fitness 应优于早期 (进化在改进)
     assert sum(late) / len(late) < sum(early) / len(early)
+
+
+# ---------------------------------------------------------------------------
+# 作用域: ask() 按数据集查重 (修跨数据集泄漏)
+# ---------------------------------------------------------------------------
+
+
+def test_ask_passes_dataset_to_graveyard_and_seen():
+    """AgingEvolution(dataset=...) → ask() 用 dataset 调 query_graveyard/seen_signature。
+
+    修跨数据集泄漏: METR-LA 的进化不该被 PeMS04 的崩溃/已见签名阻断。
+    """
+    calls = {"graveyard": [], "seen": []}
+
+    class _SpyMemory:
+        def query_graveyard(self, genotype, hp=None, dataset=None, space_version=None):
+            calls["graveyard"].append(dataset)
+            return None
+        def seen_signature(self, genotype, hp=None, dataset=None, space_version=None):
+            calls["seen"].append(dataset)
+            return False
+
+    evo = AgingEvolution(population_size=6, tournament_size=3, seed=0,
+                         memory=_SpyMemory(), dataset="METR-LA")
+    # 跑过 bootstrap 进入进化路径 (ask/tell 若干轮)
+    for _ in range(10):
+        g = evo.ask()
+        evo.tell(g, 5.0)
+    assert calls["graveyard"], "ask() 未调 query_graveyard"
+    assert all(d == "METR-LA" for d in calls["graveyard"]), "graveyard 未按数据集查重"
+    assert all(d == "METR-LA" for d in calls["seen"]), "seen 未按数据集查重"
+
+
+def test_ask_dataset_none_backward_compat():
+    """不传 dataset → 查重 dataset=None (全局, 旧行为)。"""
+    seen_ds = []
+
+    class _SpyMemory:
+        def query_graveyard(self, genotype, hp=None, dataset=None, space_version=None):
+            seen_ds.append(dataset); return None
+        def seen_signature(self, genotype, hp=None, dataset=None, space_version=None):
+            return False
+
+    evo = AgingEvolution(population_size=6, tournament_size=3, seed=0, memory=_SpyMemory())
+    for _ in range(8):
+        evo.tell(evo.ask(), 5.0)
+    assert seen_ds and all(d is None for d in seen_ds)

@@ -258,6 +258,7 @@ class AgingEvolution:
         protected: list[str] | None = None,
         memory=None,                  # 可选 MemoryStore: 用于 graveyard/已见 查重
         base_genotype: Genotype | None = None,  # 若给定, bootstrap 以它为起点变异
+        dataset: str | None = None,   # 作用域: graveyard/seen 按数据集查重 (防跨数据集误阻断)
     ):
         if tournament_size > population_size:
             raise ValueError("tournament_size 不应超过 population_size")
@@ -267,6 +268,7 @@ class AgingEvolution:
         self.protected = protected or []
         self.memory = memory
         self.base_genotype = base_genotype
+        self.dataset = dataset
 
         self.population: deque[Member] = deque()  # FIFO: 左老右新
         self._seed_queue: list[Genotype] = []     # 待提议的 bootstrap 种子
@@ -303,9 +305,9 @@ class AgingEvolution:
             if sig in self._pending:
                 continue  # 正在评估中, 换一个
             if self.memory is not None:
-                if self.memory.query_graveyard(child.to_dict()) is not None:
-                    continue  # 已知失败, 跳过 (硬阻断无效优化)
-                if self.memory.seen_signature(child.to_dict()):
+                if self.memory.query_graveyard(child.to_dict(), dataset=self.dataset) is not None:
+                    continue  # 已知失败, 跳过 (硬阻断无效优化; 按数据集查重防跨集误阻断)
+                if self.memory.seen_signature(child.to_dict(), dataset=self.dataset):
                     continue  # 已评估过, 跳过
             self._pending[sig] = child
             return child

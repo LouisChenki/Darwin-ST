@@ -419,3 +419,33 @@ def test_creation_cooldown_resets_since_improve():
     # 创造后设了冷却窗口 (rounds + refine_rounds)
     assert orch._creation_cooldown_until > 0
 
+
+
+# ---------------------------------------------------------------------------
+# 作用域隔离: trial 落库带 space_version
+# ---------------------------------------------------------------------------
+
+
+def test_trials_carry_space_version():
+    """OrchestratorConfig(space_version=...) → 所有落库 trial 带该代际; scoped best_so_far 隔离。"""
+    mem = MemoryStore(":memory:")
+    cfg = OrchestratorConfig(dataset="PeMS04", space_version="vSCOPE",
+                             population_size=4, tournament_size=2, max_rounds=2, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=2, memory=mem)
+    assert orch.scope.space_version == "vSCOPE"
+    assert orch.evo.dataset == "PeMS04"
+    orch.run()
+    rows = mem.list_trials(dataset="PeMS04")
+    assert rows and all(r.get("space_version") == "vSCOPE" for r in rows)
+    # scoped best_so_far 只在本代取到, 别代 None
+    assert mem.best_so_far("PeMS04", space_version="vSCOPE") is not None
+    assert mem.best_so_far("PeMS04", space_version="other") is None
+    mem.close()
+
+
+def test_space_version_auto_resolves_when_none():
+    """不传 space_version → 自动哈希派生 (非 None)。"""
+    from darwin_st.search.operators import builtin_op_signature
+    cfg = OrchestratorConfig(dataset="PeMS04", max_rounds=1)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    assert orch.scope.space_version == builtin_op_signature()

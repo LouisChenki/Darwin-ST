@@ -241,3 +241,82 @@ def test_persistence_to_disk(tmp_path):
         m.record_trial(_trial(val_mae=18.0))
     with MemoryStore(db) as m:
         assert m.best_so_far("PeMS04")["val_mae"] == 18.0
+
+
+# ---------------------------------------------------------------------------
+# 作用域隔离 (space_version): 多数据集/多代际验证地基
+# ---------------------------------------------------------------------------
+
+
+def test_migration_idempotent_on_legacy_db(tmp_path):
+    """旧库 (无 space_version 列, 无 scope 索引) 打开触发迁移; 多次重开 no-op 不崩。"""
+    import sqlite3
+    db = str(tmp_path / "legacy.db")
+    raw = sqlite3.connect(db)
+    raw.executescript(
+        "CREATE TABLE experiments (id INTEGER PRIMARY KEY AUTOINCREMENT, run_tag TEXT NOT NULL,"
+        " dataset TEXT NOT NULL, signature TEXT NOT NULL, genotype_json TEXT NOT NULL,"
+        " hp_json TEXT DEFAULT '{}', val_mae REAL, val_mae_std REAL, val_rmse REAL, val_mape REAL,"
+        " test_mae REAL, num_seeds INTEGER DEFAULT 1, status TEXT NOT NULL, fail_reason TEXT,"
+        " behavior_descriptor TEXT DEFAULT '{}', num_params INTEGER, wall_seconds REAL,"
+        " peak_mem_gb REAL, parent_id INTEGER, commit_hash TEXT, created_at TEXT NOT NULL);")
+    raw.execute("INSERT INTO experiments (run_tag,dataset,signature,genotype_json,status,created_at,val_mae)"
+                " VALUES ('old','PeMS04','sigX','{}','KEEP','t',18.0)")
+    raw.commit(); raw.close()
+    m = MemoryStore(db)   # 触发迁移 (老库无列 → ALTER + 建 idx_exp_scope)
+    cols = {r["name"] for r in m.conn.execute("PRAGMA table_info(experiments)")}
+    assert "space_version" in cols
+    m.close()
+    MemoryStore(db).close()   # 二次打开 no-op 不崩
+
+
+def test_legacy_null_version_scoped_vs_unscoped(tmp_path):
+    """旧行 space_version=NULL: scoped 查返回 None (不暖启动新作用域), 无 scope 查仍返回 (兼容)。"""
+    import sqlite3
+    db = str(tmp_path / "legacy2.db")
+    raw = sqlite3.connect(db)
+    raw.executescript(
+        "CREATE TABLE experiments (id INTEGER PRIMARY KEY AUTOINCREMENT, run_tag TEXT NOT NULL,"
+        " dataset TEXT NOT NULL, signature TEXT NOT NULL, genotype_json TEXT NOT NULL,"
+        " hp_json TEXT DEFAULT '{}', val_mae REAL, val_mae_std REAL, val_rmse REAL, val_mape REAL,"
+        " test_mae REAL, num_seeds INTEGER DEFAULT 1, status TEXT NOT NULL, fail_reason TEXT,"
+        " behavior_descriptor TEXT DEFAULT '{}', num_params INTEGER, wall_seconds REAL,"
+        " peak_mem_gb REAL, parent_id INTEGER, commit_hash TEXT, created_at TEXT NOT NULL);")
+    raw.execute("INSERT INTO experiments (run_tag,dataset,signature,genotype_json,status,created_at,val_mae)"
+                " VALUES ('old','PeMS04','sigX','{}','KEEP','t',18.0)")
+    raw.commit(); raw.close()
+    m = MemoryStore(db)
+    assert m.best_so_far("PeMS04", space_version="anyver") is None  # NULL 不匹配 scoped
+    assert m.best_so_far("PeMS04") is not None                     # 无 scope 仍取到
+    m.close()
+
+
+def test_scoped_best_so_far_isolation(store):
+    """同数据集不同 space_version 各返回各自最优, 互不泄漏; 无 scope 取全局最优。"""
+    store.record_trial(_trial(genotype={"b": 1}, val_mae=20.0, space_version="v1"))
+    store.record_trial(_trial(genotype={"b": 2}, val_mae=18.0, space_version="v2"))
+    assert store.best_so_far("PeMS04", space_version="v1")["val_mae"] == 20.0
+    assert store.best_so_far("PeMS04", space_version="v2")["val_mae"] == 18.0
+    assert store.best_so_far("PeMS04")["val_mae"] == 18.0   # 无 scope = 全局最优
+
+
+def test_scoped_graveyard_by_dataset(store):
+    """graveyard 按数据集隔离 (防跨集误阻断), 默认全局。"""
+    store.record_trial(_trial(genotype={"x": 1}, status="CRASH", fail_reason="nan"))  # PeMS04
+    assert store.query_graveyard({"x": 1}, dataset="PeMS04") is not None
+    assert store.query_graveyard({"x": 1}, dataset="METR-LA") is None   # 别的数据集不阻断
+    assert store.query_graveyard({"x": 1}) is not None                  # 默认全局仍命中
+
+
+def test_scoped_seen_by_dataset(store):
+    """seen_signature 可按数据集收窄 (默认全局)。"""
+    store.record_trial(_trial(genotype={"y": 9}))   # PeMS04 KEEP
+    assert store.seen_signature({"y": 9}, dataset="PeMS04") is True
+    assert store.seen_signature({"y": 9}, dataset="METR-LA") is False
+    assert store.seen_signature({"y": 9}) is True
+
+
+def test_record_trial_carries_space_version(store):
+    """record_trial 落库带 space_version, 读回一致。"""
+    tid = store.record_trial(_trial(space_version="vXYZ"))
+    assert store.get_trial(tid)["space_version"] == "vXYZ"

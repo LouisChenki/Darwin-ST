@@ -67,6 +67,7 @@ class Trial:
 
     parent_id: int | None = None
     commit_hash: str | None = None
+    space_version: str | None = None   # 搜索空间代际 (作用域隔离键); 旧调用不传→NULL
 
     def __post_init__(self) -> None:
         if self.status not in VALID_STATUS:
@@ -92,6 +93,25 @@ class MemoryStore:
         with open(_SCHEMA_PATH, encoding="utf-8") as f:
             self.conn.executescript(f.read())
         self.conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """幂等迁移: 旧库 (schema 只 CREATE IF NOT EXISTS, 不改已存在表) 补 space_version 列。
+
+        新库经 schema.sql 已有该列, PRAGMA 检测到即跳过 ALTER → 二次运行/`:memory:` 均 no-op 安全。
+        旧行 space_version 留 NULL: scoped 查询 (WHERE space_version=?) 天然不匹配 NULL
+        → 旧代记录绝不暖启动新作用域 (正是想要的隔离); 无 scope 查询仍能取到 (离线分析兼容)。
+
+        idx_exp_scope 在此建 (不在 schema.sql): 旧库 CREATE TABLE IF NOT EXISTS 是 no-op 不加列,
+        若索引在 schema.sql 引用 space_version 会在 ALTER 前崩。此处在列就绪后建, 幂等。
+        """
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(experiments)")}
+        if "space_version" not in cols:
+            self.conn.execute("ALTER TABLE experiments ADD COLUMN space_version TEXT")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exp_scope "
+            "ON experiments(dataset, space_version, status)")
+        self.conn.commit()
 
     # -- 上下文管理 --
     def __enter__(self) -> "MemoryStore":
@@ -112,8 +132,9 @@ class MemoryStore:
                 run_tag, dataset, signature, genotype_json, hp_json,
                 val_mae, val_mae_std, val_rmse, val_mape, test_mae, num_seeds,
                 status, fail_reason, behavior_descriptor,
-                num_params, wall_seconds, peak_mem_gb, parent_id, commit_hash, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                num_params, wall_seconds, peak_mem_gb, parent_id, commit_hash, created_at,
+                space_version
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 trial.run_tag, trial.dataset, trial.signature,
@@ -125,6 +146,7 @@ class MemoryStore:
                 json.dumps(trial.behavior_descriptor, ensure_ascii=False),
                 trial.num_params, trial.wall_seconds, trial.peak_mem_gb,
                 trial.parent_id, trial.commit_hash, trial.created_at,
+                trial.space_version,
             ),
         )
         new_id = int(cur.lastrowid)
@@ -151,41 +173,65 @@ class MemoryStore:
         row = self.conn.execute("SELECT * FROM experiments WHERE id=?", (trial_id,)).fetchone()
         return _row_to_dict(row) if row else None
 
-    def best_so_far(self, dataset: str, metric: str = "val_mae") -> dict | None:
-        """取该数据集 KEEP 实验中指标最小 (最优) 的一条 —— 供超越 SOTA 判定。"""
+    def best_so_far(self, dataset: str, metric: str = "val_mae",
+                    space_version: str | None = None) -> dict | None:
+        """取该数据集 KEEP 实验中指标最小 (最优) 的一条 —— 供超越 SOTA 判定 / RESUME 暖启动。
+
+        space_version 给定 → 只在该搜索空间代内取最优 (作用域隔离: 换代/换数据集不暖启动旧代
+        局部最优, 修 Stage2 稀释 bug)。不给 → 全数据集历史 (旧行为, 离线分析/向后兼容)。
+        """
         if metric not in ("val_mae", "val_rmse", "val_mape", "test_mae"):
             raise ValueError(f"不支持的 metric: {metric}")
+        clauses = ["dataset=?", "status='KEEP'", f"{metric} IS NOT NULL"]
+        params: list = [dataset]
+        if space_version is not None:
+            clauses.append("space_version=?")
+            params.append(space_version)
         row = self.conn.execute(
-            f"""
-            SELECT * FROM experiments
-            WHERE dataset=? AND status='KEEP' AND {metric} IS NOT NULL
-            ORDER BY {metric} ASC LIMIT 1
-            """,
-            (dataset,),
+            f"SELECT * FROM experiments WHERE {' AND '.join(clauses)} "
+            f"ORDER BY {metric} ASC LIMIT 1",
+            params,
         ).fetchone()
         return _row_to_dict(row) if row else None
 
-    def query_graveyard(self, genotype: dict, hp: dict | None = None) -> dict | None:
+    def query_graveyard(self, genotype: dict, hp: dict | None = None,
+                        dataset: str | None = None, space_version: str | None = None) -> dict | None:
         """按签名查是否为已知失败配置 (status in CRASH/DISCARD)。
 
         命中则返回该失败记录 (供 Agent 跳过, 不浪费算力重跑); 否则 None。
+        dataset 给定 → 只在该数据集内查 (防跨数据集误阻断: METR-LA 不该被 PeMS04 崩溃阻断)。
+        space_version 一般不传: 纯内置崩溃 (如 OOM) 跨代可复用是真知识; 含 synth 的 genotype
+        因算子名唯一天然分区, 版本化多余。仅在需要更严隔离时才传。
         """
         sig = compute_signature(genotype, hp)
+        clauses = ["signature=?", "status IN ('CRASH','DISCARD')"]
+        params: list = [sig]
+        if dataset is not None:
+            clauses.append("dataset=?")
+            params.append(dataset)
+        if space_version is not None:
+            clauses.append("space_version=?")
+            params.append(space_version)
         row = self.conn.execute(
-            """
-            SELECT * FROM experiments
-            WHERE signature=? AND status IN ('CRASH','DISCARD')
-            ORDER BY id DESC LIMIT 1
-            """,
-            (sig,),
+            f"SELECT * FROM experiments WHERE {' AND '.join(clauses)} ORDER BY id DESC LIMIT 1",
+            params,
         ).fetchone()
         return _row_to_dict(row) if row else None
 
-    def seen_signature(self, genotype: dict, hp: dict | None = None) -> bool:
-        """该 genotype+hp 是否被试过 (任意状态)。"""
+    def seen_signature(self, genotype: dict, hp: dict | None = None,
+                       dataset: str | None = None, space_version: str | None = None) -> bool:
+        """该 genotype+hp 是否被试过 (任意状态)。可按 dataset/space_version 收窄 (默认全局)。"""
         sig = compute_signature(genotype, hp)
+        clauses = ["signature=?"]
+        params: list = [sig]
+        if dataset is not None:
+            clauses.append("dataset=?")
+            params.append(dataset)
+        if space_version is not None:
+            clauses.append("space_version=?")
+            params.append(space_version)
         row = self.conn.execute(
-            "SELECT 1 FROM experiments WHERE signature=? LIMIT 1", (sig,)
+            f"SELECT 1 FROM experiments WHERE {' AND '.join(clauses)} LIMIT 1", params
         ).fetchone()
         return row is not None
 

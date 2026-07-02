@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,7 +28,9 @@ __all__ = [
     "TEMPORAL_OPS",
     "SPATIOTEMPORAL_OPS",
     "OP_CATEGORY",
+    "SYNTH_PREFIX",
     "op_category",
+    "builtin_op_signature",
     "build_op",
     "build_spatial_op",
     "build_temporal_op",
@@ -549,15 +554,45 @@ OP_CATEGORY["identity"] = "any"
 # 需要 num_nodes 构造参数的空间/时序算子 (自学邻接类)。时空一体类 + synth_ 单独判。
 NEEDS_NODES: set[str] = {"adaptive", "gwnet_adp"}
 
+# 合成算子注册名前缀 (Tier-2 创造注入 SPATIAL_OPS 时加此前缀区分内置算子)。
+# 定义在此 (而非 registry) 是为了让 builtin_op_signature 能排除 synth_ 算子且不引入
+# operators→registry 的反向依赖; registry.py re-export 保持向后兼容。
+SYNTH_PREFIX = "synth_"
+
 
 def op_category(name: str) -> str:
     """查算子类别。内置查 OP_CATEGORY; synth_ 前缀查 registry 登记的类别, 兜底 spatiotemporal。"""
     if name in OP_CATEGORY:
         return OP_CATEGORY[name]
-    if name.startswith("synth_"):
+    if name.startswith(SYNTH_PREFIX):
         # registry 注入时把类别写进 OP_CATEGORY; 若没写 (旧算子) 默认时空一体 (诚实兜底)
         return "spatiotemporal"
     return "spatiotemporal"
+
+
+def builtin_op_signature() -> str:
+    """内置搜索空间的稳定短哈希 (排除 synth_ 运行时注入算子)。
+
+    作用: 作为 ExperimentScope.space_version 的自动来源。**内置算子集或 fusion 集一变
+    (Stage1→2→3), 哈希就变 → 新代实验自动落到独立作用域**, 从根上杜绝跨代记忆污染
+    (Stage2 稀释 bug 的结构性修复)。
+
+    稳定性铁律 (改这里前务必想清楚, 否则旧作用域会"漂移"):
+      - 只哈希算子名 (keys), sorted, 排除 synth_ 前缀 (运行时注入不算搜索空间代际)。
+      - 不哈希算子代码/dict 插入顺序/超参。
+      - genotype schema 本身变化 (非算子名) 时, 手动 bump 下面的 "schema" 标记。
+    """
+    from darwin_st.search.genotype import VALID_FUSION  # 函数内 import 避免顶层环
+    builtin = lambda d: sorted(n for n in d if not n.startswith(SYNTH_PREFIX))
+    payload = {
+        "spatial": builtin(SPATIAL_OPS),
+        "temporal": builtin(TEMPORAL_OPS),
+        "joint": builtin(SPATIOTEMPORAL_OPS),
+        "fusion": sorted(VALID_FUSION),
+        "schema": "v1",   # genotype schema 变了 (非算子名) 手动 bump
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:8]
 
 
 def _all_ops() -> dict:

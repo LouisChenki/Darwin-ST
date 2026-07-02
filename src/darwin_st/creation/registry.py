@@ -23,10 +23,9 @@ import torch.nn as nn
 from darwin_st.creation.contracts import SynthesizedOperator
 from darwin_st.creation.synthesizer import exec_operator_code
 from darwin_st.search import operators as ops_mod
+from darwin_st.search.operators import SYNTH_PREFIX  # 单一真源在 operators.py, 此处 re-export 保兼容
 
 __all__ = ["OperatorRegistry", "SYNTH_PREFIX"]
-
-SYNTH_PREFIX = "synth_"
 
 
 @dataclass

@@ -50,6 +50,7 @@ def _now_iso() -> str:
 class OrchestratorConfig:
     dataset: str = "PeMS04"
     run_tag: str = "exp/auto"
+    space_version: str | None = None      # 搜索空间代际 (作用域隔离键); None=自动哈希派生
     population_size: int = 20
     tournament_size: int = 5
     seed: int = 0
@@ -129,6 +130,10 @@ class Orchestrator:
         self._pending_seed_genotypes: list = []   # 创造产出的待评 genotype 队列
         self._creation_cooldown_until = 0         # 创造后精修窗口: rounds 到此前不再触发创造
 
+        # 实验作用域 (数据集 + 搜索空间代际): trial 落库带 space_version, evolution 按数据集查重。
+        from darwin_st.scope import ExperimentScope
+        self.scope = ExperimentScope.resolve(config.dataset, config.space_version)
+
         self.evo = AgingEvolution(
             population_size=config.population_size,
             tournament_size=config.tournament_size,
@@ -136,6 +141,7 @@ class Orchestrator:
             protected=protected,
             memory=memory,
             base_genotype=base_genotype,
+            dataset=config.dataset,
         )
         self.archive = MAPElitesArchive(seed=config.seed)
         self.scheduler = GPUScheduler(
@@ -263,6 +269,7 @@ class Orchestrator:
 
         trial = Trial(
             run_tag=self.cfg.run_tag, dataset=self.cfg.dataset,
+            space_version=self.scope.space_version,
             genotype=res.genotype.to_dict(), hp=res.hps,
             status=status, created_at=_now_iso(),
             val_mae=res.mae if _finite(res.mae) else None,
