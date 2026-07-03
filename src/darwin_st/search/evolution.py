@@ -42,7 +42,9 @@ from darwin_st.search.operators import SPATIOTEMPORAL_OPS, op_category
 
 __all__ = ["Member", "AgingEvolution", "random_mutation", "seed_genotypes"]
 
-_HIDDEN_CHOICES = (64, 128, 192, 256)
+_HIDDEN_CHOICES = (64, 128, 192)   # 砍掉 256: 冷启动撞上 hidden-256 → 121万参数吃31GB显存,
+                                   # 是深度探索的评估提速陷阱 (18.348 best 也才 hidden-128)。深度是要探的
+                                   # 容量维度, 宽度不是; 保留到 192 够用, 去掉最笨重的 256。
 _EMB_DIM_CHOICES = EmbeddingConfig.VALID_DIMS  # (32, 64, 96, 128)
 
 
