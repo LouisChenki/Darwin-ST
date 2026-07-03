@@ -5,12 +5,15 @@
 
 核心:
   - 网格按行为描述子 (BD) 离散, 每格只留最优精英 (严格改进才替换)。
-  - BD 三轴 (36 格): 主导空间族 × 主导时序族 × 参数量档 —— 从 genotype 直接算, 无需训练。
+  - BD 四轴 (108 格): 主导空间族 × 主导时序族 × 参数量档 × 深度档 —— 从 genotype 直接算, 无需训练。
   - 选择 = 混合: 40% 从填充格均匀采 (QD 多样性), 60% 最近精英锦标赛 (aging 抗噪)。
   - 停滞 → 岛屿重置 (FunSearch 式): 清差的一半格, 从最优精英重播种。
   - empty_cells() 暴露未探索区, 供 LLM 定向填充 (ICQD 式)。
 
 BD 不能与 fitness 相关 (否则 QD 退化成纯优化) —— 空间/时序算子族与精度正交, 是好 BD。
+**深度轴 (depth_bucket) 是关键**: 无它则 depth-2 与 depth-4 若家族+参数档相同会落同一格竞争,
+便宜的浅架构挤掉深架构 → 搜索坍缩在浅层 (实测 depth-4 一次没探到)。加深度轴让每个深度带各留 elite,
+浅的挤不掉深的 (QD/MAP-Elites for NAS 破容量坍缩的标准解, 见 Schneider 2022)。深度与 masked-MAE 正交, 是合法 BD。
 fitness 约定: 越小越优 (masked val-MAE)。
 """
 
@@ -22,7 +25,7 @@ from dataclasses import dataclass, field
 from darwin_st.search.genotype import Genotype
 
 __all__ = ["Elite", "behavior_descriptor", "cell_index", "MAPElitesArchive",
-           "SPATIAL_FAMILIES", "TEMPORAL_FAMILIES", "PARAM_BUCKETS"]
+           "SPATIAL_FAMILIES", "TEMPORAL_FAMILIES", "PARAM_BUCKETS", "DEPTH_BUCKETS"]
 
 # 主导空间族分桶 (4): 把 6 个空间算子归并为 4 个有意义的族
 SPATIAL_FAMILIES = {
@@ -45,6 +48,11 @@ _TEMPORAL_FAMILY_ORDER = ["conv", "recurrent", "attention"]
 # 参数量档 (3): <50k / 50k-200k / >200k
 PARAM_BUCKETS = [(0, 50_000), (50_000, 200_000), (200_000, float("inf"))]
 _N_PARAM_BUCKETS = len(PARAM_BUCKETS)
+
+# 深度档 (3): 1-2 / 3-4 / 5+。用字符串标签自描述 (且不和 int param_bucket 视觉混)。
+# 用 3 个带而非逐深度: 小评估预算下逐深度过碎; 3 带映射实测缺口 (depth-2 坍缩 vs depth-4 目标)。
+DEPTH_BUCKETS = [(1, 3), (3, 5), (5, float("inf"))]
+_DEPTH_BUCKET_LABELS = ["1-2", "3-4", "5+"]
 
 
 def _dominant_spatial_family(geno: Genotype) -> str:
@@ -72,30 +80,41 @@ def _param_bucket(num_params: int) -> int:
     return _N_PARAM_BUCKETS - 1
 
 
+def _depth_bucket(depth: int) -> str:
+    """深度 → 深度档标签 (1-2 / 3-4 / 5+)。depth = len(genotype.blocks)。"""
+    for (lo, hi), label in zip(DEPTH_BUCKETS, _DEPTH_BUCKET_LABELS):
+        if lo <= depth < hi:
+            return label
+    return _DEPTH_BUCKET_LABELS[-1]
+
+
 def behavior_descriptor(geno: Genotype, num_params: int) -> dict:
-    """计算行为描述子 (BD): {spatial_family, temporal_family, param_bucket}。
+    """计算行为描述子 (BD): {spatial_family, temporal_family, param_bucket, depth_bucket}。
 
     num_params 由调用方提供 (orchestrator 从 builder 实例化的模型取), 无需训练。
+    depth_bucket 让 MAP-Elites 在深度上保持多样性 (深架构不被浅架构挤掉)。
     """
     return {
         "spatial_family": _dominant_spatial_family(geno),
         "temporal_family": _dominant_temporal_family(geno),
         "param_bucket": _param_bucket(num_params),
+        "depth_bucket": _depth_bucket(geno.depth),
     }
 
 
-def cell_index(bd: dict) -> tuple[str, str, int]:
+def cell_index(bd: dict) -> tuple[str, str, int, str]:
     """BD → 网格 cell 键 (可哈希元组)。"""
-    return (bd["spatial_family"], bd["temporal_family"], bd["param_bucket"])
+    return (bd["spatial_family"], bd["temporal_family"], bd["param_bucket"], bd["depth_bucket"])
 
 
-def all_cells() -> list[tuple[str, str, int]]:
-    """枚举全部 36 个可能 cell (用于 coverage / empty_cells)。"""
+def all_cells() -> list[tuple[str, str, int, str]]:
+    """枚举全部 108 个可能 cell (用于 coverage / empty_cells)。"""
     return [
-        (s, t, p)
+        (s, t, p, d)
         for s in _SPATIAL_FAMILY_ORDER
         for t in _TEMPORAL_FAMILY_ORDER
         for p in range(_N_PARAM_BUCKETS)
+        for d in _DEPTH_BUCKET_LABELS
     ]
 
 

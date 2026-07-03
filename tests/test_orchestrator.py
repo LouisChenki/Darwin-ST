@@ -180,6 +180,20 @@ def test_archive_populated():
     assert orch.archive.best() is not None
 
 
+def test_search_explores_deep_architectures():
+    """深度探索修复端到端: eval_fn 奖励 depth (mae=base-depth*1.0), 搜索应探到 depth>=3 架构,
+    且 archive 填充 3-4 深度带 (证明浅层坍缩被破)。"""
+    cfg = OrchestratorConfig(population_size=10, tournament_size=4, max_rounds=25, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(rng=random.Random(0)), devices=2)
+    orch.run()
+    # archive 里出现过 depth>=3 的精英 (深度档 3-4 或 5+ 被填)
+    deep_cells = [k for k in orch.archive.cells if k[3] in ("3-4", "5+")]
+    assert deep_cells, "搜索未探到 depth>=3 (浅层坍缩未破)"
+    # 最深精英确实 >= 3 层
+    max_depth = max(e.genotype.depth for e in orch.archive.cells.values())
+    assert max_depth >= 3, f"最深架构仅 {max_depth} 层"
+
+
 def test_graveyard_prevents_recrash(monkeypatch):
     """crash 进 graveyard 后, evolution 不再提议同配置 (memory 集成)。"""
     mem = MemoryStore(":memory:")

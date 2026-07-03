@@ -56,8 +56,41 @@ def test_bd_dominant_family_by_count():
     assert behavior_descriptor(g, 1000)["spatial_family"] == "local_conv"  # gcn x2 > gat x1
 
 
-def test_all_cells_is_36():
-    assert len(all_cells()) == 36
+def test_all_cells_is_108():
+    """4 轴: 空间族(4) × 时序族(3) × 参数档(3) × 深度档(3) = 108。"""
+    assert len(all_cells()) == 108
+    assert len(set(all_cells())) == 108   # 无重复
+
+
+def test_bd_depth_buckets():
+    """深度档: 1-2 / 3-4 / 5+。"""
+    assert behavior_descriptor(_geno(depth=1), 1000)["depth_bucket"] == "1-2"
+    assert behavior_descriptor(_geno(depth=2), 1000)["depth_bucket"] == "1-2"
+    assert behavior_descriptor(_geno(depth=3), 1000)["depth_bucket"] == "3-4"
+    assert behavior_descriptor(_geno(depth=4), 1000)["depth_bucket"] == "3-4"
+    assert behavior_descriptor(_geno(depth=5), 1000)["depth_bucket"] == "5+"
+    assert behavior_descriptor(_geno(depth=8), 1000)["depth_bucket"] == "5+"
+
+
+def test_cell_index_is_4_tuple():
+    bd = behavior_descriptor(_geno("gcn", "tcn", depth=2), 10_000)
+    ci = cell_index(bd)
+    assert len(ci) == 4
+    assert ci == ("local_conv", "conv", 0, "1-2")
+
+
+def test_depth_separates_cells():
+    """核心回归 (守住浅层坍缩 bug): 家族+参数档相同但深度不同 → 落不同 cell,
+    且更差的深架构**不被**更好的浅架构挤掉 (深探索是零成本加保险)。"""
+    arc = MAPElitesArchive(seed=0)
+    shallow = _geno("gcn", "tcn", depth=2)   # local_conv/conv/param/1-2
+    deep = _geno("gcn", "tcn", depth=4)      # local_conv/conv/param/3-4 (仅深度档不同)
+    # 同 num_params 强制家族+参数档一致, 只有深度档区分
+    assert cell_index(behavior_descriptor(shallow, 60_000)) \
+        != cell_index(behavior_descriptor(deep, 60_000))
+    arc.add(shallow, fitness=18.0, num_params=60_000)   # 好的浅
+    arc.add(deep, fitness=20.0, num_params=60_000)      # 差的深 —— 不该被挤掉
+    assert len(arc) == 2, "深架构被浅架构挤掉了 (坍缩 bug 复现)"
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +132,8 @@ def test_different_bd_different_cells():
 def test_coverage_and_empty():
     arc = MAPElitesArchive(seed=0)
     arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)
-    assert arc.coverage() == 1 / 36
-    assert len(arc.empty_cells()) == 35
+    assert arc.coverage() == 1 / 108
+    assert len(arc.empty_cells()) == 107
     assert cell_index(behavior_descriptor(_geno("gcn", "tcn"), 10_000)) not in arc.empty_cells()
 
 

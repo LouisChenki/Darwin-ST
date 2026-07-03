@@ -91,6 +91,9 @@ def random_mutation(geno: Genotype, rng: random.Random, max_attempts: int = 50) 
     """
     # (类型, 权重) —— op-swap 与 embedding-toggle 高权重(研究指明高价值)
     # Stage2: swap 池纳入类别兼容全算子; 加 swap_joint/toggle_joint 让 joint 时空算子进搜索。
+    # 深度探索修复: add_block 权重 3 > remove_block 1 —— 温和向深偏置打破 depth=2 坍缩 (实测 depth-4
+    # 一次没探到)。非单向: remove_block 仍在, 变异是父代 ±1 层双向游走; 差的深架构被 archive 严格改进
+    # + aging 逐出自动淘汰, 浅层好架构在自己深度格保留 (配 archive depth_bucket 维度)。
     choices = [
         ("swap_spatial", 3),
         ("swap_temporal", 3),
@@ -100,7 +103,7 @@ def random_mutation(geno: Genotype, rng: random.Random, max_attempts: int = 50) 
         ("toggle_joint", 2),
         ("change_hidden", 2),
         ("change_adj_mode", 1),
-        ("add_block", 1),
+        ("add_block", 3),
         ("remove_block", 1),
     ]
     ops = [c for c, _ in choices]
@@ -213,8 +216,8 @@ def seed_genotypes(n: int, rng: random.Random, protected: list[str] | None = Non
     out = []
     for _ in range(n):
         g = random_genotype(
-            depth=rng.choice([1, 2, 3]),
-            spatial=rng.choice(s_pool),
+            depth=rng.choice([2, 3, 4]),   # 深度探索: 播种深一档 (原[1,2,3]) 保证 3-4 深度带 bootstrap 就被采样;
+            spatial=rng.choice(s_pool),     # 丢最弱的 depth-1 (实测 d1 best=20.60 远差于 d2)。
             temporal=rng.choice(t_pool),
             fusion=rng.choice(list(VALID_FUSION)),
             hidden=rng.choice(_HIDDEN_CHOICES),
