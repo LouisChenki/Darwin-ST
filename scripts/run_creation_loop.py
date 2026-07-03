@@ -162,17 +162,22 @@ def main():
     backend = os.environ.get("BACKEND", "auto")
     eval_spec = EvalSpec(dataset=ds, hpo_cfg=hpo_cfg,
                          synth_persist_dir=scope.synth_dir(cache))   # 同 registry 单一源, 主/worker 一致
-    base = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64)  # 故意弱基线, 逼出创造
+    base = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64)  # 非 RESUME 时的弱基线 (逼出创造)
     # RESUME=1 (看门狗重启续跑用): **作用域匹配**暖启动 —— 只从本 (dataset, space_version) 的最优 KEEP
-    # 暖启动。换代/换数据集 (space_version 变) 时查不到旧代最优 → base 留弱基线 → 冷启动公平 bootstrap
-    # (修 Stage2 稀释 bug: 不暖启动旧代局部最优, 且本作用域 synth 目录为空, 新算子不被旧算子碾压)。
+    # 暖启动。换代/换数据集 (space_version 变) 时查不到旧代最优 → base=None → 走 seed_genotypes 冷启动
+    # (公平 bootstrap: 深度 [2,3,4] 播种 + 多样算子。修 Stage2 稀释 + 深度坍缩两个 bug)。
+    #
+    # 铁律 (曾踩坑): base **非 None 会让 evolution 走暖启动分支** (base+变异, 见 _init_seeds),
+    # 绕过 seed_genotypes → 深度播种失效, 全从 depth-1 弱基线变异坍缩浅层。冷启动必须 base=None。
+    # 创造仍会触发 (靠 state.best_genotype 停滞判定, 与 base 无关), 故 base=None 不影响 Tier-2。
     if os.environ.get("RESUME", "0") == "1":
         warm = resolve_warmstart_base(mem, ds, scope)
         if warm is not None:
             base = warm
             print(f"[续跑] 作用域匹配暖启动 base (scope={ds}/{scope.space_version})")
         else:
-            print(f"[续跑] 本作用域 ({ds}/{scope.space_version}) 无历史 → 冷启动公平 seed (新代/新数据集)")
+            base = None   # 真冷启动: 走 seed_genotypes ([2,3,4] 深度播种 + 多样算子)
+            print(f"[续跑] 本作用域 ({ds}/{scope.space_version}) 无历史 → 冷启动公平 seed (base=None, 深度[2,3,4]播种)")
 
     # target_mae: 默认 0.0 不可达(靠 max_rounds 停); 24h 冲 SOTA 设 TARGET_MAE=17.80 程序化停。
     target_mae = float(os.environ.get("TARGET_MAE", "0.0"))

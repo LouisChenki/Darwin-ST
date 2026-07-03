@@ -194,6 +194,17 @@ def test_search_explores_deep_architectures():
     assert max_depth >= 3, f"最深架构仅 {max_depth} 层"
 
 
+def test_cold_start_seeds_deep_not_shallow():
+    """铁律回归 (曾踩坑): base_genotype=None 冷启动 → 走 seed_genotypes 深度[2,3,4]播种,
+    **不是** 从 depth-1 弱基线变异。这守住 run_creation_loop 的 base=None 冷启动接线:
+    若 base 误传非 None (如弱基线), evolution 走暖启动分支绕过深度播种 → 坍缩浅层。"""
+    cfg = OrchestratorConfig(population_size=16, tournament_size=3, max_rounds=1, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=4, base_genotype=None)
+    seed_depths = {g.depth for g in orch.evo._seed_queue}
+    assert seed_depths and seed_depths <= {2, 3, 4}, f"冷启动种子深度应⊆{{2,3,4}}, 实际 {seed_depths}"
+    assert 1 not in seed_depths, "冷启动不该出现 depth-1 (说明误走了弱基线暖启动分支)"
+
+
 def test_graveyard_prevents_recrash(monkeypatch):
     """crash 进 graveyard 后, evolution 不再提议同配置 (memory 集成)。"""
     mem = MemoryStore(":memory:")
