@@ -129,6 +129,9 @@ class Orchestrator:
         self.creation_loop = creation_loop
         self._pending_seed_genotypes: list = []   # 创造产出的待评 genotype 队列
         self._creation_cooldown_until = 0         # 创造后精修窗口: rounds 到此前不再触发创造
+        # 流式驱动状态: refresh 屏障标志 + 完成计数 (每 num_devices 次完成 = 1 轮)
+        self._pending_refresh = False
+        self._completions_since_round = 0
 
         # 实验作用域 (数据集 + 搜索空间代际): trial 落库带 space_version, evolution 按数据集查重。
         from darwin_st.scope import ExperimentScope
@@ -204,7 +207,10 @@ class Orchestrator:
 
     # -- 单轮: 提议一批 → 并行评估 → 消化结果 --
     def step(self) -> list[EvalResult]:
-        """跑一轮: 取 (设备数) 个架构并行评估, 消化结果。返回本轮结果。"""
+        """[legacy 批模式] 跑一轮: 取 (设备数) 个架构并行评估, 消化结果。返回本轮结果。
+
+        run() 已改用流式驱动 (run_stream), 不再调 step()。保留供手动/兼容调用; 无测试直接依赖。
+        """
         batch_size = self.scheduler.num_devices
         genotypes = []
         # 优先评估创造产出的待评 genotype (Tier-2 新算子), 余位由进化补
@@ -219,6 +225,49 @@ class Orchestrator:
         if self.on_round is not None:
             self.on_round(self.state)
         return results
+
+    # -- 流式驱动接线 (run_stream 回调): 4 卡持续满载, 破批同步 --
+
+    def _next_genotype(self):
+        """流式驱动取下一个待评 genotype。refresh 屏障待定时返 None (让在飞排空)。
+
+        优先创造产出的待评 seed (Tier-2 新算子), 余由进化 ask 补 (同 step 的 211-217 语义)。
+        """
+        if self._pending_refresh:
+            return None
+        if self._pending_seed_genotypes:
+            return self._pending_seed_genotypes.pop(0)
+        return self.evo.ask()
+
+    def _after_digest(self) -> None:
+        """每完成一个评估后的轮次/停滞/创造 bookkeeping。
+
+        每 num_devices 次完成 = 1 轮 (rounds == evals // num_devices, 与批模式恒等)。
+        轮末做: 自适应耐心 + 停滞→创造/island_reset + on_round —— 逻辑与旧 run() 主体一致,
+        保持停滞检测/创造/冷却全部按轮次粒度不变。
+        """
+        self._completions_since_round += 1
+        if self._completions_since_round < self.scheduler.num_devices:
+            return
+        self._completions_since_round = 0
+        self.state.rounds += 1
+        # 停滞 → Tier-2 跨域创造(若接入)。创造后进精修窗口: N 轮内不再创造也不 island_reset。
+        if self.cfg.adaptive_patience:
+            self.archive.stagnation_patience = self._adaptive_patience()
+        if self.archive.stagnated():
+            if self.state.rounds >= self._creation_cooldown_until and self._try_creation():
+                # 创造成功: 设冷却窗口, 不立即 island_reset (避免清掉刚注入算子的邻域)
+                self._creation_cooldown_until = self.state.rounds + self.cfg.creation_refine_rounds
+                self.archive._since_improve = 0   # 精修窗口干净计数
+            elif self.state.rounds >= self._creation_cooldown_until:
+                self.archive.island_reset()       # 没接创造 / 无产出 → 岛屿重置解停滞
+        if self.on_round is not None:
+            self.on_round(self.state)
+
+    def _on_stream_result(self, res: EvalResult) -> None:
+        """流式回调: 消化一个结果 + 轮次 bookkeeping。"""
+        self._digest(res)
+        self._after_digest()
 
     def _digest(self, res: EvalResult) -> None:
         """消化一个评估结果: 定状态 → 落 memory → 进 archive → 回灌 evolution → 更新最优。"""
@@ -282,28 +331,20 @@ class Orchestrator:
 
     # -- 主循环 (永不暂停问人) --
     def run(self) -> RunState:
-        """跑到满足停止条件。无 max_* 与可达 target → 真 24/7 (由外部中断)。"""
+        """跑到满足停止条件 (流式驱动: 4 卡持续满载, 慢架构不阻塞快架构)。
+
+        无 max_* 与可达 target → 真 24/7 (由外部中断)。停滞→创造/island_reset + 轮次 bookkeeping
+        搬进 _after_digest (每 num_devices 次完成触发一次), 与旧批模式轮次粒度恒等。
+        """
         try:
-            while True:
-                reason = self.should_stop()
-                if reason is not None:
-                    self.state.stop_reason = reason
-                    break
-                self.step()
-                # 停滞 → Tier-2 跨域创造(若接入)。创造后进精修窗口: N 轮内不再创造也不 island_reset,
-                # 让 NAS+HPO 充分围绕新算子换骨架/精修 (修两阶段衔接节奏: 别浅评一次就又创造)。
-                if self.cfg.adaptive_patience:
-                    # 距离自适应: 每轮按距 SOTA 远近重设耐心 (远→小快创造, 近→大重精修)
-                    self.archive.stagnation_patience = self._adaptive_patience()
-                if self.archive.stagnated():
-                    if self.state.rounds >= self._creation_cooldown_until and self._try_creation():
-                        # 创造成功: 设冷却窗口, 不立即 island_reset (避免清掉刚注入算子的邻域)
-                        self._creation_cooldown_until = self.state.rounds + self.cfg.creation_refine_rounds
-                        self.archive._since_improve = 0   # 精修窗口干净计数 (窗口内真改进会刷新)
-                    elif self.state.rounds >= self._creation_cooldown_until:
-                        # 没接创造层 / 创造无产出 → 岛屿重置解停滞 (FunSearch 式)
-                        self.archive.island_reset()
-                    # 冷却窗口内停滞: 啥都不做, 靠 aging 进化噪声继续围猎新算子
+            self.scheduler.run_stream(
+                next_genotype=self._next_genotype,
+                on_result=self._on_stream_result,
+                should_continue=lambda: self.should_stop() is None,
+                pause_check=lambda: self._pending_refresh,
+                on_resume=lambda: setattr(self, "_pending_refresh", False),
+            )
+            self.state.stop_reason = self.state.stop_reason or self.should_stop() or "stream_end"
         finally:
             self.scheduler.close()   # 进程后端清理持久池 (线程后端 no-op)
         return self.state
@@ -329,9 +370,10 @@ class Orchestrator:
                 self.state.history.append({"event": "creation", "operators": outcome.operator_names,
                                            "bottleneck": outcome.bottleneck,
                                            "n_success": outcome.n_success})
-                # 进程后端: 新 synth 算子已 persist, 回收旧池 → 下批 worker load_persisted 拿到最新
-                # (线程后端 no-op; 主进程 SPATIAL_OPS 已含新算子, 无需 refresh)
-                self.scheduler.refresh_workers()
+                # 进程后端: 新 synth 算子已 persist → 需 refresh_workers 让新 worker load_persisted。
+                # 流式下池常忙, 不能直接 shutdown (会 cancel 在飞丢结果) → 设标志, 由 run_stream 屏障
+                # 排空在飞后再 refresh (线程后端 no-op; 主进程 SPATIAL_OPS 已含新算子)。
+                self._pending_refresh = True
                 return True
             return False
         except Exception as e:

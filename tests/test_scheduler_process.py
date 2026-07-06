@@ -140,3 +140,46 @@ def test_empty_batch_returns_empty():
         assert sched.run_batch([]) == []
     finally:
         sched.close()
+
+
+# ---------------------------------------------------------------------------
+# run_stream 进程后端 (流式真跨进程 + 崩溃兜底)
+# ---------------------------------------------------------------------------
+
+
+def test_run_stream_process_cross_process():
+    """流式进程后端: 真跨进程评估, 每个恰好 digest 一次, 结果回填。"""
+    sched = _make_sched(["cpu", "cpu", "cpu"])
+    try:
+        genos = [random_genotype(depth=1, spatial=s, hidden=64)
+                 for s in ("gcn", "adaptive", "cheb", "gcn", "adaptive", "cheb", "gcn")]
+        it = iter(genos); seen = []
+        sched.run_stream(lambda: next(it, None), lambda r: seen.append(r),
+                         should_continue=lambda: True)
+        assert len(seen) == len(genos)
+        assert all(r.status == "OK" for r in seen)
+        pids = {r.extra["worker_pid"] for r in seen}
+        assert all(p != os.getpid() for p in pids)   # 真跨进程
+    finally:
+        sched.close()
+
+
+def test_run_stream_process_crash_contained():
+    """流式下 worker 抛异常 → 兜底 CRASH, 不传播, 其余正常; 每个仍 digest 一次。"""
+    sched = _make_sched(["cpu", "cpu"])
+    try:
+        genos = [
+            random_genotype(depth=1, spatial="gcn", hidden=64),
+            random_genotype(depth=1, spatial="gcn", hidden=CRASH_HIDDEN),  # 哨兵 → 抛
+            random_genotype(depth=1, spatial="adaptive", hidden=64),
+            random_genotype(depth=1, spatial="cheb", hidden=64),
+        ]
+        it = iter(genos); seen = []
+        sched.run_stream(lambda: next(it, None), lambda r: seen.append(r),
+                         should_continue=lambda: True)
+        assert len(seen) == 4
+        status = {r.genotype.hidden: r.status for r in seen}
+        assert status[CRASH_HIDDEN] == "CRASH"
+        assert sum(1 for r in seen if r.status == "OK") == 3
+    finally:
+        sched.close()

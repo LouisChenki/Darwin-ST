@@ -26,7 +26,13 @@ import os
 import queue
 import threading
 import traceback
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -156,9 +162,9 @@ class GPUScheduler:
 
     用法:
         sched = GPUScheduler(eval_fn, devices=4)        # 或 ['cuda:0',...]
-        results = sched.run_batch([g1, g2, g3, ...])    # 并行评估一批, 返回结果列表
-      或流式:
-        sched.submit(g); ... ; for r in sched.drain(): ...
+        results = sched.run_batch([g1, g2, g3, ...])    # 批模式: 并行一批, 全返回才出结果
+      或流式 (推荐, 4 卡持续满载, 慢架构不阻塞快架构):
+        sched.run_stream(next_genotype, on_result, should_continue)
     """
 
     def __init__(
@@ -294,3 +300,153 @@ class GPUScheduler:
                         self.on_result(results[i])
             self.refresh_workers()
         return [r for r in results if r is not None]
+
+    # -- 流式驱动 (run_stream): 保持 num_devices 个在飞, 4 卡持续满载 --
+
+    def run_stream(
+        self,
+        next_genotype: Callable[[], "Genotype | None"],
+        on_result: Callable[[EvalResult], None],
+        should_continue: Callable[[], bool],
+        pause_check: Callable[[], bool] | None = None,
+        on_resume: Callable[[], None] | None = None,
+    ) -> None:
+        """连续流式评估: 始终保持 ≤num_devices 个评估在飞, 一个完成立即取下一个提交。
+
+        破批同步瓶颈: 批模式下一批必须全返回才落库, 慢架构拖住整批 (4 卡 3 闲)。流式下
+        一个 worker 一空就补新任务 → 卡永远满载。ask/tell 已乱序安全, 每 genotype 仍恰好评估+
+        digest 一次, 计数与批模式恒等, 只变完成顺序与提交时机。
+
+        回调契约:
+          - next_genotype(): 下一个待评 genotype; None = 暂无 (含 refresh 待定期, 让在飞排空)。
+          - on_result(res):  每完成回调 (主进程/线程串行), 调用方在此 digest。
+          - should_continue(): False → 停止提交、排空剩余在飞 (仍 digest, 不丢结果)、返回。
+          - pause_check():   True → 进 refresh 屏障 (排空在飞 → refresh_workers → on_resume → 续)。
+          - on_resume():     屏障后调 (调用方清 pause 标志)。
+        """
+        pause_check = pause_check or (lambda: False)
+        if self._use_process:
+            self._run_stream_process(next_genotype, on_result, should_continue,
+                                     pause_check, on_resume)
+        else:
+            self._run_stream_thread(next_genotype, on_result, should_continue,
+                                    pause_check, on_resume)
+
+    def _run_stream_thread(self, next_genotype, on_result, should_continue,
+                           pause_check, on_resume) -> None:
+        """线程后端流式 (mock/CPU 测试): 一卡一架构由 _device_pool 保证 (同 _eval_one)。"""
+        with ThreadPoolExecutor(max_workers=self.num_devices) as pool:
+            in_flight: dict = {}          # future -> genotype
+
+            def _fill() -> None:
+                while len(in_flight) < self.num_devices:
+                    if pause_check():
+                        break             # refresh 待定: 停止提交, 让在飞排空
+                    g = next_genotype()
+                    if g is None:
+                        break
+                    in_flight[pool.submit(self._eval_one, g)] = g
+
+            _fill()
+            while True:
+                if not in_flight:
+                    _fill()               # 屏障后/冷启动: 重新 prime
+                    if not in_flight:
+                        break             # 无在飞且无新任务 (next_genotype 枯竭) → 结束
+                done, _ = wait(list(in_flight), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    if fut not in in_flight:
+                        continue          # 已被 _drain 消费 (同批 done 多 future 时防重复)
+                    g = in_flight.pop(fut)
+                    res = self._safe_future_result(fut, g)
+                    with self._lock:      # 回调串行化 (同批模式 238)
+                        on_result(res)
+                    if not should_continue():
+                        self._drain(in_flight, on_result, lock=self._lock)
+                        return
+                    if pause_check():
+                        # 屏障: 排空在飞 → refresh → 恢复 (线程后端 refresh 是 no-op, 仍走流程保一致)
+                        self._drain(in_flight, on_result, lock=self._lock)
+                        self.refresh_workers()
+                        if on_resume is not None:
+                            on_resume()
+                        break             # 回外层 while, 顶部重新 prime
+                    _fill()
+
+    def _run_stream_process(self, next_genotype, on_result, should_continue,
+                            pause_check, on_resume) -> None:
+        """进程后端流式 (真实多卡): 持久 spawn 池, round-robin 绑卡 (同 _run_batch_process:274)。"""
+        from concurrent.futures.process import BrokenProcessPool
+
+        n = self.num_devices
+        in_flight: dict = {}              # future -> genotype
+        rr = 0
+
+        def _fill() -> None:
+            nonlocal rr
+            while len(in_flight) < n:
+                if pause_check():
+                    break
+                g = next_genotype()
+                if g is None:
+                    break
+                device = self.devices[rr % n]
+                fut = self._pool.submit(_process_worker, self.eval_spec, n, device, g)
+                in_flight[fut] = g
+                rr += 1
+
+        self._ensure_pool()
+        try:
+            _fill()
+            while True:
+                if not in_flight:
+                    _fill()               # 屏障后/冷启动: 重新 prime
+                    if not in_flight:
+                        break             # 无在飞且无新任务 → 结束
+                done, _ = wait(list(in_flight), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    if fut not in in_flight:
+                        continue          # 已被 _drain 消费
+                    g = in_flight.pop(fut)
+                    res = self._safe_future_result(fut, g)
+                    on_result(res)        # 主进程本就串行
+                    if not should_continue():
+                        self._drain(in_flight, on_result)
+                        return
+                    if pause_check():
+                        self._drain(in_flight, on_result)
+                        self.refresh_workers()
+                        if on_resume is not None:
+                            on_resume()
+                        self._ensure_pool()   # refresh 后重建池, 供下轮 submit
+                        break             # 回外层 while, 顶部重新 prime
+        except BrokenProcessPool as e:
+            # 整池坏: 在飞全标 CRASH + 重建池, 由调用方停止判定决定是否续 (自主性: 崩不中止)
+            for fut, g in list(in_flight.items()):
+                res = EvalResult(genotype=g, status="CRASH",
+                                 fail_reason=f"BrokenProcessPool: {e}")
+                on_result(res)
+            in_flight.clear()
+            self.refresh_workers()
+
+    def _safe_future_result(self, fut, genotype: Genotype) -> EvalResult:
+        """取 future 结果, future 层异常兜底 CRASH (worker 内已兜底, 这里防池层异常)。"""
+        try:
+            return fut.result()
+        except Exception as e:
+            return EvalResult(genotype=genotype, status="CRASH",
+                              fail_reason=f"future: {type(e).__name__}: {e}")
+
+    def _drain(self, in_flight: dict, on_result, lock=None) -> None:
+        """排空剩余在飞 future: 全部等到完成并 digest (不丢结果), 清空 in_flight。"""
+        while in_flight:
+            done, _ = wait(list(in_flight), return_when=FIRST_COMPLETED)
+            for fut in done:
+                g = in_flight.pop(fut)
+                res = self._safe_future_result(fut, g)
+                if lock is not None:
+                    with lock:
+                        on_result(res)
+                else:
+                    on_result(res)
+

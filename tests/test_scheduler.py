@@ -173,3 +173,80 @@ def test_on_result_callback():
     sched = GPUScheduler(fake_eval, devices=2, on_result=lambda r: received.append(r))
     sched.run_batch(_genos(4))
     assert len(received) == 4
+
+
+# ---------------------------------------------------------------------------
+# run_stream 流式驱动 (破批同步: 4 卡持续满载, 慢架构不阻塞快架构)
+# ---------------------------------------------------------------------------
+
+
+def test_run_stream_keeps_pool_full():
+    """核心修复: 峰值并发==设备数; 慢架构不阻塞快架构 (快的先完成)。"""
+    peak = [0]; cur = [0]; lk = threading.Lock(); order = []
+
+    def eval_fn(g, dev):
+        with lk:
+            cur[0] += 1; peak[0] = max(peak[0], cur[0])
+        time.sleep(0.4 if g.hidden == 999 else 0.03)   # hidden=999 是慢架构
+        with lk:
+            cur[0] -= 1
+        return EvalResult(genotype=g, status="OK", mae=20.0, device=dev, extra={"num_params": 5000})
+
+    sched = GPUScheduler(eval_fn, devices=4, backend="thread")
+    from darwin_st.search.genotype import Genotype, STBlock
+    genos = ([Genotype(blocks=[STBlock("gcn", "tcn")], hidden=999)]
+             + [Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64) for _ in range(11)])
+    it = iter(genos); results = []
+    sched.run_stream(lambda: next(it, None),
+                     lambda r: (order.append(r.genotype.hidden), results.append(r)),
+                     should_continue=lambda: True)
+    assert len(results) == 12
+    assert peak[0] == 4, f"峰值并发 {peak[0]} != 4 (没满载)"
+    assert order[0] != 999, "慢架构最先完成 (它阻塞了快的)"
+    assert 999 in order, "慢架构最终也要完成"
+
+
+def test_run_stream_stop_drains_inflight():
+    """停止时排空在飞: should_continue 翻 False 后, 在飞的仍 digest (不丢结果)。"""
+    def eval_fn(g, dev):
+        time.sleep(0.03)
+        return EvalResult(genotype=g, status="OK", mae=20.0, device=dev, extra={"num_params": 5000})
+    sched = GPUScheduler(eval_fn, devices=4, backend="thread")
+    from darwin_st.search.genotype import Genotype, STBlock
+    it = iter([Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64) for _ in range(20)])
+    n = [0]
+    sched.run_stream(lambda: next(it, None), lambda r: n.__setitem__(0, n[0] + 1),
+                     should_continue=lambda: n[0] < 3)
+    # 停在第3个完成, 但 ≤num_devices-1 个在飞排空 → 3..6, 不丢
+    assert 3 <= n[0] <= 3 + sched.num_devices - 1
+
+
+def test_run_stream_refresh_barrier():
+    """refresh 屏障: pause_check True → 排空在飞到 0 才调 refresh_workers → on_resume 后续跑。"""
+    calls = {"refresh": 0}
+    def eval_fn(g, dev):
+        time.sleep(0.02)
+        return EvalResult(genotype=g, status="OK", mae=20.0, device=dev, extra={"num_params": 5000})
+    sched = GPUScheduler(eval_fn, devices=2, backend="thread")
+    sched.refresh_workers = lambda: calls.__setitem__("refresh", calls["refresh"] + 1)
+    from darwin_st.search.genotype import Genotype, STBlock
+    it = iter([Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64) for _ in range(8)])
+    done = [0]; paused = [False]
+    def on_res(r):
+        done[0] += 1
+        if done[0] == 2:
+            paused[0] = True   # 第2个完成后触发屏障
+    sched.run_stream(lambda: next(it, None), on_res, should_continue=lambda: done[0] < 8,
+                     pause_check=lambda: paused[0], on_resume=lambda: paused.__setitem__(0, False))
+    assert calls["refresh"] >= 1, "屏障未调 refresh_workers"
+    assert done[0] == 8, "屏障后未继续跑完 (seed/后续没恢复)"
+
+
+def test_run_stream_exhausts_source():
+    """next_genotype 枯竭 (返 None) → 排空在飞后干净结束, 每个都 digest 恰好一次。"""
+    def eval_fn(g, dev):
+        return EvalResult(genotype=g, status="OK", mae=20.0, device=dev, extra={"num_params": 5000})
+    sched = GPUScheduler(eval_fn, devices=4, backend="thread")
+    it = iter(_genos(7)); seen = []
+    sched.run_stream(lambda: next(it, None), lambda r: seen.append(r), should_continue=lambda: True)
+    assert len(seen) == 7   # 恰好 7 个, 无丢无重

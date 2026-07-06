@@ -55,7 +55,8 @@ def test_runs_and_stops_on_max_rounds():
     state = orch.run()
     assert state.rounds == 5
     assert "max_rounds" in state.stop_reason
-    assert state.evals == 5 * 2  # 每轮 2 卡
+    # 流式: 每轮 2 卡 = 10 评估; 停止时排空在飞可多至 num_devices-1 个 (不丢结果)
+    assert 5 * 2 <= state.evals <= 5 * 2 + orch.scheduler.num_devices - 1
 
 
 def test_max_evals_stop():
@@ -474,3 +475,47 @@ def test_space_version_auto_resolves_when_none():
     cfg = OrchestratorConfig(dataset="PeMS04", max_rounds=1)
     orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
     assert orch.scope.space_version == builtin_op_signature()
+
+
+# ---------------------------------------------------------------------------
+# 流式驱动: 4 卡满载, 慢架构不阻塞 (破批同步瓶颈)
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_pipelined_no_idle():
+    """流式: 慢架构不阻塞快架构 —— 直接用 scheduler.run_stream 证快的先完成 (完成序非提交序)。
+
+    批模式下一批必须全返回才 digest, 慢的拖住整批。流式下快的一完成立即 digest。
+    """
+    import time
+    from darwin_st.optim.scheduler import GPUScheduler
+    from darwin_st.search.genotype import Genotype, STBlock
+    order = []
+
+    def eval_fn(geno, device):
+        time.sleep(0.4 if geno.hidden == 999 else 0.02)   # hidden=999 慢
+        order.append(geno.hidden)
+        return EvalResult(genotype=geno, status="OK", mae=20.0, device=device,
+                          extra={"num_params": 50_000})
+
+    sched = GPUScheduler(eval_fn, devices=4, backend="thread")
+    # 第一个提交的是慢架构, 其余快 → 流式下快的应先完成 digest
+    genos = ([Genotype(blocks=[STBlock("gcn", "tcn")], hidden=999)]
+             + [Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64) for _ in range(11)])
+    it = iter(genos)
+    sched.run_stream(lambda: next(it, None), lambda r: None, should_continue=lambda: True)
+    assert len(order) == 12
+    assert order[0] != 999, "慢架构最先完成 = 阻塞了快架构 (流式失效)"
+    assert order.index(999) >= 3, "慢架构应在多个快架构之后才完成 (证明 4 卡并行不空转)"
+
+
+def test_pipelined_counts_identical_to_batch():
+    """流式与批模式计数恒等: 每 genotype 恰好评估+digest 一次 (eval/keep 计数不变)。"""
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=6, tournament_size=3,
+                             max_rounds=8, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(rng=random.Random(1)), devices=2)
+    state = orch.run()
+    # 每次评估恰好一条 history + 计数自洽
+    assert state.evals == len([h for h in state.history if "eval" in h])
+    assert state.n_keep + state.n_discard + state.n_crash == state.evals
+    assert state.rounds == 8   # 每 num_devices 完成 = 1 轮
