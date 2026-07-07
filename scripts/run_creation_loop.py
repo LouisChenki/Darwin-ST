@@ -156,7 +156,9 @@ def main():
 
     # --- 优化引擎 (真实训练) ---
     hpo_cfg = HPOConfig(n_trials=hpo_trials, max_epochs=max_epochs,
-                        min_resource=2, reduction_factor=3, n_startup_trials=2)
+                        min_resource=2, reduction_factor=3, n_startup_trials=2,
+                        early_stop_patience=_env_int("EARLY_STOP_PATIENCE", 0),  # >0 启用收敛早停
+                        early_stop_min_delta=float(os.environ.get("EARLY_STOP_MIN_DELTA", "0.001")))
     eval_fn = make_eval_fn(ds, hpo_cfg=hpo_cfg)
     # 进程后端: worker 自建 eval_fn + 从 persist_dir 重载 synth 算子 (spawn 子进程丢进程全局 SPATIAL_OPS)
     backend = os.environ.get("BACKEND", "auto")
@@ -192,7 +194,13 @@ def main():
                              adaptive_patience=os.environ.get("ADAPTIVE_PATIENCE", "0") == "1",
                              patience_base=_env_int("PATIENCE_BASE", 3),
                              patience_k=float(os.environ.get("PATIENCE_K", "5.0")),
-                             patience_cap=_env_int("PATIENCE_CAP", 12))
+                             patience_cap=_env_int("PATIENCE_CAP", 12),
+                             # 距离自适应 HPO trials (Gap-Annealed HPO Depth): 远/冷启动少调快筛, 近 SOTA 深调
+                             adaptive_hpo_trials=os.environ.get("ADAPTIVE_HPO_TRIALS", "0") == "1",
+                             hpo_trials_base=_env_int("HPO_TRIALS_BASE", 4),
+                             hpo_trials_cap=_env_int("HPO_TRIALS_CAP", 12),
+                             hpo_trials_k=float(os.environ.get("HPO_TRIALS_K", "2.0")),
+                             hpo_trials_eps=float(os.environ.get("HPO_TRIALS_EPS", "0.3")))
 
     def on_round(state):
         b = state.best_mae

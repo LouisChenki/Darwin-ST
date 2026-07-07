@@ -32,12 +32,13 @@ class TrainTrace:
     grad_norm_max: list[float] = field(default_factory=list)   # 每 epoch 梯度总范数最大值
 
     # 标量
-    n_epochs_run: int = 0           # 实际跑了几 epoch (时间/NaN 熔断可能 < max)
+    n_epochs_run: int = 0           # 实际跑了几 epoch (时间/NaN/收敛熔断可能 < max)
     max_epochs: int = 0
     best_epoch: int = -1            # val_mae 最优的 epoch 下标
     best_mae: float = float("inf")
     final_train_loss: float = float("inf")
     stopped_early: bool = False     # 被时间熔断截断 (非自然收敛)
+    converged: bool = False         # 被收敛早停截断 (val 曲线平台 patience 轮无实质改进; best 已存零损失)
     nan_hit: bool = False           # 训练中遇到 NaN/Inf loss
     lr_schedule: str = "none"       # 该 trial 用的调度 (none/cosine/plateau)
     lr: float = 0.0                 # 该 trial lr (辅助梯度诊断)

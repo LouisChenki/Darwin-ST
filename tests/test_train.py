@@ -155,3 +155,58 @@ def test_evaluate_architecture_as_orchestrator_eval_fn(tiny_data):
     state = orch.run()
     assert state.rounds == 2
     assert state.evals >= 2
+
+
+# ---------------------------------------------------------------------------
+# 收敛早停 (Part A: 依训练动态自适应训练预算, 多 benchmark 地基)
+# ---------------------------------------------------------------------------
+
+
+def test_train_one_early_stops_on_plateau(tiny_data):
+    """lr=0 → 权重不更新 → val 立即平台 → 收敛早停切在 patience 后, best 已存零损失。"""
+    prof, data_dir, adj = tiny_data
+    geno = random_genotype(depth=1, hidden=16)
+    mae, trace = train_one(geno, {"lr": 0.0, "batch_size": 16}, data_dir, prof, adj,
+                           device="cpu", max_epochs=30, early_stop_patience=3)
+    assert trace.converged, "平台未触发收敛早停"
+    assert trace.n_epochs_run < 30, f"没提前停 (跑满 {trace.n_epochs_run})"
+    assert np.isfinite(mae) and abs(mae - trace.best_mae) < 1e-9, "返回值非 best"
+
+
+def test_train_one_no_early_stop_when_improving(tiny_data):
+    """正常 lr 训练几 epoch: 还在改进 (或没连续平台够 patience) → 不误停跑满。"""
+    prof, data_dir, adj = tiny_data
+    geno = random_genotype(depth=1, spatial="gcn", temporal="tcn", hidden=16)
+    # patience 设得比 max_epochs 大 → 即使有噪声也不会触发 (验证不误停)
+    mae, trace = train_one(geno, {"lr": 1e-2, "batch_size": 16}, data_dir, prof, adj,
+                           device="cpu", max_epochs=5, early_stop_patience=10)
+    assert not trace.converged
+    assert trace.n_epochs_run == 5   # 跑满
+
+
+def test_train_one_early_stop_off_by_default(tiny_data):
+    """early_stop_patience=0 (默认) → 检测关, 跑满 max_epochs (向后兼容)。"""
+    prof, data_dir, adj = tiny_data
+    geno = random_genotype(depth=1, hidden=16)
+    mae, trace = train_one(geno, {"lr": 0.0, "batch_size": 16}, data_dir, prof, adj,
+                           device="cpu", max_epochs=6)   # 不传 early_stop_patience → 默认 0
+    assert not trace.converged
+    assert trace.n_epochs_run == 6   # 平台但默认关 → 跑满
+
+
+def test_train_one_early_stop_reports_asha_every_epoch(tiny_data):
+    """ASHA 共存: 即使收敛早停开, trial.report 仍每 epoch 调 (两机制正交不冲突)。"""
+    prof, data_dir, adj = tiny_data
+    geno = random_genotype(depth=1, hidden=16)
+
+    class _StubTrial:
+        def __init__(self): self.reports = []
+        def report(self, mae, epoch): self.reports.append(epoch)
+        def should_prune(self): return False   # 不剪, 让早停自己触发
+
+    stub = _StubTrial()
+    mae, trace = train_one(geno, {"lr": 0.0, "batch_size": 16}, data_dir, prof, adj,
+                           device="cpu", max_epochs=20, trial=stub, early_stop_patience=3)
+    assert trace.converged
+    # report 调用数 == 实际跑的 epoch 数 (每 epoch 都 report, 早停不跳过 ASHA)
+    assert len(stub.reports) == trace.n_epochs_run

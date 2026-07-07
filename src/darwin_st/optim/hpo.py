@@ -42,11 +42,14 @@ class HPOConfig:
     """HPO 配置 (每架构一次调参的预算与搜索空间边界)。"""
 
     n_trials: int = 12               # 每架构试多少组超参
-    max_epochs: int = 27             # 单 trial 最大 epoch (= ASHA max_resource)
+    max_epochs: int = 27             # 单 trial 最大 epoch (= ASHA max_resource, 也是收敛早停硬上限)
     min_resource: int = 3            # ASHA 首 rung epoch (设在 warmup 之后)
     reduction_factor: int = 3        # ASHA eta (3 比默认 4 温和, 适合噪声 MAE)
     n_startup_trials: int = 8        # TPE 前 n 个随机 (小预算下调低)
     seed: int = 0
+    # 收敛早停 (per-run/per-dataset 自适应训练预算): >0 才启用, 0=关(跑满 max_epochs)。
+    early_stop_patience: int = 0     # val 连续几 epoch 无实质改进 → 停 (best 已存, 零损失)
+    early_stop_min_delta: float = 0.001  # 相对改进阈值 (0.1%), scale-free 跨数据集
     # 搜索空间边界
     lr_range: tuple[float, float] = (1e-4, 1e-2)
     wd_range: tuple[float, float] = (1e-6, 1e-3)

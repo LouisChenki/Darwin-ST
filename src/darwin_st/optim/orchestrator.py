@@ -76,6 +76,14 @@ class OrchestratorConfig:
     patience_k: float = 5.0               # 反比强度
     patience_cap: int = 12                # 上限 (防 gap→0 时发散)
     patience_eps: float = 0.5             # 分母平滑
+    # 距离自适应 HPO trials (Gap-Annealed HPO Depth): 每架构调参预算随距 SOTA 自适应。
+    #   同 patience 的边际收益递减动机, 但作用在 Tier-1 评估层 (每架构调多狠), 非 Tier-2 创造节奏。
+    #   trials(gap)=clip(round(base+k/(gap+eps)), base, cap)。远/冷启动→base(广撒网快筛), 近 SOTA→cap(精调)。
+    adaptive_hpo_trials: bool = False     # True 启用; False 用固定 HPO n_trials (行为不变)
+    hpo_trials_base: int = 4              # 远处/冷启动基线 trials (少调快筛, 提速核心)
+    hpo_trials_cap: int = 12              # 近 SOTA 上限 (=当前固定 n_trials, 无回归)
+    hpo_trials_k: float = 2.0             # 反比强度 (陡降: 远处明显省)
+    hpo_trials_eps: float = 0.3           # 分母平滑
 
 
 @dataclass
@@ -195,6 +203,25 @@ class Orchestrator:
         p = cfg.patience_base + cfg.patience_k / (gap + cfg.patience_eps)
         return int(min(cfg.patience_cap, round(p)))
 
+    def _adaptive_hpo_trials(self) -> int:
+        """距离自适应 HPO trials (Gap-Annealed HPO Depth): 每架构调参预算随距 SOTA 自适应。
+        trials(gap)=clip(round(base+k/(gap+eps)), base, cap), gap=best_mae-sota_mae。
+
+        近 SOTA (gap 小) → trials 大 → 深调超参榨干每架构 (边际收益递减下每点提升难得, 值得多投入)。
+        远/冷启动/gap 未知 → trials 小 (=base) → 广撒网少调快筛 (探索期多试架构比精调每个更快逼近, 提速核心)。
+        注: 与 patience 兜底不同 —— patience 未知时用 cap(多精修), trials 未知时用 base(先快筛), 语义相反。
+        gap<=0 (已达/超 SOTA) → cap (死磕精调)。
+        """
+        cfg = self.cfg
+        # 冷启动/gap 未知 → base (广撒网快筛, 修正: 不是 cap)
+        if self.state.sota_mae is None or self.state.best_mae >= float("inf"):
+            return cfg.hpo_trials_base
+        gap = self.state.best_mae - self.state.sota_mae
+        if gap <= 0:
+            return cfg.hpo_trials_cap
+        t = cfg.hpo_trials_base + cfg.hpo_trials_k / (gap + cfg.hpo_trials_eps)
+        return int(min(cfg.hpo_trials_cap, max(cfg.hpo_trials_base, round(t))))
+
     def should_stop(self) -> str | None:
         """返回停止原因字符串, 或 None (继续)。"""
         if self._target is not None and self.state.best_mae < self._target:
@@ -236,8 +263,13 @@ class Orchestrator:
         if self._pending_refresh:
             return None
         if self._pending_seed_genotypes:
-            return self._pending_seed_genotypes.pop(0)
-        return self.evo.ask()
+            return self._pending_seed_genotypes.pop(0)   # 创造 seed: 已带 _seed_meta 显式大 HPO, 不覆盖
+        g = self.evo.ask()
+        # 自适应 HPO trials: 只盖进化 genotype (无 _seed_meta), 按实时 gap 定调参预算。
+        # 创造 seed 已有 _seed_meta (显式大 HPO), getattr 判别保证不被覆盖。
+        if self.cfg.adaptive_hpo_trials and getattr(g, "_seed_meta", None) is None:
+            g._seed_meta = {"hpo_trials": self._adaptive_hpo_trials()}
+        return g
 
     def _after_digest(self) -> None:
         """每完成一个评估后的轮次/停滞/创造 bookkeeping。

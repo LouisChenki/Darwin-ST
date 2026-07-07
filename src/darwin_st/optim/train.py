@@ -67,11 +67,17 @@ def train_one(
     trial: optuna.Trial | None = None,
     max_epochs: int = 27,
     time_budget_s: float = 2400.0,
+    early_stop_patience: int = 0,
+    early_stop_min_delta: float = 0.001,
 ) -> tuple[float, TrainTrace]:
     """用给定超参训练一个架构, 返回 (最优 val-MAE 真实尺度 masked, TrainTrace 训练动态轨迹)。
 
     每 epoch 向 trial.report 上报 val-MAE 供 ASHA 剪枝(trial 为 None 则跳过剪枝)。
-    NaN/时间熔断触发时提前返回当前最优(或 inf)。
+    NaN/时间/收敛熔断触发时提前返回当前最优(或 inf)。
+
+    收敛早停 (early_stop_patience>0 才启用): val-MAE 连续 patience 轮无 >min_delta(相对) 改进 → 停。
+    因 best-checkpoint 已存最优, 早停零损失。max_epochs 是硬上限(安全), 早停是软自适应切(省算力)。
+    相对 min_delta (默认 0.1%) 跨数据集 scale-free (PeMS04~18 与 METR-LA~3 同一相对阈值都有意义)。
 
     TrainTrace 在 epoch 边界聚合训练动态 (loss 曲线/梯度范数/收敛标志), 供 Tier-2 LLM 瓶颈诊断。
     采集点全在现有边界, 开销 <0.1% (每 epoch 几个 .item() + append, 相对一次全量 val evaluate 可忽略)。
@@ -105,6 +111,7 @@ def train_one(
 
     trace = TrainTrace(max_epochs=max_epochs, lr_schedule=sched_kind, lr=lr)
     best_mae = float("inf")
+    epochs_since_improve = 0                # 收敛早停计数: 连续多少 epoch 无 >min_delta(相对) 改进
     start = time.time()
     for epoch in range(max_epochs):
         model.train()
@@ -140,7 +147,10 @@ def train_one(
         met = P.evaluate(model, data_dir, "val", batch_size=batch_size, device=device,
                          null_val=profile.null_val)
         mae = met["mae"]
-        if mae < best_mae:                               # best-checkpoint(取最优步)
+        # 收敛早停计数: 用**相对**阈值判有无实质改进 (best 更新前算, scale-free 跨数据集)
+        improved = mae < best_mae * (1.0 - early_stop_min_delta)
+        epochs_since_improve = 0 if improved else epochs_since_improve + 1
+        if mae < best_mae:                               # best-checkpoint(取最优步, 严格 <)
             best_mae = mae
             trace.best_epoch = epoch
 
@@ -164,6 +174,12 @@ def train_one(
                 trace.best_mae = best_mae
                 trace.final_train_loss = trace.train_loss[-1] if trace.train_loss else float("inf")
                 raise optuna.TrialPruned()
+
+        # 收敛早停: val 平台 patience 轮无实质改进 → 停 (best 已存, 零损失)。与 ASHA 正交:
+        # ASHA 跨 trial 剪坏配置, 早停在单 trial 内切收敛好配置; 此 trial 仍是 COMPLETE(非 pruned)。
+        if early_stop_patience and epochs_since_improve >= early_stop_patience:
+            trace.converged = True
+            break
 
         if time.time() - start > time_budget_s:          # 时间熔断
             trace.stopped_early = True
@@ -201,7 +217,9 @@ def evaluate_architecture(
 
     def train_eval_fn(geno, hps, trial):
         mae, trace = train_one(geno, hps, data_dir, profile, adj, device, trial=trial,
-                               max_epochs=hpo_cfg.max_epochs)
+                               max_epochs=hpo_cfg.max_epochs,
+                               early_stop_patience=hpo_cfg.early_stop_patience,
+                               early_stop_min_delta=hpo_cfg.early_stop_min_delta)
         # 把训练轨迹挂到 trial user_attr (存 dict: Optuna 要求 JSON-able + 跨进程更稳)
         try:
             trial.set_user_attr("trace", asdict(trace))

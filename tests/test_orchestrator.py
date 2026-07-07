@@ -519,3 +519,58 @@ def test_pipelined_counts_identical_to_batch():
     assert state.evals == len([h for h in state.history if "eval" in h])
     assert state.n_keep + state.n_discard + state.n_crash == state.evals
     assert state.rounds == 8   # 每 num_devices 完成 = 1 轮
+
+
+# ---------------------------------------------------------------------------
+# 自适应 HPO trials (Part B: Gap-Annealed HPO Depth, 距 SOTA 自适应调参预算)
+# ---------------------------------------------------------------------------
+
+
+def test_adaptive_hpo_trials_scales_with_gap():
+    """距离自适应: gap 大→base(广撒网), gap 小→cap(精调); 冷启动/未知→base; gap<0→cap。"""
+    cfg = OrchestratorConfig(adaptive_hpo_trials=True, hpo_trials_base=4, hpo_trials_cap=12,
+                             hpo_trials_k=2.0, hpo_trials_eps=0.3)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    orch.state.sota_mae = 17.8
+    orch.state.best_mae = 19.21   # gap=1.41 → 少 trials (远)
+    far = orch._adaptive_hpo_trials()
+    orch.state.best_mae = 18.0    # gap=0.20 → 多 trials (近)
+    near = orch._adaptive_hpo_trials()
+    assert far < near, "近 SOTA 应更多 trials"
+    assert cfg.hpo_trials_base <= far <= cfg.hpo_trials_cap
+    # gap<=0 (已超 SOTA) → cap 死磕精调
+    orch.state.best_mae = 17.0
+    assert orch._adaptive_hpo_trials() == cfg.hpo_trials_cap
+    # 冷启动 (best=inf) → base (广撒网快筛, 修正: 不是 cap)
+    orch.state.best_mae = float("inf")
+    assert orch._adaptive_hpo_trials() == cfg.hpo_trials_base
+    # sota 未知 → base
+    orch.state.sota_mae = None
+    assert orch._adaptive_hpo_trials() == cfg.hpo_trials_base
+
+
+def test_next_genotype_stamps_evo_not_creation_seed():
+    """_next_genotype 只盖进化 genotype 的 hpo_trials, 不覆盖创造 seed 的显式大 HPO。"""
+    from darwin_st.search.genotype import Genotype, STBlock
+    cfg = OrchestratorConfig(dataset="PeMS04", adaptive_hpo_trials=True)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=2)
+    orch.state.sota_mae = 17.8
+    orch.state.best_mae = 19.21
+    # 创造 seed 带 _seed_meta 大 HPO → 原样返回不被盖
+    seed = Genotype(blocks=[STBlock("gcn", "tcn")])
+    seed._seed_meta = {"hpo_trials": 20, "is_creation_seed": True}
+    orch._pending_seed_genotypes = [seed]
+    g1 = orch._next_genotype()
+    assert g1._seed_meta["hpo_trials"] == 20, "创造 seed 大 HPO 被覆盖!"
+    # evo genotype 被盖成自适应值
+    g2 = orch._next_genotype()
+    assert getattr(g2, "_seed_meta", None) is not None
+    assert g2._seed_meta["hpo_trials"] == orch._adaptive_hpo_trials()
+
+
+def test_adaptive_hpo_trials_off_by_default():
+    """默认关 → evo genotype 无 _seed_meta → worker 用固定 n_trials (行为不变)。"""
+    cfg = OrchestratorConfig(dataset="PeMS04")   # adaptive_hpo_trials 默认 False
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=2)
+    g = orch._next_genotype()
+    assert getattr(g, "_seed_meta", None) is None
