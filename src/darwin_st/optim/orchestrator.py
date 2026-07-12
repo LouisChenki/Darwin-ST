@@ -255,16 +255,41 @@ class Orchestrator:
 
     # -- 流式驱动接线 (run_stream 回调): 4 卡持续满载, 破批同步 --
 
+    def _archive_parent_p(self) -> float:
+        """走 archive.select() 选父代的概率 (0..1)。默认 0.5; env ARCHIVE_PARENT_P 覆盖, =0 退回纯 aging。
+
+        根因 B 修复: 接通 MAP-Elites 正典父代选择 (Mouret & Clune 2015: 从 archive 均匀选 elite → 变异)。
+        此前 archive.select() 生产零调用, 108 格深度保护形同虚设。冷启动 archive 空时自动回落 evo.ask()。
+        """
+        import os
+        raw = os.environ.get("ARCHIVE_PARENT_P")
+        if raw is None:
+            return 0.5
+        try:
+            return max(0.0, min(1.0, float(raw)))
+        except ValueError:
+            return 0.5
+
     def _next_genotype(self):
         """流式驱动取下一个待评 genotype。refresh 屏障待定时返 None (让在飞排空)。
 
-        优先创造产出的待评 seed (Tier-2 新算子), 余由进化 ask 补 (同 step 的 211-217 语义)。
+        优先创造产出的待评 seed (Tier-2 新算子), 否则:
+          - 概率 p_archive 走 MAP-Elites 父代选择 (archive.select() → 变异), 恢复 QD 多样性反压;
+          - 否则 evo.ask() (aging 锦标赛)。archive 空 (冷启动) 自动回落 evo.ask()。
         """
         if self._pending_refresh:
             return None
         if self._pending_seed_genotypes:
             return self._pending_seed_genotypes.pop(0)   # 创造 seed: 已带 _seed_meta 显式大 HPO, 不覆盖
-        g = self.evo.ask()
+        # 根因 B: 概率走 archive 父代选择 (正典 MAP-Elites); archive 空则回落 aging
+        g = None
+        if self._archive_parent_p() > 0.0 and self.evo.rng.random() < self._archive_parent_p():
+            elite = self.archive.select()
+            if elite is not None:
+                from darwin_st.search.evolution import random_mutation
+                g = random_mutation(elite.genotype, self.evo.rng)
+        if g is None:
+            g = self.evo.ask()
         # 自适应 HPO trials: 只盖进化 genotype (无 _seed_meta), 按实时 gap 定调参预算。
         # 创造 seed 已有 _seed_meta (显式大 HPO), getattr 判别保证不被覆盖。
         if self.cfg.adaptive_hpo_trials and getattr(g, "_seed_meta", None) is None:
@@ -292,7 +317,11 @@ class Orchestrator:
                 self._creation_cooldown_until = self.state.rounds + self.cfg.creation_refine_rounds
                 self.archive._since_improve = 0   # 精修窗口干净计数
             elif self.state.rounds >= self._creation_cooldown_until:
-                self.archive.island_reset()       # 没接创造 / 无产出 → 岛屿重置解停滞
+                cleared = self.archive.island_reset()   # 没接创造 / 无产出 → 岛屿重置解停滞
+                # 根因 B 修复: 把存活精英回灌进化种子队列, 让逃逸真正作用到被 ask 消费的种群
+                # (否则 island_reset 只重置停滞计数, 对实际选择是 no-op)。
+                if cleared:
+                    self.evo.reseed([e.genotype for e in self.archive.elites()])
         if self.on_round is not None:
             self.on_round(self.state)
 

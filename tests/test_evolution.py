@@ -267,3 +267,96 @@ def test_ask_dataset_none_backward_compat():
     for _ in range(8):
         evo.tell(evo.ask(), 5.0)
     assert seen_ds and all(d is None for d in seen_ds)
+
+
+# ---------------------------------------------------------------------------
+# 根因 A 修复: 变异池来源加权 (_weighted_pick) —— 保内置可达
+# ---------------------------------------------------------------------------
+
+
+def _register_fake_synth(n: int) -> list[str]:
+    """注册 n 个假 synth 空间算子 (类别 spatiotemporal), 返回注册名。用后由调用方清理。"""
+    from darwin_st.search import operators as ops_mod
+    names = []
+    for i in range(n):
+        name = f"synth_fake_{i}"
+        ops_mod.SPATIAL_OPS[name] = ops_mod.SPATIAL_OPS["gcn"]  # 复用工厂, 仅测采样比例
+        ops_mod.OP_CATEGORY[name] = "spatiotemporal"
+        names.append(name)
+    return names
+
+
+def _cleanup_synth(names: list[str]) -> None:
+    from darwin_st.search import operators as ops_mod
+    for n in names:
+        ops_mod.SPATIAL_OPS.pop(n, None)
+        ops_mod.OP_CATEGORY.pop(n, None)
+
+
+def test_weighted_pick_lifts_builtin_share(monkeypatch):
+    """117 synth 淹没 6 内置时, 默认权重 0.5 下内置整体命中率应 ~50% (远高于均匀的 ~5%)。"""
+    from darwin_st.search.evolution import _weighted_pick, _spatial_slot_pool
+    from darwin_st.search.operators import SYNTH_PREFIX
+
+    names = _register_fake_synth(117)
+    try:
+        monkeypatch.delenv("BUILTIN_MUTATION_WEIGHT", raising=False)  # 默认 0.5
+        rng = random.Random(0)
+        pool = _spatial_slot_pool()
+        # 前提: 池里 synth 远多于内置 (淹没场景)
+        n_builtin = sum(1 for o in pool if not o.startswith(SYNTH_PREFIX))
+        n_synth = sum(1 for o in pool if o.startswith(SYNTH_PREFIX))
+        assert n_synth > 5 * n_builtin
+        picks = [_weighted_pick(pool, rng) for _ in range(4000)]
+        builtin_share = sum(1 for p in picks if not p.startswith(SYNTH_PREFIX)) / len(picks)
+        assert 0.4 < builtin_share < 0.6   # ~50%, 而非均匀的 ~5%
+    finally:
+        _cleanup_synth(names)
+
+
+def test_weighted_pick_zero_weight_is_uniform(monkeypatch):
+    """BUILTIN_MUTATION_WEIGHT=0 退回对全池均匀 (向后兼容): 内置命中率回到 ~n_builtin/n_pool。"""
+    from darwin_st.search.evolution import _weighted_pick, _spatial_slot_pool
+    from darwin_st.search.operators import SYNTH_PREFIX
+
+    names = _register_fake_synth(117)
+    try:
+        monkeypatch.setenv("BUILTIN_MUTATION_WEIGHT", "0")
+        rng = random.Random(0)
+        pool = _spatial_slot_pool()
+        n_builtin = sum(1 for o in pool if not o.startswith(SYNTH_PREFIX))
+        expected = n_builtin / len(pool)
+        picks = [_weighted_pick(pool, rng) for _ in range(4000)]
+        share = sum(1 for p in picks if not p.startswith(SYNTH_PREFIX)) / len(picks)
+        assert abs(share - expected) < 0.03   # 贴近均匀期望
+    finally:
+        _cleanup_synth(names)
+
+
+def test_weighted_pick_single_source_falls_back(monkeypatch):
+    """池里只有内置 (无 synth, 如冷启动) → 加权退化为均匀, 不崩且全返内置。"""
+    from darwin_st.search.evolution import _weighted_pick
+    from darwin_st.search.operators import SYNTH_PREFIX
+
+    monkeypatch.delenv("BUILTIN_MUTATION_WEIGHT", raising=False)
+    rng = random.Random(0)
+    pool = ["gcn", "gat", "diffusion"]   # 纯内置
+    picks = {_weighted_pick(pool, rng) for _ in range(200)}
+    assert picks <= set(pool)
+    assert all(not p.startswith(SYNTH_PREFIX) for p in picks)
+
+
+def test_reseed_enqueues_survivors():
+    """reseed 把 genotype 塞回 bootstrap 种子队列, 下次 ask 优先派发; 去重已在队/在评估的。"""
+    rng_geno = [random_genotype(depth=2 + i) for i in range(3)]
+    evo = AgingEvolution(population_size=4, tournament_size=2, seed=0)
+    # 先耗尽 bootstrap 种子, 让 _seed_queue 空
+    while evo.is_bootstrapping:
+        evo.tell(evo.ask(), 5.0)
+    assert not evo.is_bootstrapping
+    added = evo.reseed(rng_geno)
+    assert added == 3
+    assert evo.is_bootstrapping        # 重新有种子待派
+    # 再 reseed 同样的 → 去重, 不重复入队
+    added2 = evo.reseed(rng_geno)
+    assert added2 == 0

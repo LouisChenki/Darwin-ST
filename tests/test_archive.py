@@ -227,3 +227,52 @@ def test_archive_accumulates_diverse_elites():
     # 应填充多个 cell (多样性), 但不超过 36
     assert 5 <= len(arc) <= 36
     assert arc.best() is not None
+
+
+# ---------------------------------------------------------------------------
+# 根因 C 修复: BD 对 synth 算子分族 (不再全塌 none/conv)
+# ---------------------------------------------------------------------------
+
+
+def test_synth_ops_disperse_across_families():
+    """多个不同 synth 空间算子应散到多个空间族 (而非全塌 'none'), 否则 108 格 QD 塌缩。"""
+    from darwin_st.optim.archive import _dominant_spatial_family
+    fams = set()
+    for i in range(12):
+        g = Genotype(blocks=[STBlock(f"synth_op_{i}", "tcn")])
+        fams.add(_dominant_spatial_family(g))
+    assert "none" not in fams        # synth 不该被判成"无空间算子"
+    assert len(fams) >= 2            # 散开到多族 (哈希分散)
+
+
+def test_synth_temporal_disperse_not_all_conv():
+    """多个 synth 时序算子不应全落 'conv' 族。"""
+    from darwin_st.optim.archive import _dominant_temporal_family
+    fams = set()
+    for i in range(12):
+        g = Genotype(blocks=[STBlock("gcn", f"synth_t_{i}")])
+        fams.add(_dominant_temporal_family(g))
+    assert len(fams) >= 2
+
+
+def test_synth_family_is_stable():
+    """同一 synth 名多次映射到同一族 (稳定哈希, 跨进程一致)。"""
+    from darwin_st.optim.archive import _dominant_spatial_family
+    g = Genotype(blocks=[STBlock("synth_stable_xyz", "tcn")])
+    f1 = _dominant_spatial_family(g)
+    f2 = _dominant_spatial_family(g)
+    assert f1 == f2
+
+
+def test_builtin_family_unchanged():
+    """内置算子分族行为不变 (回归): gcn→local_conv, gat→attention。"""
+    from darwin_st.optim.archive import _dominant_spatial_family
+    assert _dominant_spatial_family(Genotype(blocks=[STBlock("gcn", "tcn")])) == "local_conv"
+    assert _dominant_spatial_family(Genotype(blocks=[STBlock("gat", "tcn")])) == "attention"
+    assert _dominant_spatial_family(Genotype(blocks=[STBlock("identity", "tcn")])) == "none"
+
+
+def test_all_cells_still_108():
+    """网格总格数保持 108 (4×3×3×3)。"""
+    assert len(all_cells()) == 108
+    assert MAPElitesArchive.TOTAL_CELLS == 108

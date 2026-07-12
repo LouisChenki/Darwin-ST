@@ -38,7 +38,7 @@ from darwin_st.search.genotype import (
     mutate,
     random_genotype,
 )
-from darwin_st.search.operators import SPATIOTEMPORAL_OPS, op_category
+from darwin_st.search.operators import SPATIOTEMPORAL_OPS, SYNTH_PREFIX, op_category
 
 __all__ = ["Member", "AgingEvolution", "random_mutation", "seed_genotypes"]
 
@@ -69,6 +69,41 @@ def _temporal_slot_pool() -> list[str]:
 def _joint_pool() -> list[str]:
     """可坐"一体槽"的时空算子: spatiotemporal 类 (含 synth_ 默认归此类)。"""
     return [o for o in _all_search_ops() if op_category(o) == "spatiotemporal"]
+
+
+def _builtin_weight() -> float:
+    """内置算子在变异采样中占的**整体**权重 (0..1)。默认 0.5 (内置与 synth 各半)。
+
+    env BUILTIN_MUTATION_WEIGHT 覆盖; =0 退回旧的对全池均匀 rng.choice (向后兼容)。
+    根因 A 修复: 117 synth 淹没 6 内置 → 均匀采样下内置命中率仅 ~5%, 达到旧最优的
+    adaptive+gru+attn 组合统计上不可达。按来源加权把内置整体命中率抬回 ~50%。
+    """
+    import os
+    raw = os.environ.get("BUILTIN_MUTATION_WEIGHT")
+    if raw is None:
+        return 0.5
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return 0.5
+
+
+def _weighted_pick(pool: list[str], rng: random.Random) -> str:
+    """从候选池按**来源加权**采一个算子: 内置整体占 w, synth 整体占 1-w, 组内均匀。
+
+    w=_builtin_weight()。w<=0 或某一侧为空 → 退回对全池均匀 rng.choice (向后兼容/退化保护)。
+    组内均匀 = 每个内置算子概率 w/n_builtin, 每个 synth 算子 (1-w)/n_synth。
+    """
+    w = _builtin_weight()
+    if w <= 0.0:
+        return rng.choice(pool)
+    builtin = [o for o in pool if not o.startswith(SYNTH_PREFIX)]
+    synth = [o for o in pool if o.startswith(SYNTH_PREFIX)]
+    if not builtin or not synth:
+        return rng.choice(pool)   # 只有一侧 → 均匀即可
+    weights = [w / len(builtin) if not o.startswith(SYNTH_PREFIX) else (1.0 - w) / len(synth)
+               for o in pool]
+    return rng.choices(pool, weights=weights, k=1)[0]
 
 
 def _all_search_ops() -> list[str]:
@@ -130,13 +165,13 @@ def _apply_random(geno: Genotype, op: str, rng: random.Random) -> Genotype:
         i = rng.randrange(n)
         cur = geno.blocks[i].spatial_op
         cands = [o for o in _spatial_slot_pool() if o != cur]
-        return mutate(geno, "swap_spatial", index=i, new_op=rng.choice(cands))
+        return mutate(geno, "swap_spatial", index=i, new_op=_weighted_pick(cands, rng))
 
     if op == "swap_temporal":
         i = rng.randrange(n)
         cur = geno.blocks[i].temporal_op
         cands = [o for o in _temporal_slot_pool() if o != cur]
-        return mutate(geno, "swap_temporal", index=i, new_op=rng.choice(cands))
+        return mutate(geno, "swap_temporal", index=i, new_op=_weighted_pick(cands, rng))
 
     if op == "swap_joint":
         # 仅对已处于一体模式的块生效 (否则 mutate 抛错→重采)
@@ -148,7 +183,7 @@ def _apply_random(geno: Genotype, op: str, rng: random.Random) -> Genotype:
         cands = [o for o in _joint_pool() if o != cur]
         if not cands:
             raise ValueError("无候选时空一体算子")
-        return mutate(geno, "swap_joint", index=i, new_op=rng.choice(cands))
+        return mutate(geno, "swap_joint", index=i, new_op=_weighted_pick(cands, rng))
 
     if op == "toggle_joint":
         i = rng.randrange(n)
@@ -185,8 +220,8 @@ def _apply_random(geno: Genotype, op: str, rng: random.Random) -> Genotype:
             )
         else:
             nb = STBlock(
-                spatial_op=rng.choice(_spatial_slot_pool()),
-                temporal_op=rng.choice(_temporal_slot_pool()),
+                spatial_op=_weighted_pick(_spatial_slot_pool(), rng),
+                temporal_op=_weighted_pick(_temporal_slot_pool(), rng),
                 fusion=rng.choice(list(VALID_FUSION)),
             )
         return mutate(geno, "add_block", new_block=nb)
@@ -331,6 +366,25 @@ class AgingEvolution:
         self.population.append(Member(genotype=genotype, fitness=fitness, trial_id=trial_id))
         while len(self.population) > self.population_size:
             self.population.popleft()  # **移除最老 (FIFO), 而非最差** —— aging 核心
+
+    def reseed(self, genotypes: list[Genotype]) -> int:
+        """把一批 genotype 塞回 bootstrap 种子队列 (下次 ask 优先派发)。返回入队数。
+
+        根因 B 修复: island_reset 清掉 archive 差格后, 把存活精英回灌进化种子队列, 让
+        逃逸机制真正作用到被 ask() 消费的种群 (否则 island_reset 只重置停滞计数, 是 no-op)。
+        去重 (按签名) 避免与在评估中的重复; 不改 population 本身 (aging FIFO 语义不变)。
+        """
+        pending_sigs = set(self._pending)
+        queued_sigs = {g.signature() for g in self._seed_queue}
+        added = 0
+        for g in genotypes:
+            sig = g.signature()
+            if sig in pending_sigs or sig in queued_sigs:
+                continue
+            self._seed_queue.append(g.copy())
+            queued_sigs.add(sig)
+            added += 1
+        return added
 
     # -- 查询 --
     def _tournament(self) -> Member:

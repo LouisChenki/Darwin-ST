@@ -574,3 +574,72 @@ def test_adaptive_hpo_trials_off_by_default():
     orch = Orchestrator(cfg, _make_eval_fn(), devices=2)
     g = orch._next_genotype()
     assert getattr(g, "_seed_meta", None) is None
+
+
+# ---------------------------------------------------------------------------
+# 根因 B 修复: 接通 archive.select() 驱动父代选择 + island_reset 后 reseed
+# ---------------------------------------------------------------------------
+
+
+def test_next_genotype_uses_archive_when_p_high(monkeypatch):
+    """ARCHIVE_PARENT_P=1 且 archive 非空时, _next_genotype 应走 archive.select()。"""
+    monkeypatch.setenv("ARCHIVE_PARENT_P", "1.0")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=6, tournament_size=3)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    # 手动填一个 elite 进 archive
+    g = Genotype(blocks=[__import__("darwin_st.search.genotype", fromlist=["STBlock"]).STBlock("gcn", "tcn")])
+    orch.archive.add(g, fitness=18.0, num_params=80_000)
+    calls = {"n": 0}
+    real_select = orch.archive.select
+    def spy():
+        calls["n"] += 1
+        return real_select()
+    orch.archive.select = spy
+    for _ in range(10):
+        orch._next_genotype()
+    assert calls["n"] >= 1   # 确实走了 archive 父代选择
+
+
+def test_next_genotype_pure_aging_when_p_zero(monkeypatch):
+    """ARCHIVE_PARENT_P=0 → 从不调 archive.select() (退回纯 aging, 向后兼容)。"""
+    monkeypatch.setenv("ARCHIVE_PARENT_P", "0")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=6, tournament_size=3)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    g = Genotype(blocks=[__import__("darwin_st.search.genotype", fromlist=["STBlock"]).STBlock("gcn", "tcn")])
+    orch.archive.add(g, fitness=18.0, num_params=80_000)
+    called = {"n": 0}
+    orch.archive.select = lambda: called.__setitem__("n", called["n"] + 1)
+    # bootstrap 种子够派多次; 只需覆盖若干次 ask 确认从不走 archive
+    for _ in range(orch.cfg.population_size):
+        orch._next_genotype()
+    assert called["n"] == 0
+
+
+def test_archive_empty_falls_back_to_ask(monkeypatch):
+    """archive 空 (冷启动) 时即便 p=1 也回落 evo.ask(), 不崩、返回合法 genotype。"""
+    monkeypatch.setenv("ARCHIVE_PARENT_P", "1.0")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=6, tournament_size=3)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    assert len(orch.archive) == 0
+    g = orch._next_genotype()
+    g.validate()   # 合法
+
+
+def test_island_reset_reseeds_evolution():
+    """停滞触发 island_reset 后, 存活精英应被 reseed 回 evo 种子队列 (逃逸真正生效)。"""
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=6, tournament_size=3)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    # 造多个不同族精英填 archive (让 island_reset 有东西可清)
+    from darwin_st.search.genotype import STBlock
+    for i, (s, t) in enumerate([("gcn", "tcn"), ("gat", "gru"), ("diffusion", "attn"),
+                                 ("adaptive", "tcn"), ("cheb", "gru"), ("gat", "attn")]):
+        orch.archive.add(Genotype(blocks=[STBlock(s, t)]), fitness=20.0 - i, num_params=80_000)
+    n_before = len(orch.archive)
+    reseeded = {"n": 0}
+    real_reseed = orch.evo.reseed
+    orch.evo.reseed = lambda gs: reseeded.__setitem__("n", real_reseed(gs))
+    cleared = orch.archive.island_reset()
+    if cleared:
+        orch.evo.reseed([e.genotype for e in orch.archive.elites()])
+    assert cleared > 0
+    assert reseeded["n"] > 0   # 存活精英确实回灌

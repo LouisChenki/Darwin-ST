@@ -104,7 +104,7 @@ def main():
     print(f"\n=== 结束: {state.stop_reason} ({dt:.0f}s) ===")
     print(f"评估 {state.evals} 个架构: KEEP={state.n_keep} DISCARD={state.n_discard} CRASH={state.n_crash}")
     print(f"最优 MAE={state.best_mae:.3f} | SOTA({state.sota_name})={state.sota_mae} | 超越={state.beat_sota}")
-    print(f"档案 coverage={orch.archive.coverage():.2f} ({len(orch.archive)}/36) "
+    print(f"档案 coverage={orch.archive.coverage():.2f} ({len(orch.archive)}/{orch.archive.TOTAL_CELLS}) "
           f"QD={orch.archive.qd_score():.3f}")
     if state.best_genotype is not None:
         bg = state.best_genotype

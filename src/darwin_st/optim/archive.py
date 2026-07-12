@@ -54,12 +54,38 @@ _N_PARAM_BUCKETS = len(PARAM_BUCKETS)
 DEPTH_BUCKETS = [(1, 3), (3, 5), (5, float("inf"))]
 _DEPTH_BUCKET_LABELS = ["1-2", "3-4", "5+"]
 
+# synth 前缀 (与 operators.SYNTH_PREFIX 一致; 此处本地常量避免 archive→operators 反向依赖膨胀)
+_SYNTH_PREFIX = "synth_"
+
+
+def _synth_family(op: str, families_order: list[str]) -> str:
+    """把 synth 算子按注册名稳定哈希散到已有族 (而非全塌默认族)。
+
+    根因 C 修复: synth 算子在 SPATIAL/TEMPORAL_FAMILIES 字典里查不到 → .get 全落 none/conv →
+    368/368 KEEP 架构落同一族, 108 格 QD 网格塌成 ~9 格, 深度保护失效。按注册名哈希散开,
+    保证不同 synth 算子分布到不同族, 网格重新展开。哈希用名字 (稳定, 跨进程一致), 排除 'none'
+    (none 语义是"无空间算子", 不该被 synth 占用)。
+    """
+    import hashlib
+    pool = [f for f in families_order if f != "none"] or families_order
+    h = int(hashlib.sha1(op.encode()).hexdigest(), 16)
+    return pool[h % len(pool)]
+
+
+def _family_of(op: str, table: dict, families_order: list[str], default: str) -> str:
+    """查算子所属族: 内置查 table; synth_ 前缀走稳定哈希散族; 其余落 default。"""
+    if op in table:
+        return table[op]
+    if op.startswith(_SYNTH_PREFIX):
+        return _synth_family(op, families_order)
+    return default
+
 
 def _dominant_spatial_family(geno: Genotype) -> str:
     """该 genotype 的主导空间族 = 出现最多的空间算子所属族 (平局取更深块的)。"""
     counts: dict[str, int] = {}
     for b in geno.blocks:
-        fam = SPATIAL_FAMILIES.get(b.spatial_op, "none")
+        fam = _family_of(b.spatial_op, SPATIAL_FAMILIES, _SPATIAL_FAMILY_ORDER, "none")
         counts[fam] = counts.get(fam, 0) + 1
     # 平局时按 _SPATIAL_FAMILY_ORDER 靠后 (更"重") 优先
     return max(counts, key=lambda f: (counts[f], _SPATIAL_FAMILY_ORDER.index(f)))
@@ -68,7 +94,7 @@ def _dominant_spatial_family(geno: Genotype) -> str:
 def _dominant_temporal_family(geno: Genotype) -> str:
     counts: dict[str, int] = {}
     for b in geno.blocks:
-        fam = TEMPORAL_FAMILIES.get(b.temporal_op, "conv")
+        fam = _family_of(b.temporal_op, TEMPORAL_FAMILIES, _TEMPORAL_FAMILY_ORDER, "conv")
         counts[fam] = counts.get(fam, 0) + 1
     return max(counts, key=lambda f: (counts[f], _TEMPORAL_FAMILY_ORDER.index(f)))
 
@@ -140,7 +166,7 @@ class MAPElitesArchive:
         if arc.stagnated(): arc.island_reset()
     """
 
-    TOTAL_CELLS = len(all_cells())  # 36
+    TOTAL_CELLS = len(all_cells())  # 108 (4 空间族 × 3 时序族 × 3 参数档 × 3 深度档)
 
     def __init__(self, seed: int = 0, p_uniform: float = 0.4, tournament_size: int = 4,
                  stagnation_patience: int = 20):
