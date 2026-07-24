@@ -10,10 +10,12 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
 from darwin_st.creation import (
+    COMPOSITION_OPS,
     FusionRequest,
     MockLLM,
     OperatorSynthesizer,
@@ -21,6 +23,7 @@ from darwin_st.creation import (
     exec_operator_code,
     extract_code,
 )
+from darwin_st.creation.synthesizer import build_plan_prompt
 from darwin_st.creation.validation import ValidationConfig
 from darwin_st.knowledge import all_seed_mechanisms
 
@@ -285,3 +288,234 @@ def test_synthesize_many_dedup_names():
     results = synth.synthesize_many(_req(), n_hypotheses=2)
     # 两个同名 HypoA, 去重后只合成一个
     assert len([r for r in results if r.success]) <= 1
+
+
+# ---------------------------------------------------------------------------
+# B4 温度透传: temperature=None → cfg.temperature (行为不变); 显式值覆盖
+# ---------------------------------------------------------------------------
+
+
+class _TempLLM(MockLLM):
+    """记录每次 chat 的 temperature (温度透传断言用)。"""
+    def __init__(self, responder):
+        super().__init__(responder)
+        self.temps = []
+
+    def chat(self, messages, temperature=0.7, max_tokens=4096):
+        self.temps.append(temperature)
+        return self.responder(messages)
+
+
+def test_synthesize_temperature_none_uses_cfg():
+    responses = iter([_GOOD_PLAN, _GOOD_CODE])
+    llm = _TempLLM(lambda msgs: next(responses))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2, temperature=0.8))
+    res = synth.synthesize(_req())
+    assert res.success
+    assert llm.temps == [0.8, 0.8]                    # plan + code 都用 cfg 默认
+
+
+def test_synthesize_temperature_override():
+    responses = iter([_GOOD_PLAN, _GOOD_CODE])
+    llm = _TempLLM(lambda msgs: next(responses))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2, temperature=0.8))
+    res = synth.synthesize(_req(), temperature=0.3)
+    assert res.success
+    assert llm.temps == [0.3, 0.3]                    # 覆盖温度贯穿 plan + code
+
+
+def test_synthesize_many_temperature_passthrough():
+    responses = iter([_PLAN_ARRAY, _op_code("HypoA"), _op_code("HypoB")])
+    llm = _TempLLM(lambda msgs: next(responses))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1, temperature=0.8))
+    results = synth.synthesize_many(_req(), n_hypotheses=2, temperature=0.55)
+    assert sum(1 for r in results if r.success) == 2
+    assert llm.temps == [0.55, 0.55, 0.55]            # 1 次计划 + 2 次代码
+
+
+def test_synthesize_many_temperature_none_uses_cfg():
+    responses = iter([_PLAN_ARRAY, _op_code("HypoA"), _op_code("HypoB")])
+    llm = _TempLLM(lambda msgs: next(responses))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1, temperature=0.8))
+    synth.synthesize_many(_req(), n_hypotheses=2)
+    assert llm.temps == [0.8, 0.8, 0.8]               # None → cfg.temperature (回归)
+
+
+# ---------------------------------------------------------------------------
+# B5 假设独立采样 (synthesize_independent) + 双模型路由
+# ---------------------------------------------------------------------------
+
+
+def _plan_json(name, composition, mechs=("a", "b")):
+    return json.dumps({
+        "operator_name": name, "rationale": "r", "shared_structure": "s",
+        "composition": composition, "source_mechanisms": list(mechs),
+        "expected_effect": "e",
+    }, ensure_ascii=False)
+
+
+def _bad_code_for(name):
+    return (f'```python\nimport torch.nn as nn\nclass {name}(nn.Module):\n'
+            f'    def __init__(self,channels,num_nodes,**kw):\n'
+            f'        super().__init__(); self.l=nn.Linear(channels,channels)\n'
+            f'    def forward(self,x,adj=None): return self.l(x).mean(dim=2)\n```')
+
+
+class _ForcedCompliantLLM(MockLLM):
+    """plan 阶段按 prompt 硬约束出合规 plan (算子名 Op_<文法>); code 阶段出该类名的好代码。"""
+
+    def __init__(self):
+        self.forced_seen: list[str] = []
+        self.prompts: list[str] = []
+        self.temps: list[float] = []
+        self._last_name = None
+        super().__init__(self._respond)
+
+    def chat(self, messages, temperature=0.7, max_tokens=4096):
+        self.temps.append(temperature)
+        return super().chat(messages, temperature=temperature, max_tokens=max_tokens)
+
+    def _respond(self, msgs):
+        content = msgs[-1]["content"]
+        self.prompts.append(content)
+        m = re.search(r"composition=(\w+)", content)   # 硬约束行只在 plan prompt 里
+        if m:                                          # plan 阶段
+            comp = m.group(1)
+            self.forced_seen.append(comp)
+            self._last_name = f"Op_{comp}"
+            return _plan_json(self._last_name, comp)
+        return _op_code(self._last_name)               # code 阶段
+
+
+def test_build_plan_prompt_unchanged_without_new_args():
+    """回归: forced_composition/exemplars 为 None → prompt 与改动前逐字节一致 (无硬约束/履历段)。"""
+    msgs = build_plan_prompt(_req())
+    assert len(msgs) == 2 and msgs[0]["role"] == "system"
+    user = msgs[1]["content"]
+    assert user.startswith("瓶颈与跨域机制集:")
+    assert "硬约束" not in user and "成功先例" not in user
+
+
+def test_build_plan_prompt_forced_composition_line():
+    msgs = build_plan_prompt(_req(), forced_composition="gated_routed")
+    assert "必须使用 composition=gated_routed" in msgs[1]["content"]
+
+
+def test_synthesize_independent_rotates_all_four_compositions():
+    """轮转组合文法命中 4 种 (sorted(COMPOSITION_OPS) 按假设序) + 硬约束进 prompt。"""
+    llm = _ForcedCompliantLLM()
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1))
+    results = synth.synthesize_independent(_req(), n_hypotheses=4)
+    assert llm.forced_seen == sorted(COMPOSITION_OPS)          # 4 种文法轮转命中
+    assert all("必须使用 composition=" in p for p in llm.prompts[::2])   # plan prompt 均带硬约束
+    assert sum(1 for r in results if r.success) == 4
+    assert [r.plan.composition for r in results] == sorted(COMPOSITION_OPS)
+
+
+def test_synthesize_independent_temperature_ladder_and_clamp():
+    """温度阶梯 [t, t+0.1, t-0.1, t+0.2] clamp [0.3, 1.0]; None → cfg.temperature 为基准。"""
+    llm = _ForcedCompliantLLM()
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1, temperature=0.8))
+    synth.synthesize_independent(_req(), n_hypotheses=4)
+    assert llm.temps[::2] == pytest.approx([0.8, 0.9, 0.7, 1.0])   # plan 阶段温度 (上沿 clamp 1.0)
+    # 低基准: 下沿 clamp 0.3
+    llm2 = _ForcedCompliantLLM()
+    synth2 = OperatorSynthesizer(llm2, SynthesisConfig(max_retries=1, temperature=0.8))
+    synth2.synthesize_independent(_req(), n_hypotheses=4, temperature=0.3)
+    assert llm2.temps[::2] == pytest.approx([0.3, 0.4, 0.3, 0.5])   # 0.3-0.1=0.2 → clamp 0.3
+
+
+def test_synthesize_independent_forced_mismatch_fails_before_code():
+    """plan 实出文法与强制不符 → 记失败 (注明未按指定组合文法), 不进代码阶段。"""
+    calls = []
+
+    def responder(msgs):
+        calls.append(msgs[-1]["content"])
+        return _plan_json("DisobedientOp", "parallel")       # 永远出 parallel
+
+    llm = MockLLM(responder)
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2))
+    results = synth.synthesize_independent(_req(), n_hypotheses=1)   # i=0 强制 additive_residual
+    assert len(results) == 1
+    r = results[0]
+    assert not r.success
+    assert "未按指定组合文法" in r.last_error
+    assert r.plan is not None and r.plan.composition == "parallel"
+    assert len(calls) == 1                                   # 只调了 plan, 未进代码阶段
+
+
+def test_synthesize_independent_dedup_by_name():
+    """去重形态一: operator_name 重名 → 后者跳过 (不计入返回)。"""
+    responses = iter([_plan_json("SameNameOp", "additive_residual"), _op_code("SameNameOp"),
+                      _plan_json("SameNameOp", "gated_routed"), _op_code("SameNameOp")])
+    llm = MockLLM(lambda msgs: next(responses))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1))
+    results = synth.synthesize_independent(_req(), n_hypotheses=2)
+    assert len(results) == 1
+    assert results[0].success and results[0].plan.operator_name == "SameNameOp"
+
+
+def test_synthesize_independent_dedup_by_mechanism_composition_sig():
+    """去重形态二: (frozenset(source_mechanisms), composition) 与已接受结果重复 → 跳过。"""
+    # h1 强制 gated_routed 但 LLM 违规出 additive_residual + 同源机制 → 与 h0 同签名, 跳过
+    responses = iter([_plan_json("NameA", "additive_residual", ("a", "b")), _op_code("NameA"),
+                      _plan_json("NameB", "additive_residual", ("b", "a"))])  # frozenset 无序
+    llm = MockLLM(lambda msgs: next(responses))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1))
+    results = synth.synthesize_independent(_req(), n_hypotheses=2)
+    assert len(results) == 1
+    assert results[0].plan.operator_name == "NameA"
+
+
+def test_synthesize_independent_dual_model_routing():
+    """双模型路由: fast_llm 存在时第 0 个假设用强模型 (质量锚点), 其余用 fast_llm。"""
+    strong = _ForcedCompliantLLM()
+    fast = _ForcedCompliantLLM()
+    synth = OperatorSynthesizer(strong, SynthesisConfig(max_retries=1), fast_llm=fast)
+    results = synth.synthesize_independent(_req(), n_hypotheses=3)
+    assert strong.forced_seen == sorted(COMPOSITION_OPS)[:1]        # h0 → 强模型
+    assert fast.forced_seen == sorted(COMPOSITION_OPS)[1:3]         # h1/h2 → fast
+    assert sum(1 for r in results if r.success) == 3
+    assert strong.call_count == 2 and fast.call_count == 4          # 各自 plan+code, 无 escalation
+
+
+def test_synthesize_independent_escalates_to_strong_after_fast_fails():
+    """fast 假设重试全败 → 同槽位强模型补试一次 (escalation), 结果取强模型的。"""
+    strong = _ForcedCompliantLLM()
+
+    def fast_responder(msgs):
+        content = msgs[-1]["content"]
+        if "composition=" in content:                        # plan 阶段: 合规 (h1 强制 gated_routed)
+            return _plan_json("FastOp", "gated_routed")
+        return _bad_code_for("FastOp")                       # 代码永远坏 (丢节点维)
+
+    fast = MockLLM(fast_responder)
+    synth = OperatorSynthesizer(strong, SynthesisConfig(max_retries=2), fast_llm=fast)
+    results = synth.synthesize_independent(_req(), n_hypotheses=2)
+    assert len(results) == 2
+    assert results[0].success                                # h0 强模型直接成功
+    assert results[1].success                                # fast 全败 → 强模型补试成功
+    assert results[1].plan.operator_name == "Op_gated_routed"  # 补试的 plan 来自强模型
+    assert fast.call_count == 3                              # fast: 1 plan + 2 code (重试全败)
+    assert strong.call_count == 4                            # strong: h0 (2) + escalation (2)
+
+
+def test_synthesize_independent_no_fast_llm_uses_strong_for_all():
+    """fast_llm=None → 全部假设用强模型 (现状兼容), 无 escalation。"""
+    strong = _ForcedCompliantLLM()
+    synth = OperatorSynthesizer(strong, SynthesisConfig(max_retries=1))     # 不传 fast_llm
+    results = synth.synthesize_independent(_req(), n_hypotheses=3)
+    assert len(strong.forced_seen) == 3
+    assert sum(1 for r in results if r.success) == 3
+    assert strong.call_count == 6                              # 3 plan + 3 code, 全走强模型
+
+
+def test_synthesize_independent_passes_exemplars_to_plan_prompt():
+    """exemplars 透传: 非空履历注入独立采样的 plan prompt (同 many 路径)。"""
+    llm = _ForcedCompliantLLM()
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1))
+    exemplars = {"successes": [{"operator_name": "synth_x", "composition": "parallel",
+                                "seed_val_mae": 18.5, "rationale": "r", "code": "class X: pass"}],
+                 "failures": []}
+    synth.synthesize_independent(_req(), n_hypotheses=1, exemplars=exemplars)
+    assert "成功先例" in llm.prompts[0]

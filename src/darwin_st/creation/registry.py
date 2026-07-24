@@ -9,14 +9,27 @@ Tier-2 闭环的关键: 合成并验证过的融合算子, 注册进 operators.p
   - 持久化: 算子代码写入 dynamic_ops 目录, 重启后 load_persisted() 重新注册(存活)。
   - 隔离: 注入的算子带前缀(synth_)区分内置算子; unregister 可移除。
 
+算子家谱 (B2, FunSearch/ELM 微进化):
+  - family: 注册名去掉版本尾缀 (_v<N>); synth_foo 与 synth_foo_v2 同族 synth_foo。
+  - register_variant(): 把精炼产物注册为父版同族的新版本 (版本号由 refiner 按 next_version
+    命名, 此处校验族一致 + 版本不重复), 家谱只增不删。
+  - 持久化: 每族一个 lineage_<family>.json {family, versions:[{reg_name, code_file,
+    real_mae(可空), round_idx, created_at, parent_reg_name(可空), version}]}。
+  - update_real_mae(): 实测后回填 lineage 与算子 json; family_best 由查询端 (best_in_family)
+    按 mae 比较天然得出, 不做物理替换。
+  - load_persisted() 兼容旧目录: 无 lineage 文件时每个算子隐式成单版本族。
+
 注意(用户拍板): 合成算子进【算子库】给进化用, **不进机制库**(机制库静态只读)。
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import torch.nn as nn
 
@@ -25,7 +38,20 @@ from darwin_st.creation.synthesizer import exec_operator_code
 from darwin_st.search import operators as ops_mod
 from darwin_st.search.operators import SYNTH_PREFIX  # 单一真源在 operators.py, 此处 re-export 保兼容
 
-__all__ = ["OperatorRegistry", "SYNTH_PREFIX"]
+__all__ = ["OperatorRegistry", "SYNTH_PREFIX", "family_of", "version_of"]
+
+_VERSION_RE = re.compile(r"_v(\d+)$")
+
+
+def family_of(reg_name: str) -> str:
+    """注册名 → 族名: 去掉版本尾缀 _v<N> (synth_foo_v2 → synth_foo; 无尾缀即自身)。"""
+    return _VERSION_RE.sub("", reg_name)
+
+
+def version_of(reg_name: str) -> int:
+    """注册名 → 版本号: 无 _v<N> 尾缀视为 v1 (族内首版)。"""
+    m = _VERSION_RE.search(reg_name)
+    return int(m.group(1)) if m else 1
 
 
 @dataclass
@@ -34,19 +60,55 @@ class _RegisteredOp:
     class_name: str      # 代码里的类名
     code: str
     needs_adj: bool
+    composition: str = ""                        # plan 的组合文法 (精炼沿用用)
+    source_mechanisms: list[str] = field(default_factory=list)  # plan 的源机制 (精炼沿用用)
 
 
 class OperatorRegistry:
-    """合成算子的注册表 + 持久化。注入到 search.operators.SPATIAL_OPS。"""
+    """合成算子的注册表 + 持久化 + 算子家谱 (B2)。注入到 search.operators.SPATIAL_OPS。"""
 
     def __init__(self, persist_dir: str | None = None):
         self.persist_dir = persist_dir
         self._registered: dict[str, _RegisteredOp] = {}
+        self._lineages: dict[str, list[dict]] = {}   # family -> [version 条目, 按版本序]
         if persist_dir:
             os.makedirs(persist_dir, exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # 注册
+    # ------------------------------------------------------------------
+
     def register(self, op: SynthesizedOperator) -> str:
         """注入一个合成算子到 SPATIAL_OPS, 返回注册名。要求已 validated。"""
+        reg_name = self._inject(op)
+        # 首版算子: 隐式成族 (parent=None, 版本号按名解析, 通常是 v1)
+        self._track_lineage(reg_name, parent_reg_name=None, round_idx=None,
+                            real_mae=op.real_mae)
+        return reg_name
+
+    def register_variant(self, op: SynthesizedOperator, parent_reg_name: str,
+                         round_idx: int | None = None) -> str:
+        """把精炼产物注册为 parent 同族的新版本 (B2 微进化)。返回注册名。
+
+        族一致性: family_of(synth_+op.name) 必须等于 family_of(parent_reg_name);
+        版本不重复: 注册名不得已存在 (refiner 按 next_version 命名保证递增)。
+        其余与 register 相同 (注入 SPATIAL_OPS + 持久化), 并写 lineage (parent 指针)。
+        """
+        if parent_reg_name not in self._registered:
+            raise ValueError(f"父算子 {parent_reg_name} 未注册, 无法注册变体")
+        fam = family_of(parent_reg_name)
+        reg_name = SYNTH_PREFIX + op.name
+        if family_of(reg_name) != fam:
+            raise ValueError(f"变体 {reg_name} 与父版 {parent_reg_name} 不同族 {fam}")
+        if reg_name in self._registered:
+            raise ValueError(f"版本 {reg_name} 已存在 (族内版本须递增不重复)")
+        reg_name = self._inject(op)
+        self._track_lineage(reg_name, parent_reg_name=parent_reg_name,
+                            round_idx=round_idx, real_mae=op.real_mae)
+        return reg_name
+
+    def _inject(self, op: SynthesizedOperator) -> str:
+        """注册公共体: 校验 → exec → 注入 SPATIAL_OPS → 持久化算子文件。"""
         if not op.validated:
             raise ValueError(f"算子 {op.name} 未过验证, 拒绝注入")
         reg_name = SYNTH_PREFIX + op.name
@@ -58,7 +120,10 @@ class OperatorRegistry:
         ops_mod.SPATIAL_OPS[reg_name] = _make_factory(cls)
         # 登记类别元数据 → op_category() 据此正确放槽 (spatiotemporal → joint block)
         ops_mod.OP_CATEGORY[reg_name] = getattr(op, "category", "spatiotemporal")
-        self._registered[reg_name] = _RegisteredOp(reg_name, op.name, op.code, op.needs_adj)
+        self._registered[reg_name] = _RegisteredOp(
+            reg_name, op.name, op.code, op.needs_adj,
+            composition=op.plan.composition,
+            source_mechanisms=list(op.plan.source_mechanisms))
 
         if self.persist_dir:
             self._persist(reg_name, op)
@@ -68,6 +133,7 @@ class OperatorRegistry:
         ops_mod.SPATIAL_OPS.pop(reg_name, None)
         ops_mod.OP_CATEGORY.pop(reg_name, None)
         self._registered.pop(reg_name, None)
+        # 家谱只增不删: lineage 记录保留 (历史版本信息是进化经验)
 
     def registered_names(self) -> list[str]:
         return list(self._registered)
@@ -75,7 +141,91 @@ class OperatorRegistry:
     def is_registered(self, reg_name: str) -> bool:
         return reg_name in self._registered
 
-    # -- 持久化 --
+    # ------------------------------------------------------------------
+    # 算子家谱 (B2)
+    # ------------------------------------------------------------------
+
+    def families(self) -> list[str]:
+        """所有已知族名 (含隐式单版本族), 字典序。"""
+        return sorted(self._lineages)
+
+    def family_versions(self, family: str) -> list[dict]:
+        """族内全部版本条目 (按版本序), 每条附 code/composition/source_mechanisms (内存 enrich)。"""
+        return [self._enrich(v) for v in self._lineages.get(family, [])]
+
+    def best_in_family(self, family: str) -> dict | None:
+        """族内实测 MAE 最小的版本条目 (enrich 后); 无有限 MAE → None。"""
+        vs = [v for v in self._lineages.get(family, []) if _finite(v.get("real_mae"))]
+        if not vs:
+            return None
+        return self._enrich(min(vs, key=lambda v: v["real_mae"]))
+
+    def update_real_mae(self, reg_name: str, mae: float) -> None:
+        """回填某版本的实测 MAE: lineage + 算子 json 同步 (orchestrator 评测后调用)。
+
+        只增不改其它字段; 未知注册名静默跳过 (回填是增益, 不中止优化循环)。
+        """
+        fam = family_of(reg_name)
+        hit = False
+        for v in self._lineages.get(fam, []):
+            if v["reg_name"] == reg_name:
+                v["real_mae"] = mae
+                hit = True
+        if hit:
+            self._persist_lineage(fam)
+        # 算子 json 的 real_mae 钩子同步 (持久层两处的同一真值)
+        if self.persist_dir:
+            meta_path = os.path.join(self.persist_dir, reg_name + ".json")
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    meta["real_mae"] = mae
+                    with open(meta_path, "w") as f:
+                        json.dump(meta, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass            # 回填失败不崩 (增益非必需)
+
+    def _enrich(self, entry: dict) -> dict:
+        """版本条目 + 内存里的代码/plan 元数据 (精炼 prompt 需要父代码全文)。"""
+        e = dict(entry)
+        r = self._registered.get(e["reg_name"])
+        e["code"] = r.code if r else None
+        e["composition"] = r.composition if r else ""
+        e["source_mechanisms"] = list(r.source_mechanisms) if r else []
+        e["needs_adj"] = r.needs_adj if r else False
+        return e
+
+    def _track_lineage(self, reg_name: str, parent_reg_name: str | None,
+                       round_idx: int | None, real_mae: float | None) -> None:
+        """把一版算子记入家谱 (幂等: 已存在不重复记) 并持久化 lineage 文件。"""
+        fam = family_of(reg_name)
+        versions = self._lineages.setdefault(fam, [])
+        if any(v["reg_name"] == reg_name for v in versions):
+            return
+        versions.append({"reg_name": reg_name, "version": version_of(reg_name),
+                         "code_file": reg_name + ".py", "real_mae": real_mae,
+                         "round_idx": round_idx,
+                         "created_at": datetime.now(timezone.utc).isoformat(),
+                         "parent_reg_name": parent_reg_name})
+        versions.sort(key=lambda v: v["version"])
+        self._persist_lineage(fam)
+
+    def _persist_lineage(self, family: str) -> None:
+        """原子写 lineage_<family>.json (临时文件 + rename, 防半途崩溃留半文件)。"""
+        if not self.persist_dir:
+            return
+        path = os.path.join(self.persist_dir, f"lineage_{family}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"family": family, "versions": self._lineages[family]},
+                      f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+    # ------------------------------------------------------------------
+    # 持久化 (算子本体)
+    # ------------------------------------------------------------------
+
     def _persist(self, reg_name: str, op: SynthesizedOperator) -> None:
         base = os.path.join(self.persist_dir, reg_name)
         with open(base + ".py", "w") as f:
@@ -89,12 +239,17 @@ class OperatorRegistry:
                        "real_mae": op.real_mae}, f, ensure_ascii=False, indent=2)
 
     def load_persisted(self) -> list[str]:
-        """从 persist_dir 重新加载并注册所有持久化的算子。返回注册名列表。"""
+        """从 persist_dir 重新加载并注册所有持久化的算子 + 家谱。返回注册名列表。
+
+        兼容旧目录 (B2 前): 无 lineage_*.json 时, 每个持久算子隐式成单版本族
+        (real_mae 从算子 json 的钩子字段读回)。
+        """
         if not self.persist_dir or not os.path.isdir(self.persist_dir):
             return []
         loaded = []
+        loaded_mae: dict[str, float | None] = {}
         for fn in sorted(os.listdir(self.persist_dir)):
-            if not fn.endswith(".json"):
+            if not fn.endswith(".json") or fn.startswith("lineage_"):
                 continue
             meta_path = os.path.join(self.persist_dir, fn)
             with open(meta_path) as f:
@@ -110,11 +265,48 @@ class OperatorRegistry:
                 ops_mod.SPATIAL_OPS[reg_name] = _make_factory(cls)
                 ops_mod.OP_CATEGORY[reg_name] = meta.get("category", "spatiotemporal")
                 self._registered[reg_name] = _RegisteredOp(
-                    reg_name, meta["class_name"], code, meta.get("needs_adj", False))
+                    reg_name, meta["class_name"], code, meta.get("needs_adj", False),
+                    composition=meta.get("composition", ""),
+                    source_mechanisms=list(meta.get("source_mechanisms", [])))
                 loaded.append(reg_name)
+                loaded_mae[reg_name] = meta.get("real_mae")
             except Exception:
                 continue  # 坏的持久算子跳过, 不崩
+
+        # 家谱: 先读 lineage 文件 (显式记录优先)
+        for fn in sorted(os.listdir(self.persist_dir)):
+            if not (fn.startswith("lineage_") and fn.endswith(".json")):
+                continue
+            fam = fn[len("lineage_"):-5]
+            try:
+                with open(os.path.join(self.persist_dir, fn)) as f:
+                    data = json.load(f)
+                versions = [v for v in data.get("versions", [])
+                            if isinstance(v, dict) and "reg_name" in v]
+            except Exception:
+                continue            # 坏 lineage 文件跳过, 不崩
+            if versions:
+                for v in versions:
+                    v.setdefault("version", version_of(v["reg_name"]))
+                versions.sort(key=lambda v: v["version"])
+                self._lineages[fam] = versions
+
+        # 隐式族: 已注册但不在任何 lineage 里的算子 (旧目录单版本族成立)
+        for reg_name in loaded:
+            fam = family_of(reg_name)
+            have = {v["reg_name"] for v in self._lineages.get(fam, [])}
+            if reg_name not in have:
+                self._lineages.setdefault(fam, []).append(
+                    {"reg_name": reg_name, "version": version_of(reg_name),
+                     "code_file": reg_name + ".py", "real_mae": loaded_mae.get(reg_name),
+                     "round_idx": None, "created_at": None, "parent_reg_name": None})
+        for versions in self._lineages.values():
+            versions.sort(key=lambda v: v["version"])
         return loaded
+
+
+def _finite(x) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(x)
 
 
 def _make_factory(cls):

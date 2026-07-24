@@ -74,7 +74,10 @@ def _loop(store, llm_responses, memory=None):
     llm = MockLLM(lambda msgs: next(resp))
     synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2))
     reg = OperatorRegistry()
-    return CreationLoop(store, store.embedder, synth, reg, memory=memory)
+    # 本组用例的响应序列按 synthesize_many (单次调用产 N) 编排 → 固定走旧路径;
+    # 独立采样 (默认开) 的用例单独构造, 见 B5 段
+    return CreationLoop(store, store.embedder, synth, reg, memory=memory,
+                        config=CreationConfig(independent_sampling=False))
 
 
 # ---------------------------------------------------------------------------
@@ -259,3 +262,166 @@ def test_maybe_create_synth_failure_records_and_no_crash(store):
     insights = mem.get_insights("PeMS04")
     assert any("未过验证" in i["insight_text"] for i in insights)
     mem.close()
+
+
+# ---------------------------------------------------------------------------
+# B4 方向信用分 + 温度自适应 (LLMatic curiosity)
+# ---------------------------------------------------------------------------
+
+_BAD_CODE_DROP_N = ('```python\nimport torch.nn as nn\nclass FusedCreationOp(nn.Module):\n'
+                    '    def __init__(self,channels,num_nodes,**kw):\n'
+                    '        super().__init__(); self.l=nn.Linear(channels,channels)\n'
+                    '    def forward(self,x,adj=None): return self.l(x).mean(dim=2)\n```')
+
+
+def _failing_loop(store):
+    """全部假设挂门的 loop (代码丢节点维, 挂 shape 门; max_retries=2 → 2 次坏代码)。"""
+    return _loop(store, [_GOOD_PLAN_ARRAY, _BAD_CODE_DROP_N, _BAD_CODE_DROP_N])
+
+
+def test_history_records_have_score_field(store):
+    """_history 每条带 score 字段, 初始 0.0 (旧记录无此字段时按 0 渲染, 见 diagnosis)。"""
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    assert loop._history[0]["score"] == 0.0
+
+
+def test_all_hypotheses_fail_scores_minus_one(store):
+    """全部假设挂门 (无 seed 产出, 立即可知) → 本轮方向同步记 −1。"""
+    loop = _failing_loop(store)
+    outcome = loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    assert not outcome.success
+    assert loop._history[0]["score"] == -1.0
+
+
+def test_all_fail_raises_temperature(store):
+    """零假设过门 → 温度 +0.05 (升温探索)。"""
+    loop = _failing_loop(store)
+    assert loop._temperature == pytest.approx(0.8)
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    assert loop._temperature == pytest.approx(0.85)
+
+
+def test_update_direction_outcome_accumulates(store):
+    """三种结局记分累加: adopted +1 / 罚 −0.5; 未知 round_idx 静默跳过。"""
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    loop.update_direction_outcome(0, 1.0)
+    assert loop._history[0]["score"] == pytest.approx(1.0)
+    loop.update_direction_outcome(0, -0.5)
+    assert loop._history[0]["score"] == pytest.approx(0.5)
+    loop.update_direction_outcome(99, 1.0)          # 无此轮 → 静默跳过, 不崩
+    assert loop._history[0]["score"] == pytest.approx(0.5)
+
+
+def test_adopted_lowers_temperature_penalty_does_not(store):
+    """+1 (adopted) → 温度 −0.05 (收敛利用); 罚分不动温度 (全灭升温在轮末做)。"""
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    loop.update_direction_outcome(0, 1.0)
+    assert loop._temperature == pytest.approx(0.75)
+    loop.update_direction_outcome(0, -0.5)
+    assert loop._temperature == pytest.approx(0.75)
+
+
+def test_temperature_clamp_upper(store):
+    loop = _failing_loop(store)
+    loop._temperature = 1.0
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    assert loop._temperature == 1.0                              # 上界 clamp [_, 1.0]
+
+
+def test_temperature_clamp_lower(store):
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    loop._temperature = 0.5
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    loop.update_direction_outcome(0, 1.0)
+    assert loop._temperature == 0.5                              # 下界 clamp [0.5, _]
+
+
+def test_constructor_temperature_override(store):
+    """构造参数覆盖初始温度; 越界初始值也 clamp 到 [0.5, 1.0]。"""
+    synth = OperatorSynthesizer(MockLLM(lambda m: ""), SynthesisConfig(max_retries=1))
+    loop = CreationLoop(store, store.embedder, synth, OperatorRegistry(), temperature=0.65)
+    assert loop._temperature == pytest.approx(0.65)
+    synth2 = OperatorSynthesizer(MockLLM(lambda m: ""), SynthesisConfig(max_retries=1))
+    loop2 = CreationLoop(store, store.embedder, synth2, OperatorRegistry(), temperature=1.5)
+    assert loop2._temperature == 1.0
+
+
+def test_seed_meta_carries_creation_round(store):
+    """seed._seed_meta 带 creation_round = 产出它的诊断轮次 (round_idx 递增时机: 记 history 后+1)。"""
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE, _GOOD_PLAN_ARRAY, _GOOD_CODE])
+    g = Genotype(blocks=[STBlock("gcn", "tcn")])
+    o1 = loop.maybe_create(g, sota_gap=3.0)
+    o2 = loop.maybe_create(o1.seed_genotype, sota_gap=3.0)
+    assert o1.seed_genotype._seed_meta["creation_round"] == 0
+    assert o2.seed_genotype._seed_meta["creation_round"] == 1
+
+
+def test_maybe_create_passes_adaptive_temperature_to_synthesizer(store):
+    """maybe_create 调合成时透传 self._temperature (B4 温度自适应接线)。"""
+    temps = []
+
+    class _TempLLM(MockLLM):
+        def chat(self, messages, temperature=0.7, max_tokens=4096):
+            temps.append(temperature)
+            return self.responder(messages)
+
+    resp = iter([_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    synth = OperatorSynthesizer(_TempLLM(lambda msgs: next(resp)), SynthesisConfig(max_retries=1))
+    loop = CreationLoop(store, store.embedder, synth, OperatorRegistry(), temperature=0.66,
+                        config=CreationConfig(independent_sampling=False))
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    assert temps and all(t == pytest.approx(0.66) for t in temps)
+
+
+# ---------------------------------------------------------------------------
+# B5 假设独立采样接线 (independent_sampling 开关两态)
+# ---------------------------------------------------------------------------
+
+_IND_PLAN_A = ('{"operator_name": "IndepA", "rationale": "r", "shared_structure": "s",'
+               ' "composition": "additive_residual", "source_mechanisms": ["state_space_model"],'
+               ' "expected_effect": "e"}')
+_IND_PLAN_G = ('{"operator_name": "IndepG", "rationale": "r", "shared_structure": "s",'
+               ' "composition": "gated_routed", "source_mechanisms": ["state_space_model"],'
+               ' "expected_effect": "e"}')
+
+
+def _ind_code(name):
+    return (f'```python\nimport torch\nimport torch.nn as nn\nclass {name}(nn.Module):\n'
+            f'    def __init__(self, channels, num_nodes, **kw):\n'
+            f'        super().__init__(); self.l = nn.Linear(channels, channels)\n'
+            f'        self.a = nn.Parameter(torch.zeros(1))\n'
+            f'    def forward(self, x, adj=None): return self.l(x) + self.a * x\n```')
+
+
+def _independent_loop(store, responses, **cfg_kw):
+    resp = iter(responses)
+    llm = MockLLM(lambda msgs: next(resp))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=1))
+    cfg = CreationConfig(n_hypotheses=2, **cfg_kw)
+    return CreationLoop(store, store.embedder, synth, OperatorRegistry(), config=cfg)
+
+
+def test_independent_sampling_default_on(store):
+    """开关 True (默认): 走 synthesize_independent —— N 次独立 plan 调用 (组合文法轮转)。"""
+    loop = _independent_loop(store, [_IND_PLAN_A, _ind_code("IndepA"),
+                                     _IND_PLAN_G, _ind_code("IndepG")])
+    assert loop.cfg.independent_sampling is True
+    outcome = loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    assert outcome.success and outcome.n_success == 2 and outcome.n_hypotheses == 2
+    assert len(outcome.seed_genotypes) == 2
+    assert loop.synthesizer.llm.call_count == 4          # 2 次独立 plan + 2 次 code
+    # 两个注入算子都进算子库
+    assert all(n in ops_mod.SPATIAL_OPS for n in outcome.operator_names)
+
+
+def test_independent_sampling_off_uses_synthesize_many(store):
+    """开关 False: 走 synthesize_many —— 单次 plan 调用产 N (旧行为, 向后兼容)。"""
+    array = "[" + _IND_PLAN_A + ", " + _IND_PLAN_G + "]"
+    loop = _independent_loop(store, [array, _ind_code("IndepA"), _ind_code("IndepG")],
+                             independent_sampling=False)
+    outcome = loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    assert outcome.success and outcome.n_success == 2
+    assert loop.synthesizer.llm.call_count == 3          # 1 次 plan (数组) + 2 次 code

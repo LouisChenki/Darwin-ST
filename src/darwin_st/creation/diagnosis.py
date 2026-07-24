@@ -278,9 +278,13 @@ def _build_user(summary: DiagnosisSummary, history: list[dict], round_idx: int) 
         mae = h.get("result_mae")
         mae_s = f"MAE≈{mae:.1f}" if isinstance(mae, (int, float)) else "MAE未知"
         precs = ", ".join(h.get("preconditions", []))
-        hist_lines.append(f"- 方向[{precs}] → {mae_s} (未突破)")
+        score = h.get("score", 0.0)                       # B4 方向信用分 (无 score 旧记录按 0 渲染)
+        hist_lines.append(f"- 方向[{precs}] → {mae_s} (未突破) | 累计分={score:g}")
     hist_block = ("\n".join(hist_lines) if hist_lines
                   else "(首轮, 无历史) —— 请基于训练动态自由诊断。")
+    if hist_lines:
+        # B4 硬规则: 累计分 ≤ −1 的方向已被实测证伪, 禁令直写进 prompt (LLMatic curiosity)
+        hist_block += "\n【硬规则】累计分 ≤ -1 的前提词组合已被实测证伪, 禁止再次提出。"
 
     return (
         f"### 诊断轮次\n第 {round_idx + 1} 轮瓶颈诊断。\n\n"

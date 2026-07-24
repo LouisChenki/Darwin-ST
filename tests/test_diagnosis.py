@@ -307,3 +307,33 @@ def test_prompt_history_sorted_best_last():
     user = captured["user"]
     # 更优的 (18.7 / long_range) 应排在更差的 (22.0 / spatial_smoothness) 之后
     assert user.index("long_range_dependency") > user.index("spatial_smoothness")
+
+
+def test_prompt_history_shows_direction_score_and_ban_rule():
+    """B4 方向信用分: OPRO 轨迹每条展示累计分 + 硬规则禁令 (累计分 ≤ −1 禁止再提)。"""
+    captured = {}
+    def cap(msgs):
+        captured["user"] = msgs[1]["content"]
+        return json.dumps({"diagnosis": "z", "preconditions": ["heterogeneity"]})
+    history = [
+        {"round": 0, "preconditions": ["long_range_dependency"], "result_mae": 18.7,
+         "score": -1.5},                                            # 被证伪的方向
+        {"round": 1, "preconditions": ["spatial_smoothness"], "result_mae": 19.0},
+        # ↑ 无 score 字段的旧记录 → 按 0 渲染
+    ]
+    diagnose_bottleneck_llm(_summary(), history, 2, MockLLM(cap))
+    user = captured["user"]
+    assert "累计分=-1.5" in user
+    assert "累计分=0" in user                                        # 旧记录按 0 渲染
+    assert "累计分 ≤ -1" in user and "禁止再次提出" in user            # 硬规则禁令
+
+
+def test_prompt_first_round_has_no_ban_rule():
+    """首轮无历史 → 无累计分展示也无禁令 (与现状一致)。"""
+    captured = {}
+    def cap(msgs):
+        captured["user"] = msgs[1]["content"]
+        return json.dumps({"diagnosis": "z", "preconditions": ["heterogeneity"]})
+    diagnose_bottleneck_llm(_summary(), [], 0, MockLLM(cap))
+    assert "累计分" not in captured["user"]
+    assert "禁止再次提出" not in captured["user"]

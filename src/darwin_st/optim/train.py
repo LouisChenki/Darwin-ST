@@ -37,7 +37,8 @@ from darwin_st.optim.trace import TrainTrace
 from darwin_st.search.builder import build_model, count_params
 from darwin_st.search.genotype import Genotype
 
-__all__ = ["train_one", "evaluate_architecture", "make_eval_fn", "limit_cpu_threads"]
+__all__ = ["train_one", "proxy_eval_genotype", "evaluate_architecture", "make_eval_fn",
+           "limit_cpu_threads"]
 
 
 def limit_cpu_threads(n_workers: int) -> None:
@@ -72,11 +73,15 @@ def train_one(
     early_stop_min_delta: float = 0.001,
     checkpoint_path: str | None = None,
     checkpoint_meta: dict | None = None,
+    max_train_batches: int | None = None,
 ) -> tuple[float, TrainTrace]:
     """用给定超参训练一个架构, 返回 (最优 val-MAE 真实尺度 masked, TrainTrace 训练动态轨迹)。
 
     每 epoch 向 trial.report 上报 val-MAE 供 ASHA 剪枝(trial 为 None 则跳过剪枝)。
     NaN/时间/收敛熔断触发时提前返回当前最优(或 inf)。
+
+    max_train_batches: 非 None 时每 epoch 训练 batch 数上限 (提前 break 内层 batch 循环) ——
+    B3 proxy 短训粗筛的廉价抓手: 不动数据管道, 只让每个 epoch 变短。None (默认) = 全量, 行为不变。
 
     权重存档 (checkpoint_path 非 None 才启用, 默认行为完全不变): 每当 val-MAE 刷新
     best-checkpoint, 把 state_dict 搬到 CPU 调 maybe_save_best 原子落盘 (sidecar 比较
@@ -154,6 +159,8 @@ def train_one(
             gn_sum += gn_val
             gn_max = max(gn_max, gn_val)
             n_batches += 1
+            if max_train_batches is not None and n_batches >= max_train_batches:
+                break                                   # B3 proxy 短训: 每 epoch 只跑前 N 个 batch
 
         # 真实尺度 masked 评测
         met = P.evaluate(model, data_dir, "val", batch_size=batch_size, device=device,
@@ -212,6 +219,32 @@ def train_one(
     trace.best_mae = best_mae
     trace.final_train_loss = trace.train_loss[-1] if trace.train_loss else float("inf")
     return best_mae, trace
+
+
+def proxy_eval_genotype(
+    genotype: Genotype,
+    data_dir: str,
+    profile: DatasetProfile,
+    adj: np.ndarray | None,
+    device: str,
+    epochs: int = 4,
+    max_train_batches: int = 60,
+    batch_size: int = 64,
+) -> float:
+    """B3 评估中间档: 几分钟短训给候选架构打个 proxy 分 (val MAE), 供创造 seed 粗筛排序。
+
+    用默认超参 (lr=1e-3, weight_decay=1e-4, 无 lr schedule) 调 train_one 短训:
+    少 epoch + 每 epoch 只跑前 max_train_batches 个 batch, 开销约为全量评估 (HPO 20 trials
+    × 27 epochs × 全量 batch) 的 1/20 量级。
+
+    注意: proxy 分**只用于同一轮候选间的相对排序** (谁拿深评大预算), 不作绝对精度依据 —
+    短训未收敛, 绝对 MAE 与全量评估不可比。浅评候选仍会被真实评测器 (小 HPO 预算) 裁决,
+    proxy 排错的代价有底。
+    """
+    hps = {"lr": 1e-3, "weight_decay": 1e-4, "batch_size": batch_size, "lr_schedule": "none"}
+    mae, _ = train_one(genotype, hps, data_dir, profile, adj, device,
+                       trial=None, max_epochs=epochs, max_train_batches=max_train_batches)
+    return mae
 
 
 def evaluate_architecture(

@@ -52,9 +52,11 @@ src/darwin_st/
               anti-degeneration guard), validation.py (operator gates: shape/grad/NaN/non-trivial,
               the reward-hacking defense), synthesizer.py (plan-then-code, synthesize_many = N
               hypotheses at once), aider_backend.py (writes operators via Aider in a git sandbox),
-              registry.py (injects synthesized ops into SPATIAL_OPS — search space "grows"),
+              registry.py (injects synthesized ops into SPATIAL_OPS — search space "grows";
+              B2: operator lineages — register_variant/update_real_mae/best_in_family),
+              refiner.py (B2 micro-evolution: refine mode small/param/struct + FunSearch best-shot),
               creation_loop.py (diagnose bottleneck → retrieve → synthesize_many → inject →
-              seed genotypes for evolution).
+              seed genotypes for evolution; B2: maybe_refine reuses good operator families first).
 ```
 
 **The full creation closed loop** (validated on server, see SERVER_VALIDATION.md §P2.5-g): orchestrator stagnates → `CreationLoop.maybe_create` diagnoses a bottleneck → `find_cross_domain_analogy` returns a *complementary set* of cross-domain mechanisms → `synthesize_many` generates N fusion hypotheses, Aider writes each in a sandbox, the validation harness gates them → surviving operators are injected into `SPATIAL_OPS` and seed genotypes enter evolution → **real masked-MAE training is the final arbiter** (most fusions die, good ones survive). Synthesized operators register as `synth_`-prefixed spatial ops.

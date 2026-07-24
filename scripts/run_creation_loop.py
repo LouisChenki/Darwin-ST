@@ -9,7 +9,11 @@
 
 环境变量: DATASET / MAX_ROUNDS / N_GPUS / POP_SIZE / HPO_TRIALS / MAX_EPOCHS /
           STAGNATION(默认2, 调小快速触发创造) /
-          CHECKPOINT_DIR(权重存档目录, 默认空=关闭) / CKPT_KEEP(存档保留个数, 默认20)
+          CHECKPOINT_DIR(权重存档目录, 默认空=关闭) / CKPT_KEEP(存档保留个数, 默认20) /
+          USE_PROXY(B3 粗筛开关, 默认1) / PROXY_DEVICE(proxy 短训设备, 默认 cuda:0) /
+          DEEPSEEK_MODEL(强模型, 默认 deepseek-v4-pro) /
+          DEEPSEEK_FAST_MODEL(B5 双模型路由的便宜快模型, 默认 deepseek-v4-flash;
+          置空 → 不单建 fast_llm, 全部假设走强模型)
 """
 
 from __future__ import annotations
@@ -146,21 +150,58 @@ def main():
     # --- 创造层 (真实 DeepSeek + Aider) ---
     model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
     llm = OpenAICompatLLM()
+    # B5 双模型路由: 第 0 个假设用强模型 (质量锚点), 其余用便宜快模型 (成本);
+    # fast 全败自动 escalation 回强模型。DEEPSEEK_FAST_MODEL 置空 → 全部强模型 (行为同 B5 前)。
+    fast_model = os.environ.get("DEEPSEEK_FAST_MODEL", "deepseek-v4-flash")
+    fast_llm = OpenAICompatLLM(model=fast_model) if fast_model else None
+    print(f"[创造] 强模型={model} fast模型={fast_model or '(关闭, 全部强模型)'}")
     backend = AiderBackend(AiderConfig(model=f"deepseek/{model}"))
     synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2, temperature=0.9),
-                                code_backend=backend)
+                                code_backend=backend, fast_llm=fast_llm)
     registry = OperatorRegistry(persist_dir=scope.synth_dir(cache))
     n_loaded = registry.load_persisted()  # 加载**本作用域**之前合成的算子 (换代/换数据集→空目录冷场)
     print(f"[作用域] {scope.dataset}/{scope.space_version} synth_dir={scope.synth_dir(cache)} "
           f"载回 {len(n_loaded)} 算子")
 
-    mem = MemoryStore(os.environ.get("MEMORY_DB", os.path.join(cache, "memory_creation.db")))
+    mem_db = os.environ.get("MEMORY_DB", os.path.join(cache, "memory_creation.db"))
+    mem = MemoryStore(mem_db)
     from darwin_st.creation import CreationConfig
+    from darwin_st.creation.creation_archive import CreationArchive
+    # B1 创造档案 (履历本): 默认放 memory db 同目录, CREATION_ARCHIVE 可覆盖
+    archive_path = os.environ.get(
+        "CREATION_ARCHIVE",
+        os.path.join(os.path.dirname(mem_db) or ".", "creation_archive.jsonl"))
+    print(f"[创造档案] {archive_path}")
     n_hypo = _env_int("N_HYPOTHESES", 4)
     seed_hpo_trials = _env_int("SEED_HPO_TRIALS", 20)   # 创造 seed 专项大 HPO (AlphaEvolve 式深评)
+    ccfg = CreationConfig(n_hypotheses=n_hypo, seed_hpo_trials=seed_hpo_trials,
+                          use_proxy=os.environ.get("USE_PROXY", "1") == "1")
+
+    # B3 评估中间档 (proxy 粗筛): 合成 seed 先在主进程短训打分, 前 proxy_top_k 才给深评大 HPO,
+    # 其余小预算浅评 —— 单轮创造 GPU 成本减半以上。只绑主进程一个设备 (PROXY_DEVICE 默认 cuda:0);
+    # 进程后端 worker 不需要 proxy (proxy 只在主进程创造时用)。USE_PROXY=0 关闭 (行为同 B3 前)。
+    proxy_fn = None
+    if ccfg.use_proxy:
+        from darwin_st.data import prepare as P
+        from darwin_st.data.protocol import get_profile
+        from darwin_st.optim.train import proxy_eval_genotype
+        proxy_device = os.environ.get("PROXY_DEVICE", "cuda:0")
+        _proxy_profile = get_profile(ds)
+        _proxy_data_dir = P.prepare_dataset(ds)     # 与 make_eval_fn 同一缓存, 幂等
+        _proxy_adj = P.load_adj(_proxy_data_dir)
+
+        def proxy_fn(g):
+            return proxy_eval_genotype(g, _proxy_data_dir, _proxy_profile, _proxy_adj,
+                                       proxy_device, epochs=ccfg.proxy_epochs,
+                                       max_train_batches=ccfg.proxy_max_batches)
+        print(f"[B3] proxy 粗筛开: device={proxy_device} epochs={ccfg.proxy_epochs} "
+              f"batches/epoch={ccfg.proxy_max_batches} top_k={ccfg.proxy_top_k} "
+              f"小预算={ccfg.small_hpo_trials}")
+
     cloop = CreationLoop(store, embedder, synth, registry, memory=mem,
-                         config=CreationConfig(n_hypotheses=n_hypo, seed_hpo_trials=seed_hpo_trials),
-                         llm=llm)
+                         config=ccfg,
+                         llm=llm, archive=CreationArchive(archive_path),
+                         proxy_fn=proxy_fn)
 
     # 权重存档 (默认关): CHECKPOINT_DIR 非空 → 训练中刷新纪录的模型权重落盘该目录,
     # 脚本结束时 prune_to_top_k 只留最优 CKPT_KEEP 个防撑盘。worker 进程直接写共享盘。

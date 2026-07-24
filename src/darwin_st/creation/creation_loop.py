@@ -16,15 +16,20 @@
 
 from __future__ import annotations
 
+import math
+import random
+import re
 from dataclasses import dataclass, field
 
 from darwin_st.creation.contracts import FusionRequest
 from darwin_st.creation.synthesizer import OperatorSynthesizer
+from darwin_st.creation.refiner import REFINE_MODES, REFINE_MODE_WEIGHTS, OperatorRefiner
 from darwin_st.creation.registry import OperatorRegistry
 from darwin_st.knowledge.retrieval import find_cross_domain_analogy
 from darwin_st.search.genotype import Genotype, STBlock
 
-__all__ = ["CreationConfig", "CreationOutcome", "CreationLoop", "diagnose_bottleneck"]
+__all__ = ["CreationConfig", "CreationOutcome", "CreationLoop", "diagnose_bottleneck",
+           "parse_failure_gate"]
 
 
 @dataclass
@@ -35,6 +40,18 @@ class CreationConfig:
     seed: int = 0
     use_llm_diagnosis: bool = True  # 优先用 LLM 诊断瓶颈 (训练信号驱动多样化); 失败退回规则版
     seed_hpo_trials: int = 20      # 创造 seed 专项大 HPO 预算 (AlphaEvolve 式优胜者深评; 普通架构走 hpo_cfg)
+    # B3 评估中间档 (proxy 粗筛): 合成算子过验证门后先短训打分, 前 top_k 才给深评大预算
+    use_proxy: bool = True         # False → 全部 seed 直接大预算 (行为同 B3 之前)
+    proxy_top_k: int = 2           # 深评名额: proxy 分升序前 k 个拿 seed_hpo_trials
+    proxy_epochs: int = 4          # proxy 短训 epoch 数 (生产接线用, 见 run_creation_loop)
+    proxy_max_batches: int = 60    # proxy 每 epoch 训练 batch 上限 (生产接线用)
+    small_hpo_trials: int = 3      # 浅评小 HPO 预算 (仍被真实评测器裁决, 只是预算小)
+    # B2 微进化 (算子谱系精炼): 候选族选择阈值
+    refine_mae_window: float = 0.5       # 族 best 实测 MAE 距当前 best ≤ 此值视为"离前沿不远"
+    refine_max_family_versions: int = 3  # 族版本数 < 此值视为"仍在成长期", 直接候选
+    # B5 假设独立采样 (FunSearch/AlphaEvolve): True → synthesize_independent (N 次独立调用,
+    # 组合文法轮转 + 温度阶梯 + 双模型路由); False → synthesize_many (单次调用产 N, 旧行为)
+    independent_sampling: bool = True
 
 
 @dataclass
@@ -88,12 +105,36 @@ def diagnose_bottleneck(best_genotype: Genotype | None, sota_gap: float | None) 
     return "; ".join(clues)
 
 
+_GATE_RE = re.compile(r"门=([A-Za-z_]+)")
+
+
+def _finite(x) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def parse_failure_gate(last_error: str) -> str:
+    """从 SynthesisResult.last_error 解析失败门名 (B1 履历用)。
+
+    合成失败错误形如 "重试 N 次仍未过验证: 验证未过, 门=shape: ..." → 提取 "shape";
+    计划阶段失败 ("计划阶段失败/计划非法/多假设计划阶段失败") → "plan"; 解析不出 → "unknown"。
+    """
+    if not last_error:
+        return "unknown"
+    m = _GATE_RE.search(last_error)
+    if m:
+        return m.group(1)
+    if "计划" in last_error:
+        return "plan"
+    return "unknown"
+
+
 class CreationLoop:
     """Tier-2 创造步骤。orchestrator 在停滞时调 maybe_create()。"""
 
     def __init__(self, store, embedder, synthesizer: OperatorSynthesizer,
                  registry: OperatorRegistry, memory=None, config: CreationConfig | None = None,
-                 llm=None):
+                 llm=None, archive=None, refiner: OperatorRefiner | None = None,
+                 proxy_fn=None, temperature: float = 0.8):
         self.store = store
         self.embedder = embedder
         self.synthesizer = synthesizer
@@ -101,8 +142,24 @@ class CreationLoop:
         self.memory = memory
         self.cfg = config or CreationConfig()
         self.llm = llm                       # OpenAICompatLLM (注入); None 时 _diagnose 退规则版
+        self.archive = archive               # CreationArchive (B1 履历本); None=不记录, 行为不变
+        # B3 proxy 粗筛: proxy_fn(genotype) -> float (短训 val MAE), 设备/数据绑定由外部注入;
+        # None 或 cfg.use_proxy=False → 全部 seed 走大预算, 行为与 B3 之前完全一致
+        self.proxy_fn = proxy_fn
+        # B2 微进化: 精炼器默认复用 synthesizer 的 LLM (低温配置独立); 显式传 None 之外的对象可 mock
+        if refiner is not None:
+            self.refiner = refiner
+        elif synthesizer is not None and getattr(synthesizer, "llm", None) is not None:
+            self.refiner = OperatorRefiner(synthesizer.llm)
+        else:
+            self.refiner = None              # 无 LLM → maybe_refine 恒 None (回落从零创造)
+        self._refine_rng = random.Random(self.cfg.seed)  # mode 加权随机源 (seed 固定, 测试可复现)
         self._round_idx = 0                  # 第几次创造 (OPRO 轨迹用)
-        self._history: list[dict] = []       # 历轮诊断: [{preconditions, bottleneck, result_mae}]
+        # OPRO 轨迹: [{round, bottleneck, preconditions, result_mae, score}]
+        # score = B4 方向信用分 (见 update_direction_outcome)
+        self._history: list[dict] = []
+        # B4 温度自适应 (LLMatic curiosity): 全灭升温探索 / 被 adopted 降温利用, clamp [0.5, 1.0]
+        self._temperature = min(1.0, max(0.5, temperature))
 
     def _diagnose(self, best_genotype: Genotype | None, sota_gap: float | None,
                   best_trace: dict | None) -> tuple[str, list[str] | None]:
@@ -141,8 +198,10 @@ class CreationLoop:
         cur_mae = None
         if best_trace is not None and best_trace.get("best_mae") not in (None, float("inf")):
             cur_mae = best_trace.get("best_mae")
-        self._history.append({"round": self._round_idx, "bottleneck": bottleneck,
-                              "preconditions": override_precs or [], "result_mae": cur_mae})
+        round_idx = self._round_idx
+        self._history.append({"round": round_idx, "bottleneck": bottleneck,
+                              "preconditions": override_precs or [], "result_mae": cur_mae,
+                              "score": 0.0})   # B4 方向信用分初始 0 (结局回授累加)
         self._round_idx += 1
 
         # 2) 跨域检索互补机制集 (override_precs 非空则直接用 LLM 给的前提词做 FAC 召回, 绕过关键词匹配)
@@ -160,11 +219,34 @@ class CreationLoop:
             bottleneck=bottleneck, target_preconditions=res.target_preconditions,
             mechanisms=res.mechanisms,
             baseline_operator=(best_genotype.blocks[0].spatial_op if best_genotype else ""))
-        results = self.synthesizer.synthesize_many(req, n_hypotheses=self.cfg.n_hypotheses,
-                                                   needs_adj=False)
+        # B1 履历回读: 档案非空则把过往成功先例+失败教训喂进 plan prompt (治"每轮失忆重启")
+        exemplars = None
+        if self.archive is not None:
+            ctx = self.archive.exemplar_context()
+            if ctx["successes"] or ctx["failures"]:
+                exemplars = ctx
+        # B5: 默认假设独立采样 (组合文法轮转 + 温度阶梯 + 双模型路由);
+        # independent_sampling=False → 单次调用产 N 的旧路径 (行为同 B5 前)
+        if self.cfg.independent_sampling:
+            results = self.synthesizer.synthesize_independent(
+                req, n_hypotheses=self.cfg.n_hypotheses, needs_adj=False,
+                exemplars=exemplars, temperature=self._temperature)
+        else:
+            results = self.synthesizer.synthesize_many(req, n_hypotheses=self.cfg.n_hypotheses,
+                                                       needs_adj=False, exemplars=exemplars,
+                                                       temperature=self._temperature)
         successes = [r for r in results if r.success and r.operator is not None]
 
+        # B1: 失败假设也进履历本 (失败教训是下一轮 prompt 的反例素材)
+        if self.archive is not None:
+            for r in results:
+                if not (r.success and r.operator is not None):
+                    self._record_to_archive(req, r, round_idx)
+
         if not successes:
+            # B4: 全部假设挂门 (无 seed 产出, 结局立即可知) → 本轮方向记 −1 + 升温探索
+            self.update_direction_outcome(round_idx, -1.0)
+            self._temperature = min(1.0, self._temperature + 0.05)
             err = results[0].last_error if results else "无结果"
             insight = f"融合 {mech_names} 解决'{bottleneck}': {len(results)} 个假设均未过验证"
             self._record_insight(insight, dataset, mech_names, success=False)
@@ -172,12 +254,21 @@ class CreationLoop:
                                    n_hypotheses=len(results), n_success=0,
                                    reason=err[:200], insight=insight)
 
-        # 4) 注入所有成功算子 + 各产出一个待评 genotype
+        # 4) 注入所有成功算子 + 各产出一个待评 genotype (+ B1 成功履历, 带注册名与 seed 签名)
         op_names, seeds = [], []
         for r in successes:
             reg_name = self.registry.register(r.operator)
             op_names.append(reg_name)
-            seeds.append(self._make_seed_genotype(best_genotype, reg_name, best_hps))
+            seed = self._make_seed_genotype(best_genotype, reg_name, best_hps)
+            seed._seed_meta["creation_round"] = round_idx  # B4: 结局回授归属的诊断轮次
+            seeds.append(seed)
+
+        # B3 proxy 粗筛: 短训排序分预算 (前 top_k 深评, 其余浅评), proxy 分进履历
+        proxy_maes = self._assign_seed_budgets(seeds)
+        if self.archive is not None:
+            for r, reg_name, seed, pmae in zip(successes, op_names, seeds, proxy_maes):
+                self._record_to_archive(req, r, round_idx, reg_name=reg_name,
+                                        seed_signature=seed.signature(), proxy_mae=pmae)
 
         compositions = [r.plan.composition for r in successes]
         insight = (f"融合 {mech_names} 解决'{bottleneck}': {len(results)} 假设中 "
@@ -189,6 +280,178 @@ class CreationLoop:
             bottleneck=bottleneck, retrieved_mechanisms=mech_names,
             n_hypotheses=len(results), n_success=len(successes),
             reason="合成并注入成功", insight=insight)
+
+    # ------------------------------------------------------------------
+    # B4 方向信用分 + 温度自适应 (LLMatic curiosity 机制)
+    # ------------------------------------------------------------------
+
+    def update_direction_outcome(self, round_idx: int, score_delta: float) -> None:
+        """把一轮创造方向的实测结局回授成信用分, 累加进 OPRO 轨迹 (诊断 prompt 据此展示+禁令)。
+
+        记分规则:
+          - maybe_create 内全部假设挂门 (无 seed 产出, 立即可知) → 同步记 −1;
+          - orchestrator _digest 回填: seed adopted (KEEP) → +1; DISCARD/CRASH → −0.5。
+        温度自适应: +1 (方向被实测验证) → 合成温度 −0.05 (收敛利用), clamp [0.5, 1.0];
+        降温只由 adopted 触发, 罚分不升温 (全灭升温在 maybe_create 轮末做)。
+        找不到 round_idx (如外部手工喂的轮次) 静默跳过 —— 回授是增益, 不中止闭环。
+        """
+        for h in self._history:
+            if h.get("round") == round_idx:
+                h["score"] = h.get("score", 0.0) + score_delta
+                if score_delta > 0:
+                    self._temperature = max(0.5, self._temperature - 0.05)
+                return
+
+    # ------------------------------------------------------------------
+    # B2 微进化: 算子谱系精炼 ("生"之外加"养")
+    # ------------------------------------------------------------------
+
+    def maybe_refine(self, round_idx: int = 0, best_genotype: Genotype | None = None,
+                     best_hps: dict | None = None, current_best_mae: float | None = None,
+                     dataset: str = "PeMS04") -> CreationOutcome | None:
+        """从算子家谱挑有潜力的族, 让 LLM 小幅改进族内版本 (FunSearch/ELM 式微进化)。
+
+        候选族规则 (保持简单; B4 再加信用分仲裁, 此处不做复杂策略):
+          - 族 best_in_family 的 real_mae 有限且有代码 (无实测 MAE 无从判断潜力);
+          - 且 (族 best 距当前 best ≤ cfg.refine_mae_window, 或族版本数 < cfg.refine_max_family_versions)。
+            current_best_mae 缺省/无效时以各族 best 的最小值为参考 (最强族总会候选)。
+          - 多候选时取族 best MAE 最小者 (前沿优先)。
+        精炼方式: 族内 ≥2 个版本有实测 MAE → best_shot (FunSearch 双版本对比续写);
+        否则按 40/30/30 加权随机 (small/param/struct, 随机源 seed 固定可复现) 精炼族 best 版。
+        成功 → register_variant + 复用 _make_seed_genotype 产待评 genotype
+        (_seed_meta 加 is_refinement/family) + 写 B1 履历 (composition=refine:<mode>)。
+        返回 None = 无候选族/无精炼器 (调用方回落 maybe_create); 精炼失败返回 success=False。
+        """
+        if self.refiner is None or self.registry is None:
+            return None
+        pick = self._pick_refine_candidate(current_best_mae)
+        if pick is None:
+            return None
+        family, best, versions = pick
+        parent_reg = best["reg_name"]
+
+        scored = [v for v in versions if _finite(v.get("real_mae")) and v.get("code")]
+        if len(scored) >= 2:
+            mode = "best_shot"
+            result = self.refiner.best_shot(versions, round_idx)
+        else:
+            mode = self._refine_rng.choices(REFINE_MODES, weights=REFINE_MODE_WEIGHTS, k=1)[0]
+            parent = dict(best)
+            parent["next_version"] = len(versions) + 1   # refiner 据此命名 <family_base>_v<N>
+            result = self.refiner.refine(parent, mode, round_idx)
+
+        mechanisms = list(result.plan.source_mechanisms) if result.plan else []
+        if not (result.success and result.operator is not None):
+            self._record_refinement(family, mode, result, round_idx, mechanisms=mechanisms)
+            err = (result.last_error or "精炼失败")[:200]
+            insight = f"精炼 {family} ({mode}) 未过验证: {err}"
+            self._record_insight(insight, dataset, mechanisms, success=False)
+            return CreationOutcome(False, bottleneck=f"refine:{family}", n_hypotheses=1,
+                                   n_success=0, reason=err, insight=insight)
+
+        reg_name = self.registry.register_variant(result.operator, parent_reg, round_idx=round_idx)
+        seed = self._make_seed_genotype(best_genotype, reg_name, best_hps)
+        seed._seed_meta["is_refinement"] = True   # orchestrator 据此回填 registry real_mae
+        seed._seed_meta["family"] = family
+        seed._seed_meta["creation_round"] = round_idx  # B4: 结局回授归属轮次
+        # B3: 与 maybe_create 共用同一套预算分配 (单候选 ≤ top_k 时不调 proxy, 直接大预算)
+        proxy_maes = self._assign_seed_budgets([seed])
+        self._record_refinement(family, mode, result, round_idx, reg_name=reg_name,
+                                seed_signature=seed.signature(), mechanisms=mechanisms,
+                                proxy_mae=proxy_maes[0])
+        insight = (f"精炼 {family} ({mode}): {parent_reg} → {reg_name}, 待评测 "
+                   f"(族 best MAE={best.get('real_mae')})")
+        self._record_insight(insight, dataset, mechanisms, success=True)
+        return CreationOutcome(True, operator_names=[reg_name], seed_genotypes=[seed],
+                               bottleneck=f"refine:{family}", n_hypotheses=1, n_success=1,
+                               reason="精炼并注入成功", insight=insight)
+
+    def _pick_refine_candidate(self, current_best_mae: float | None):
+        """候选族选择 (规则见 maybe_refine docstring)。返回 (family, best条目, versions) 或 None。"""
+        scored = []
+        for fam in self.registry.families():
+            versions = self.registry.family_versions(fam)
+            best = self.registry.best_in_family(fam)
+            if best is None or not best.get("code"):
+                continue                       # 无实测 MAE / 无代码 → 无法精炼
+            scored.append((fam, best, versions))
+        if not scored:
+            return None
+        if _finite(current_best_mae):
+            ref = current_best_mae
+        else:
+            ref = min(b["real_mae"] for _, b, _ in scored)   # 无外部参考 → 族际最强者
+        cands = [(fam, best, vs) for fam, best, vs in scored
+                 if len(vs) < self.cfg.refine_max_family_versions
+                 or abs(best["real_mae"] - ref) <= self.cfg.refine_mae_window]
+        if not cands:
+            return None
+        cands.sort(key=lambda t: t[1]["real_mae"])           # 前沿优先: 族 best 最小者
+        return cands[0]
+
+    def _record_refinement(self, family: str, mode: str, result, round_idx: int,
+                           reg_name: str | None = None, seed_signature: str | None = None,
+                           mechanisms: list[str] | None = None,
+                           proxy_mae: float | None = None) -> None:
+        """精炼履历写 B1 履历本: composition 记 refine:<mode>, mechanisms 沿用父版 plan 源机制。"""
+        if self.archive is None:
+            return
+        from datetime import datetime, timezone
+
+        from darwin_st.creation.creation_archive import CreationRecord
+
+        plan = result.plan
+        if result.success and result.operator is not None:
+            gate, error, code = "all", None, result.operator.code
+            op_name = reg_name or result.operator.name
+        else:
+            gate = parse_failure_gate(result.last_error)
+            error = result.last_error or None
+            code = ""
+            op_name = plan.operator_name if plan else ""
+        rec = CreationRecord(
+            round_idx=round_idx, created_at=datetime.now(timezone.utc).isoformat(),
+            bottleneck=f"refine:{family}", mechanisms=list(mechanisms or []),
+            operator_name=op_name,
+            composition=f"refine:{mode}",
+            rationale=plan.rationale if plan else "",
+            code=code, gate=gate, error=error, seed_signature=seed_signature,
+            proxy_mae=proxy_mae)
+        try:
+            self.archive.record(rec)
+        except Exception:
+            pass                     # 档案写失败不中止闭环 (履历是增益, 非必需)
+
+    # ------------------------------------------------------------------
+    # B3 评估中间档: proxy 短训粗筛 (AlphaEvolve 级联评估 / LLMatic 廉价首筛)
+    # ------------------------------------------------------------------
+
+    def _assign_seed_budgets(self, seeds: list[Genotype]) -> list[float | None]:
+        """决定每个创造 seed 的 HPO 预算 (深评大预算 vs 浅评小预算), 返回对齐的 proxy MAE 列表。
+
+        proxy_fn 已注入且 cfg.use_proxy 且候选数 > proxy_top_k 时:
+          1. 每个 seed 调 proxy_fn 短训打分 (单个异常 → 记 inf, 不拖死整轮);
+          2. 全部 seed 先挂浅评小预算 (small_hpo_trials);
+          3. 按 proxy MAE 升序 (Python sorted 稳定, 并列/inf 保持原顺序), 前 proxy_top_k 个
+             升深评大预算 (seed_hpo_trials), 深评名额不超 top_k。
+        否则 (无 proxy_fn / 开关关 / 候选数 ≤ top_k): 全部保持 _make_seed_genotype 挂的大预算,
+        proxy_fn 一次不调, 行为与 B3 之前完全一致; 返回全 None (履历 proxy_mae 记空)。
+        """
+        if (not self.cfg.use_proxy) or self.proxy_fn is None \
+                or len(seeds) <= self.cfg.proxy_top_k:
+            return [None] * len(seeds)
+        proxy_maes: list[float] = []
+        for seed in seeds:
+            try:
+                proxy_maes.append(float(self.proxy_fn(seed)))
+            except Exception:
+                proxy_maes.append(float("inf"))   # 单个候选 proxy 崩溃不拖死整轮创造
+        for seed in seeds:
+            seed._seed_meta["hpo_trials"] = self.cfg.small_hpo_trials   # 暂挂浅评小预算
+        order = sorted(range(len(seeds)), key=lambda i: proxy_maes[i])  # 稳定排序保并列原序
+        for i in order[: self.cfg.proxy_top_k]:
+            seeds[i]._seed_meta["hpo_trials"] = self.cfg.seed_hpo_trials  # 胜者升深评
+        return proxy_maes
 
     def _make_seed_genotype(self, best: Genotype | None, op_name: str,
                             best_hps: dict | None = None) -> Genotype:
@@ -223,8 +486,45 @@ class CreationLoop:
         g.validate()
         g._seed_meta = {"warm_start_hps": best_hps or None,
                         "hpo_trials": self.cfg.seed_hpo_trials,
-                        "is_creation_seed": True}
+                        "is_creation_seed": True,
+                        "operator_name": op_name}   # B1: orchestrator 据此回写履历本
         return g
+
+    def _record_to_archive(self, req: FusionRequest, r, round_idx: int,
+                           reg_name: str | None = None, seed_signature: str | None = None,
+                           proxy_mae: float | None = None) -> None:
+        """把一条 SynthesisResult 落成 CreationRecord 追加进履历本 (B1)。
+
+        成功: gate="all" + 代码 + plan 字段 + 注册名 + seed 签名 (orchestrator 回填识别用)。
+        失败: gate=失败门 (从 last_error 解析, 解析不出记 unknown) + error + plan(若有)。
+        档案 IO 失败不中止创造闭环 (履历是增益, 非必需)。
+        """
+        from datetime import datetime, timezone
+
+        from darwin_st.creation.creation_archive import CreationRecord
+
+        plan = r.plan
+        if r.success and r.operator is not None:
+            gate, error, code = "all", None, r.operator.code
+            op_name = reg_name or r.operator.name
+        else:
+            gate = parse_failure_gate(r.last_error)
+            error = r.last_error or None
+            code = ""
+            op_name = plan.operator_name if plan else ""
+        rec = CreationRecord(
+            round_idx=round_idx, created_at=datetime.now(timezone.utc).isoformat(),
+            bottleneck=req.bottleneck, preconditions=list(req.target_preconditions),
+            mechanisms=[m.name for m in req.mechanisms],
+            operator_name=op_name,
+            composition=plan.composition if plan else "",
+            rationale=plan.rationale if plan else "",
+            code=code, gate=gate, error=error, seed_signature=seed_signature,
+            proxy_mae=proxy_mae)          # B3: proxy 粗筛分 (未走 proxy 路径为 None)
+        try:
+            self.archive.record(rec)
+        except Exception:
+            pass                     # 档案写失败不中止创造闭环
 
     def _record_insight(self, text: str, dataset: str, mechs: list[str], success: bool) -> None:
         if self.memory is None:

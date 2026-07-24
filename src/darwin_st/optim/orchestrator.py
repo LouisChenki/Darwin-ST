@@ -100,6 +100,9 @@ class OrchestratorConfig:
     hpo_trials_cap: int = 12              # 近 SOTA 上限 (=当前固定 n_trials, 无回归)
     hpo_trials_k: float = 2.0             # 反比强度 (陡降: 远处明显省)
     hpo_trials_eps: float = 0.3           # 分母平滑
+    # B2 微进化节奏: 停滞触发创造时, 先尝试族内精炼 (maybe_refine), 无候选族 (返回 None)
+    #   才回落从零创造 (maybe_create)。保持简单二档; B4 将加信用分仲裁, 此处不做复杂策略。
+    refine_first: bool = True
 
 
 @dataclass
@@ -375,6 +378,45 @@ class Orchestrator:
             self.state.n_crash += 1
             # crash 不回灌种群 (无有效 fitness), 但已进 graveyard 防重试
 
+        # 4) B1 创造档案回填: 创造 seed 的实测结局回写履历本 (主进程执行, 无跨进程问题)。
+        #    KEEP/DISCARD 记实际有限 MAE, CRASH (nan/inf) 记 None; adopted = 是否 KEEP。
+        meta = getattr(geno, "_seed_meta", None)
+        if meta and meta.get("is_creation_seed") and self.creation_loop is not None:
+            arch = getattr(self.creation_loop, "archive", None)
+            if arch is not None:
+                try:
+                    arch.update_outcome(meta.get("operator_name", ""), geno.signature(),
+                                        res.mae if _finite(res.mae) else None,
+                                        adopted=(status == "KEEP"))
+                except Exception:
+                    pass   # 履历回填失败不中止优化循环 (自主性铁律)
+
+        # 5) 算子家谱回填: 任何创造 seed (普通创造 v1 或 B2 精炼变体) 的实测 MAE 回写家谱
+        #    (lineage + 算子 json)。普通创造的 v1 族也要回填 —— 否则 real_mae 恒 None,
+        #    B2 候选族选择 best_in_family 拿不到 v1 实测成绩。
+        #    KEEP/DISCARD 有限 MAE 都回填 (族内比较靠真实信号); CRASH 无效 MAE 不回填。
+        if meta and (meta.get("is_creation_seed") or meta.get("is_refinement")) \
+                and self.creation_loop is not None and _finite(res.mae):
+            reg = getattr(self.creation_loop, "registry", None)
+            if reg is not None:
+                try:
+                    reg.update_real_mae(meta.get("operator_name", ""), res.mae)
+                except Exception:
+                    pass   # 家谱回填失败不中止优化循环 (同上)
+
+        # 6) B4 方向信用分回授: 创造 seed 的实测结局打分给诊断方向 (LLMatic curiosity)。
+        #    KEEP (adopted) → +1; DISCARD/CRASH → −0.5。+1 同时触发合成温度 −0.05 (温度自适应)。
+        #    无 creation_round 的旧 seed (改动前产出) 跳过, 行为不变。
+        if meta and (meta.get("is_creation_seed") or meta.get("is_refinement")) \
+                and self.creation_loop is not None:
+            rnd = meta.get("creation_round")
+            if rnd is not None:
+                try:
+                    self.creation_loop.update_direction_outcome(
+                        rnd, 1.0 if status == "KEEP" else -0.5)
+                except Exception:
+                    pass   # 信用分回授失败不中止优化循环 (增益非必需; 自定义 loop 可无此方法)
+
         self.state.history.append({
             "eval": self.state.evals, "status": status, "mae": res.mae,
             "best_mae": self.state.best_mae, "device": res.device,
@@ -424,8 +466,12 @@ class Orchestrator:
         return self.state
 
     def _try_creation(self) -> bool:
-        """停滞时触发 Tier-2 跨域创造: 合成新算子 → 待评 genotype 入队。返回是否成功注入。
+        """停滞时触发 Tier-2 创造: B2 起【精炼优先】——先族内微进化, 无候选再从零创造。
 
+        节奏 (见 OrchestratorConfig.refine_first, 默认开):
+          1. creation_loop.maybe_refine(): 有候选族 → 精炼算子家谱 → 待评 genotype 入队;
+             返回 None (无候选族/无精炼器) → 2。
+          2. creation_loop.maybe_create(): 原从零跨域创造。
         失败/无创造层都不中止循环(自主性: 创造是低频增益, 非必需)。返回 True 表示有 seed 入队
         (调用方据此进精修窗口); False 表示无创造层/无产出/出错(调用方走 island_reset)。
         """
@@ -435,13 +481,27 @@ class Orchestrator:
         if self.state.sota_mae is not None and self.state.best_mae < float("inf"):
             gap = self.state.best_mae - self.state.sota_mae
         try:
-            outcome = self.creation_loop.maybe_create(
-                self.state.best_genotype, sota_gap=gap,
-                run_tag=self.cfg.run_tag, dataset=self.cfg.dataset,
-                best_trace=self.state.best_trace, best_hps=self.state.best_hps)
+            outcome = None
+            kind = "create"
+            if self.cfg.refine_first:
+                maybe_refine = getattr(self.creation_loop, "maybe_refine", None)
+                if callable(maybe_refine):
+                    outcome = maybe_refine(round_idx=self.state.rounds,
+                                           best_genotype=self.state.best_genotype,
+                                           best_hps=self.state.best_hps,
+                                           current_best_mae=self.state.best_mae,
+                                           dataset=self.cfg.dataset)
+                    if outcome is not None:
+                        kind = "refine"
+            if outcome is None:
+                outcome = self.creation_loop.maybe_create(
+                    self.state.best_genotype, sota_gap=gap,
+                    run_tag=self.cfg.run_tag, dataset=self.cfg.dataset,
+                    best_trace=self.state.best_trace, best_hps=self.state.best_hps)
             if outcome.success and outcome.seed_genotypes:
                 self._pending_seed_genotypes.extend(outcome.seed_genotypes)
-                self.state.history.append({"event": "creation", "operators": outcome.operator_names,
+                self.state.history.append({"event": "creation", "kind": kind,
+                                           "operators": outcome.operator_names,
                                            "bottleneck": outcome.bottleneck,
                                            "n_success": outcome.n_success})
                 # 进程后端: 新 synth 算子已 persist → 需 refresh_workers 让新 worker load_persisted。
