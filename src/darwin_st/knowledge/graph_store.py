@@ -13,12 +13,15 @@ FAC: mechanisms_sharing_precondition(p) → 沿前提图拉同前提的机制(�
 
 from __future__ import annotations
 
+import json
+import os
+from dataclasses import asdict
 from typing import Protocol
 
 import numpy as np
 
 from darwin_st.knowledge.embedding import Embedder, cosine_sim_matrix
-from darwin_st.knowledge.ontology import Mechanism
+from darwin_st.knowledge.ontology import Evidence, Mechanism
 
 __all__ = ["GraphStore", "InMemoryGraphStore", "Neo4jGraphStore"]
 
@@ -88,6 +91,25 @@ class InMemoryGraphStore:
 # ---------------------------------------------------------------------------
 
 
+def _evidence_to_dicts(evidence: list[Evidence]) -> list[dict]:
+    """Evidence 列表 → dict 列表 (写入 Neo4j 前的中间表示)。"""
+    return [asdict(e) for e in evidence]
+
+
+def _dicts_to_evidence(dicts) -> list[Evidence]:
+    """dict 列表 → Evidence 列表 (读回重建; 字段缺失给默认, 容忍旧数据/脏数据)。"""
+    out: list[Evidence] = []
+    for d in dicts or []:
+        if not isinstance(d, dict):
+            continue
+        out.append(Evidence(
+            dataset=str(d.get("dataset", "")), metric=str(d.get("metric", "")),
+            delta=str(d.get("delta", "")), grade=str(d.get("grade", "moderate")) or "moderate",
+            source=str(d.get("source", "")),
+        ))
+    return out
+
+
 class Neo4jGraphStore:
     """Neo4j 后端。机制/前提节点 + HAS_PRECONDITION 边; embedding 存为节点属性。
 
@@ -96,9 +118,13 @@ class Neo4jGraphStore:
     """
 
     def __init__(self, embedder: Embedder, uri: str = "bolt://localhost:7687",
-                 user: str = "neo4j", password: str = "darwin_st_2024"):
+                 user: str = "neo4j", password: str | None = None):
         from neo4j import GraphDatabase
 
+        # 密码构造期解析一次: 显式传参 > env NEO4J_PASSWORD > 旧默认值 (仅本地开发兼容;
+        # 生产/服务器必须设 NEO4J_PASSWORD 环境变量, 勿再依赖硬编码默认)。
+        if password is None:
+            password = os.environ.get("NEO4J_PASSWORD", "darwin_st_2024")
         self.embedder = embedder
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
         self._ensure_constraints()
@@ -111,6 +137,9 @@ class Neo4jGraphStore:
     def add_mechanism(self, mech: Mechanism) -> None:
         mech.validate()
         emb = self.embedder.embed([mech.embedding_text()])[0].tolist()
+        # Neo4j 属性只支持原始类型及其数组 (不支持嵌套 map) → evidence 存 JSON 字符串;
+        # anti_patterns (list[str]) / inferred (bool) 可直接存。
+        ev_json = json.dumps(_evidence_to_dicts(mech.evidence), ensure_ascii=False)
         with self.driver.session() as s:
             s.run(
                 """
@@ -118,12 +147,14 @@ class Neo4jGraphStore:
                 SET m.abstract_function=$af, m.causal_behavior=$cb, m.math_structure=$ms,
                     m.origin_domain=$dom, m.abstraction_level=$lvl, m.consequences=$cons,
                     m.provenance=$prov, m.embedding=$emb, m.preconditions=$preconds,
-                    m.function_tags=$ftags
+                    m.function_tags=$ftags, m.evidence=$ev, m.anti_patterns=$ap,
+                    m.inferred=$inf
                 """,
                 name=mech.name, af=mech.abstract_function, cb=mech.causal_behavior,
                 ms=mech.math_structure, dom=mech.origin_domain, lvl=mech.abstraction_level,
                 cons=mech.consequences, prov=mech.provenance, emb=emb,
                 preconds=mech.preconditions, ftags=mech.function_tags,
+                ev=ev_json, ap=mech.anti_patterns, inf=mech.inferred,
             )
             for p in mech.preconditions:
                 s.run(
@@ -137,6 +168,11 @@ class Neo4jGraphStore:
                 )
 
     def _row_to_mech(self, rec) -> Mechanism:
+        # 向后兼容: 旧库节点可能无 evidence/anti_patterns/inferred 属性 → rec.get 给默认;
+        # inferred 缺省 True = 待人工复核 (与 ontology 的默认语义一致, 勿反)。
+        ev_raw = rec.get("evidence")
+        if isinstance(ev_raw, str):
+            ev_raw = json.loads(ev_raw)          # 新库写法: JSON 字符串
         return Mechanism(
             name=rec["name"], abstract_function=rec.get("abstract_function", ""),
             preconditions=rec.get("preconditions", []) or [],
@@ -147,6 +183,9 @@ class Neo4jGraphStore:
             origin_domain=rec.get("origin_domain", "ST"),
             abstraction_level=rec.get("abstraction_level", "concept"),
             provenance=rec.get("provenance", ""),
+            evidence=_dicts_to_evidence(ev_raw or []),
+            anti_patterns=list(rec.get("anti_patterns", []) or []),
+            inferred=bool(rec.get("inferred", True)),
         )
 
     def all_mechanisms(self) -> list[Mechanism]:

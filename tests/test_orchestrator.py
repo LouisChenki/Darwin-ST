@@ -173,6 +173,51 @@ def test_memory_populated():
     mem.close()
 
 
+def test_memory_records_metrics_and_bd():
+    """val_rmse/val_mape 与 behavior_descriptor 落库 (此前 rmse 恒 NULL/BD 恒 {})。"""
+    from darwin_st.optim.archive import behavior_descriptor
+
+    def eval_fn(geno, device):
+        return EvalResult(genotype=geno, status="OK", mae=20.0, rmse=30.0, device=device,
+                          extra={"num_params": 80_000, "val_mape": 12.5})
+
+    mem = MemoryStore(":memory:")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=2, target_mae=0.0)
+    orch = Orchestrator(cfg, eval_fn, devices=2, memory=mem)
+    orch.run()
+    rows = mem.list_trials(dataset="PeMS04")
+    assert rows, "无落库记录"
+    for r in rows:
+        assert r["val_rmse"] == 30.0, "val_rmse 未落库"
+        assert r["val_mape"] == 12.5, "val_mape 未落库"
+        # BD 四键齐全且与 archive 的 behavior_descriptor 一致 (同一函数直算)
+        bd = r["behavior_descriptor"]
+        assert set(bd) == {"spatial_family", "temporal_family", "param_bucket", "depth_bucket"}
+        geno = Genotype.from_dict(r["genotype"])
+        assert bd == behavior_descriptor(geno, r["num_params"])
+    mem.close()
+
+
+def test_memory_metrics_none_when_invalid():
+    """CRASH / inf 指标 → val_* 落 NULL (不污染 best_so_far 的 IS NOT NULL 过滤); BD 仍记。"""
+    def crash_eval(geno, device):
+        return EvalResult(genotype=geno, status="CRASH", device=device, fail_reason="mock_nan",
+                          extra={"num_params": 50_000})
+
+    mem = MemoryStore(":memory:")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=1, target_mae=0.0)
+    orch = Orchestrator(cfg, crash_eval, devices=1, memory=mem)
+    orch.run()
+    rows = mem.list_trials(dataset="PeMS04")
+    assert rows and all(r["val_mae"] is None and r["val_rmse"] is None and r["val_mape"] is None
+                        for r in rows)
+    assert all(set(r["behavior_descriptor"]) == {"spatial_family", "temporal_family",
+                                                 "param_bucket", "depth_bucket"} for r in rows)
+    mem.close()
+
+
 def test_archive_populated():
     cfg = OrchestratorConfig(population_size=8, tournament_size=3, max_rounds=8, target_mae=0.0)
     orch = Orchestrator(cfg, _make_eval_fn(), devices=2)
@@ -623,6 +668,30 @@ def test_archive_empty_falls_back_to_ask(monkeypatch):
     assert len(orch.archive) == 0
     g = orch._next_genotype()
     g.validate()   # 合法
+
+
+def test_archive_parent_p_env_read_once_at_construction(monkeypatch):
+    """ARCHIVE_PARENT_P 在构造期读一次: 构造后改 env 不影响已有实例 (治运行期静默生效)。"""
+    monkeypatch.setenv("ARCHIVE_PARENT_P", "1.0")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=6, tournament_size=3)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    assert orch._archive_parent_p == 1.0
+    # 构造后改 env → 已有实例冻结不变; 新实例才读到新值
+    monkeypatch.setenv("ARCHIVE_PARENT_P", "0")
+    assert orch._archive_parent_p == 1.0
+    orch2 = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    assert orch2._archive_parent_p == 0.0
+
+
+def test_archive_parent_p_env_invalid_and_clamped(monkeypatch):
+    """env 非法值容错回默认 0.5; 越界值裁剪到 [0,1] (构造期解析语义不变)。"""
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=6, tournament_size=3)
+    monkeypatch.setenv("ARCHIVE_PARENT_P", "junk")
+    assert Orchestrator(cfg, _make_eval_fn(), devices=1)._archive_parent_p == 0.5
+    monkeypatch.setenv("ARCHIVE_PARENT_P", "-3")
+    assert Orchestrator(cfg, _make_eval_fn(), devices=1)._archive_parent_p == 0.0
+    monkeypatch.delenv("ARCHIVE_PARENT_P")
+    assert Orchestrator(cfg, _make_eval_fn(), devices=1)._archive_parent_p == 0.5
 
 
 def test_island_reset_reseeds_evolution():

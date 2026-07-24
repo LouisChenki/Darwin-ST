@@ -20,7 +20,8 @@ from typing import Protocol
 
 import numpy as np
 
-__all__ = ["Embedder", "HashEmbedder", "SentenceTransformerEmbedder", "cosine_sim_matrix"]
+__all__ = ["Embedder", "HashEmbedder", "SentenceTransformerEmbedder", "cosine_sim_matrix",
+           "ST_INSTALL_HINT", "sentence_transformers_available", "warn_hash_fallback"]
 
 
 class Embedder(Protocol):
@@ -87,11 +88,34 @@ class HashEmbedder:
 # SentenceTransformerEmbedder: 真实语义 embedding (服务器)
 # ---------------------------------------------------------------------------
 
+# 安装提示统一口径 (pyproject [dependency-groups].semantic), 各处警告/报错都引用它
+ST_INSTALL_HINT = "uv sync --group semantic  (pip 等价: pip install 'sentence-transformers>=2.7.0')"
+
+
+def sentence_transformers_available() -> bool:
+    """sentence-transformers 是否已安装。只查 module spec, 不 import 不下载模型。"""
+    import importlib.util
+    return importlib.util.find_spec("sentence_transformers") is not None
+
+
+def warn_hash_fallback(context: str = "") -> None:
+    """退回 HashEmbedder 时打一次醒目警告: 检索质量显著退化 + 安装提示。
+
+    背景 (docs/SERVER_VALIDATION.md): Hash 嵌入下检索语义分仅 0.00-0.30, 真实语义
+    0.54-0.70 —— 静默退回等于 MAC 向量路径形同虚设, 必须让用户看见。
+    """
+    tag = f" ({context})" if context else ""
+    print("!" * 72)
+    print(f"[警告] sentence-transformers 不可用{tag}, 退回 HashEmbedder —— "
+          "跨域检索质量将显著退化 (语义分 0.54-0.70 → 0.00-0.30)!")
+    print(f"       生产检索请装真语义嵌入: {ST_INSTALL_HINT}")
+    print("!" * 72, flush=True)
+
 
 class SentenceTransformerEmbedder:
     """基于 sentence-transformers 的真实语义嵌入 (延迟加载模型)。
 
-    默认多语言模型(中英都行)。需 `pip install sentence-transformers`。
+    默认多语言模型(中英都行)。需装 sentence-transformers (`uv sync --group semantic`)。
     """
 
     def __init__(self, model_name: str = "paraphrase-multilingual-MiniLM-L12-v2"):
@@ -101,7 +125,12 @@ class SentenceTransformerEmbedder:
 
     def _ensure(self):
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError as e:
+                raise ImportError(
+                    f"sentence-transformers 未安装, 无法加载真实语义嵌入模型。安装: {ST_INSTALL_HINT}"
+                ) from e
 
             self._model = SentenceTransformer(self.model_name)
             self._dim = int(self._model.get_sentence_embedding_dimension())

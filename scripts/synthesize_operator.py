@@ -19,7 +19,8 @@ except Exception:
     pass
 
 from darwin_st.knowledge import all_seed_mechanisms
-from darwin_st.knowledge.embedding import SentenceTransformerEmbedder, HashEmbedder
+from darwin_st.knowledge.embedding import (HashEmbedder, SentenceTransformerEmbedder,
+                                           sentence_transformers_available, warn_hash_fallback)
 from darwin_st.knowledge.graph_store import Neo4jGraphStore, InMemoryGraphStore
 from darwin_st.knowledge.retrieval import find_cross_domain_analogy
 from darwin_st.creation import FusionRequest, OperatorSynthesizer, SynthesisConfig
@@ -36,7 +37,12 @@ def main():
     print(f"瓶颈: {bottleneck}\n")
 
     # 1) 跨域检索互补机制集 (用 Neo4j; 失败回退内存)
-    embedder = SentenceTransformerEmbedder()
+    # 真语义嵌入缺失时显式回退 Hash + 醒目警告 (检索质量退化, 但合成流程仍可跑通)
+    if sentence_transformers_available():
+        embedder = SentenceTransformerEmbedder()
+    else:
+        warn_hash_fallback("synthesize_operator 跨域检索")
+        embedder = HashEmbedder(dim=256)
     try:
         store = Neo4jGraphStore(embedder)
         if not store.all_mechanisms():

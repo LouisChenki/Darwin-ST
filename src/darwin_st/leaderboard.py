@@ -236,8 +236,13 @@ def render_leaderboard_md(
 def render_model_card(
     row: LeaderboardRow, dataset: str, sota_name: str | None, sota_mae: float | None,
     synth_meta: dict[str, dict] | None = None, protocol_note: str | None = None,
+    weights_file: str | None = None,
 ) -> str:
-    """渲染单个本项目模型的人读模型卡 (架构 + 超参 + 用到的跨域算子 + 性能 + 谱系)。"""
+    """渲染单个本项目模型的人读模型卡 (架构 + 超参 + 用到的跨域算子 + 性能 + 谱系)。
+
+    weights_file: 归档目录里的权重文件名 (如 "model.pt", 由导出层拷入 checkpoint 存档后传入);
+    给定时在"复现"一节加一行权重存档说明。None = 无权重存档 (旧行为)。
+    """
     synth_meta = synth_meta or {}
     g = row.genotype or {}
     blocks = g.get("blocks", [])
@@ -301,6 +306,9 @@ def render_model_card(
     lines += ["", "## 复现", "",
               "- 架构: [`genotype.json`](genotype.json) → `Genotype.from_dict(...)` → `build_model(...)`",
               "- 超参: [`hparams.json`](hparams.json)"]
+    if weights_file:
+        lines.append(f"- 权重存档: [`{weights_file}`]({weights_file}) "
+                     "(训练最优 val-MAE 步的 state_dict, 附 sidecar 元数据 `.meta.json`)")
     if row.synth_ops:
         lines.append("- 合成算子: `operators/*.py` 经 `OperatorRegistry.load_persisted()` 注入后方可构建")
     lines.append("")

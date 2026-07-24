@@ -11,6 +11,7 @@
       <dataset>.md                   # 单数据集榜单 (baseline+本项目混排)
       models/<dataset>/<rank>_mae<x>_<sig>/
         genotype.json  hparams.json  model_card.md
+        model.pt + model.meta.json          # 若 CHECKPOINT_DIR 里有对应签名的权重存档
         operators/<synth_op>.py + .json   # 若用了合成算子 (复现需要)
 
 用法 (导出本地/拷回的 db):
@@ -20,11 +21,13 @@
 环境变量 (均有默认):
     MEMORY_DB(必需有效路径), OPS_DIR(synth 算子持久目录), OUT_DIR(默认 leaderboard),
     DATASETS(逗号分隔, 默认全 baseline_registry 数据集), RUN_TAG(隔离某次实验, 默认不隔离全收),
-    THRESHOLD(入榜门槛 MAE; 默认=该数据集最弱 baseline; "none"=不设限全收 KEEP)。
+    THRESHOLD(入榜门槛 MAE; 默认=该数据集最弱 baseline; "none"=不设限全收 KEEP),
+    CHECKPOINT_DIR(权重存档目录; 设了则把对应签名的 model.pt+sidecar 一并归档)。
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -85,6 +88,36 @@ def _copy_synth_ops(synth_ops, synth_meta, dest_ops_dir) -> list[str]:
     return copied
 
 
+def _find_checkpoint(ckpt_dir: str | None, dataset: str, signature: str | None) -> str | None:
+    """在权重存档目录里按文件名找该模型对应的 .pt (命名 <dataset>_<sig[:12]>.pt, 见 train.py)。
+
+    先精确匹配 sig[:12]; 找不到再退 sig[:8] 前缀 glob (手工改存档/旧命名兜底)。无命中 → None。
+    """
+    if not ckpt_dir or not signature or not os.path.isdir(ckpt_dir):
+        return None
+    exact = os.path.join(ckpt_dir, f"{dataset}_{signature[:12]}.pt")
+    if os.path.exists(exact):
+        return exact
+    hits = sorted(glob.glob(os.path.join(ckpt_dir, f"{dataset}_{signature[:8]}*.pt")))
+    return hits[0] if hits else None
+
+
+def _copy_checkpoint(ckpt_dir: str | None, dataset: str, signature: str | None,
+                     mdir: str) -> str | None:
+    """把该模型的权重 .pt + sidecar 拷进归档目录 (model.pt + model.meta.json)。
+
+    返回拷入后的权重文件名 ("model.pt") 供模型卡引用; 无存档 → None (不致命)。
+    """
+    src = _find_checkpoint(ckpt_dir, dataset, signature)
+    if src is None:
+        return None
+    shutil.copy2(src, os.path.join(mdir, "model.pt"))
+    meta_src = src + ".meta.json"
+    if os.path.exists(meta_src):
+        shutil.copy2(meta_src, os.path.join(mdir, "model.meta.json"))
+    return "model.pt"
+
+
 def _write(path: str, text: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -92,7 +125,8 @@ def _write(path: str, text: str) -> None:
 
 
 def export(memory_db: str, out_dir: str, datasets: list[str],
-           ops_dir: str | None, run_tag: str | None, threshold_env: str | None) -> None:
+           ops_dir: str | None, run_tag: str | None, threshold_env: str | None,
+           ckpt_dir: str | None = None) -> None:
     store = MemoryStore(memory_db)
     synth_meta = _load_synth_meta(ops_dir)
     summaries: list[dict] = []
@@ -137,9 +171,11 @@ def export(memory_db: str, out_dir: str, datasets: list[str],
                        json.dumps(r.hp, ensure_ascii=False, indent=2))
                 if r.synth_ops:
                     _copy_synth_ops(r.synth_ops, synth_meta, os.path.join(mdir, "operators"))
+                weights_file = _copy_checkpoint(ckpt_dir, ds, r.signature, mdir)
                 _write(os.path.join(mdir, "model_card.md"),
                        render_model_card(r, ds, sota_name, sota_mae,
-                                         synth_meta=synth_meta, protocol_note=protocol))
+                                         synth_meta=synth_meta, protocol_note=protocol,
+                                         weights_file=weights_file))
 
             summaries.append({
                 "dataset": ds, "sota_name": sota_name, "sota_mae": sota_mae,
@@ -167,6 +203,7 @@ def main():
         sys.exit(1)
     out_dir = os.environ.get("OUT_DIR", "leaderboard")
     ops_dir = os.environ.get("OPS_DIR")  # synth 算子持久目录 (没有则模型卡无算子代码链接)
+    ckpt_dir = os.environ.get("CHECKPOINT_DIR")  # 权重存档目录 (没有则归档不含 model.pt)
     run_tag = os.environ.get("RUN_TAG")  # None = 不隔离, 全收
     threshold_env = os.environ.get("THRESHOLD")
     ds_env = os.environ.get("DATASETS")
@@ -174,8 +211,8 @@ def main():
                 if ds_env else list(BASELINE_METRICS.keys()))
 
     print(f"=== 排行榜导出 ===\n db={memory_db} ops_dir={ops_dir} out={out_dir} "
-          f"datasets={datasets} run_tag={run_tag or '(全部)'}")
-    export(memory_db, out_dir, datasets, ops_dir, run_tag, threshold_env)
+          f"datasets={datasets} run_tag={run_tag or '(全部)'} ckpt_dir={ckpt_dir}")
+    export(memory_db, out_dir, datasets, ops_dir, run_tag, threshold_env, ckpt_dir)
 
 
 if __name__ == "__main__":

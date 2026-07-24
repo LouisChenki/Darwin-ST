@@ -8,7 +8,8 @@
     DARWIN_ST_CACHE=... GITHUB_MIRROR=... python scripts/run_creation_loop.py
 
 环境变量: DATASET / MAX_ROUNDS / N_GPUS / POP_SIZE / HPO_TRIALS / MAX_EPOCHS /
-          STAGNATION(默认2, 调小快速触发创造)
+          STAGNATION(默认2, 调小快速触发创造) /
+          CHECKPOINT_DIR(权重存档目录, 默认空=关闭) / CKPT_KEEP(存档保留个数, 默认20)
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ from darwin_st.memory.store import MemoryStore
 from darwin_st.search.genotype import Genotype, STBlock
 
 from darwin_st.knowledge import all_seed_mechanisms
-from darwin_st.knowledge.embedding import SentenceTransformerEmbedder
+from darwin_st.knowledge.embedding import (HashEmbedder, SentenceTransformerEmbedder,
+                                           sentence_transformers_available, warn_hash_fallback)
 from darwin_st.knowledge.graph_store import Neo4jGraphStore, InMemoryGraphStore
 from darwin_st.knowledge.qc import mechanisms_from_cards
 from darwin_st.creation import (CreationLoop, OperatorRegistry, OperatorSynthesizer,
@@ -114,7 +116,13 @@ def main():
     mechs, kb_tag = _load_mechanisms(cache)
     kb_reload = os.environ.get("KB_RELOAD", "0") == "1"
     print(f"[知识] 源={kb_tag} 域分布={_domain_dist(mechs)}")
-    embedder = SentenceTransformerEmbedder()
+    # 真语义嵌入缺失时显式回退 Hash + 醒目警告: 否则 ModuleNotFoundError 会在下面的
+    # Neo4j try/except 里被误报成 "Neo4j 不可用", 且内存图路径再抛一次, 用户不知真因。
+    if sentence_transformers_available():
+        embedder = SentenceTransformerEmbedder()
+    else:
+        warn_hash_fallback("run_creation_loop 生产检索")
+        embedder = HashEmbedder(dim=256)
     try:
         store = Neo4jGraphStore(embedder)
         existing = len(store.all_mechanisms())
@@ -154,16 +162,22 @@ def main():
                          config=CreationConfig(n_hypotheses=n_hypo, seed_hpo_trials=seed_hpo_trials),
                          llm=llm)
 
+    # 权重存档 (默认关): CHECKPOINT_DIR 非空 → 训练中刷新纪录的模型权重落盘该目录,
+    # 脚本结束时 prune_to_top_k 只留最优 CKPT_KEEP 个防撑盘。worker 进程直接写共享盘。
+    ckpt_dir = os.environ.get("CHECKPOINT_DIR", "") or None
+    ckpt_keep = _env_int("CKPT_KEEP", 20)
+
     # --- 优化引擎 (真实训练) ---
     hpo_cfg = HPOConfig(n_trials=hpo_trials, max_epochs=max_epochs,
                         min_resource=2, reduction_factor=3, n_startup_trials=2,
                         early_stop_patience=_env_int("EARLY_STOP_PATIENCE", 0),  # >0 启用收敛早停
                         early_stop_min_delta=float(os.environ.get("EARLY_STOP_MIN_DELTA", "0.001")))
-    eval_fn = make_eval_fn(ds, hpo_cfg=hpo_cfg)
+    eval_fn = make_eval_fn(ds, hpo_cfg=hpo_cfg, checkpoint_dir=ckpt_dir)
     # 进程后端: worker 自建 eval_fn + 从 persist_dir 重载 synth 算子 (spawn 子进程丢进程全局 SPATIAL_OPS)
     backend = os.environ.get("BACKEND", "auto")
     eval_spec = EvalSpec(dataset=ds, hpo_cfg=hpo_cfg,
-                         synth_persist_dir=scope.synth_dir(cache))   # 同 registry 单一源, 主/worker 一致
+                         synth_persist_dir=scope.synth_dir(cache),   # 同 registry 单一源, 主/worker 一致
+                         checkpoint_dir=ckpt_dir)
     base = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64)  # 非 RESUME 时的弱基线 (逼出创造)
     # RESUME=1 (看门狗重启续跑用): **作用域匹配**暖启动 —— 只从本 (dataset, space_version) 的最优 KEEP
     # 暖启动。换代/换数据集 (space_version 变) 时查不到旧代最优 → base=None → 走 seed_genotypes 冷启动
@@ -224,6 +238,15 @@ def main():
     print(f"\n=== 结束: {state.stop_reason} ({dt:.0f}s) ===")
     print(f"评估 {state.evals}: KEEP={state.n_keep} DISCARD={state.n_discard} CRASH={state.n_crash}")
     print(f"最优 MAE={state.best_mae if state.best_mae<1e9 else 'inf'}")
+
+    # 权重存档收尾: 只留 top-K 最优 (按 sidecar val_mae), 防长跑撑盘。失败不致命。
+    if ckpt_dir:
+        from darwin_st.optim.checkpoint import prune_to_top_k
+        try:
+            pruned = prune_to_top_k(ckpt_dir, keep=ckpt_keep)
+            print(f"[checkpoint] 权重保留 top-{ckpt_keep}, 清理 {len(pruned)} 个 → {ckpt_dir}")
+        except Exception as e:
+            print(f"[checkpoint] prune 失败 ({type(e).__name__}: {e}), 不致命")
 
     # 创造事件
     creations = [h for h in state.history if h.get("event") == "creation"]

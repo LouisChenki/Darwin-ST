@@ -139,6 +139,68 @@ def test_temporal_embeddings_with_indices():
 
 
 # ---------------------------------------------------------------------------
+# HPO 旋钮接线: dropout / num_heads
+# ---------------------------------------------------------------------------
+
+
+def test_dropout_default_is_identity():
+    """默认 dropout=0.0 → nn.Dropout(0.0) 恒等, 现有行为完全不变。"""
+    geno = random_genotype(depth=1, spatial="gcn", temporal="tcn")
+    m = build_model(geno, num_nodes=N, in_channels=C, seq_len_in=T_IN, seq_len_out=T_OUT, adj=_adj())
+    assert isinstance(m.dropout, torch.nn.Dropout)
+    assert m.dropout.p == 0.0
+
+
+def test_dropout_positive_present_and_trainable():
+    """dropout>0 → 模型含生效的 Dropout 层, 且训练可跑 (小张量 CPU 降 loss)。"""
+    torch.manual_seed(0)
+    geno = random_genotype(depth=1, spatial="gcn", temporal="tcn")
+    m = build_model(geno, num_nodes=N, in_channels=C, seq_len_in=T_IN, seq_len_out=T_OUT,
+                    adj=_adj(), dropout=0.3)
+    assert m.dropout.p == 0.3
+    # dropout 在 train 模式真生效: 同一输入两次前向不同 (随机丢置)
+    x = torch.randn(B, T_IN, N, C)
+    m.train()
+    assert not torch.equal(m(x), m(x))
+    # 训练可跑: 几步降 loss (管道不被 dropout 打断)
+    y = torch.randn(B, T_OUT, N)
+    opt = torch.optim.Adam(m.parameters(), lr=5e-3)
+    losses = []
+    for _ in range(30):
+        opt.zero_grad()
+        loss = torch.abs(m(x) - y).mean()
+        loss.backward(); opt.step()
+        losses.append(loss.item())
+    assert losses[-1] < losses[0]
+
+
+def test_num_heads_wired_to_attention_ops():
+    """num_heads 只传给头数可配的算子 (attn): MultiheadAttention 头数随之变。"""
+    geno = Genotype(blocks=[STBlock("gcn", "attn")], hidden=64)
+    m2 = build_model(geno, N, C, T_IN, T_OUT, _adj(), num_heads=2)
+    assert m2.blocks[0].temporal.attn.num_heads == 2
+    # 默认 None → 算子自带默认 4 (现有行为不变)
+    m_def = build_model(geno, N, C, T_IN, T_OUT, _adj())
+    assert m_def.blocks[0].temporal.attn.num_heads == 4
+
+
+def test_num_heads_ignored_by_fixed_head_ops():
+    """头数写死的算子 (gat/dynamic_gat) 不传 num_heads: 不崩, 结构无变化。"""
+    geno = Genotype(blocks=[STBlock("gat", "gru")], hidden=64)
+    m = build_model(geno, N, C, T_IN, T_OUT, _adj(), num_heads=8)
+    assert not hasattr(m.blocks[0].spatial, "attn")   # GATConv 单头, 无 MultiheadAttention
+    out = m(torch.randn(B, T_IN, N, C))
+    assert out.shape == (B, T_OUT, N)
+
+
+def test_num_heads_wired_to_joint_op():
+    """一体槽的头数可配算子 (st_graph_attn) 也接通 num_heads。"""
+    geno = Genotype(blocks=[STBlock("identity", "identity", joint_op="st_graph_attn")], hidden=64)
+    m = build_model(geno, N, C, T_IN, T_OUT, _adj(), num_heads=1)
+    assert m.blocks[0].joint.attn.num_heads == 1
+
+
+# ---------------------------------------------------------------------------
 # 参数量
 # ---------------------------------------------------------------------------
 

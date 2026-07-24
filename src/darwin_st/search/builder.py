@@ -24,7 +24,7 @@ import torch.nn as nn
 from darwin_st.data.adjacency import random_walk_normalize, symmetric_normalize
 from darwin_st.search.embeddings import STEmbedding
 from darwin_st.search.genotype import Genotype, STBlock
-from darwin_st.search.operators import build_op, build_spatial_op, build_temporal_op
+from darwin_st.search.operators import accepts_num_heads, build_op, build_spatial_op, build_temporal_op
 
 __all__ = ["STBlockModule", "STModel", "build_model", "count_params"]
 
@@ -42,17 +42,26 @@ class STBlockModule(nn.Module):
       - cross:         时序(x) * sigmoid(空间(x)) (门控交叉交互, 时空互相调制)
       - iterative:     S→T→S→T (双向迭代两轮, 加残差)
     每块后接 LayerNorm。全程 [B,T,N,hidden]。
+
+    num_heads: HPO 调的多头注意力头数, 只传给头数可配的算子 (accepts_num_heads 判定:
+    attn/st_graph_attn/series_decomp_attn); 单头写死的算子 (gat/dynamic_gat) 与其余算子
+    一律不传 (它们的 __init__ 没有该参数, 传了也会被 **kw 静默吞掉, 不如不传语义干净)。
+    None = 各算子用自带默认 (现有行为不变)。
     """
 
-    def __init__(self, block: STBlock, hidden: int, num_nodes: int):
+    def __init__(self, block: STBlock, hidden: int, num_nodes: int,
+                 num_heads: int | None = None):
         super().__init__()
         self.fusion = block.fusion
         self.joint = None
         if block.joint_op is not None:
-            self.joint = build_op(block.joint_op, dim=hidden, num_nodes=num_nodes)
+            kw = {"num_heads": num_heads} if (num_heads is not None and accepts_num_heads(block.joint_op)) else {}
+            self.joint = build_op(block.joint_op, dim=hidden, num_nodes=num_nodes, **kw)
         else:
-            self.spatial = build_spatial_op(block.spatial_op, dim=hidden, num_nodes=num_nodes)
-            self.temporal = build_temporal_op(block.temporal_op, dim=hidden, num_nodes=num_nodes)
+            s_kw = {"num_heads": num_heads} if (num_heads is not None and accepts_num_heads(block.spatial_op)) else {}
+            t_kw = {"num_heads": num_heads} if (num_heads is not None and accepts_num_heads(block.temporal_op)) else {}
+            self.spatial = build_spatial_op(block.spatial_op, dim=hidden, num_nodes=num_nodes, **s_kw)
+            self.temporal = build_temporal_op(block.temporal_op, dim=hidden, num_nodes=num_nodes, **t_kw)
         self.norm = nn.LayerNorm(hidden)
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor | None) -> torch.Tensor:
@@ -88,10 +97,16 @@ class STModel(nn.Module):
     """由 genotype 编译出的完整时空预测模型。
 
     forward(x, tod_idx=None, dow_idx=None): x [B,T_in,N,C] → [B,T_out,N]。
+
+    dropout: HPO 调的正则强度, 只设在【block 堆叠后、输出头前】一处 (最小侵入;
+    嵌入处不加 —— 身份嵌入是最高杠杆组件, 丢它伤精度)。默认 0.0 → nn.Dropout(0.0)
+    恒等映射, 现有行为完全不变。
+    num_heads: HPO 调的多头注意力头数, 透传给各 ST-block (仅头数可配算子消费)。
     """
 
     def __init__(self, genotype: Genotype, num_nodes: int, in_channels: int,
-                 seq_len_in: int, seq_len_out: int, adj: np.ndarray | None = None):
+                 seq_len_in: int, seq_len_out: int, adj: np.ndarray | None = None,
+                 dropout: float = 0.0, num_heads: int | None = None):
         super().__init__()
         genotype.validate()
         self.genotype = genotype
@@ -108,10 +123,12 @@ class STModel(nn.Module):
             use_dow=ec.use_dow, dow_dim=ec.dow_dim,
         )
 
-        # ST-block 堆叠
+        # ST-block 堆叠 (num_heads 仅头数可配的注意力算子消费, 见 STBlockModule)
         self.blocks = nn.ModuleList(
-            [STBlockModule(b, hidden, num_nodes) for b in genotype.blocks]
+            [STBlockModule(b, hidden, num_nodes, num_heads=num_heads) for b in genotype.blocks]
         )
+        # 输出头前的正则 (HPO dropout 旋钮的唯一作用点; 0.0 恒等)
+        self.dropout = nn.Dropout(dropout)
 
         # 直接多步预测头: 把 T_in 步的 hidden 展平到时间, 一次输出 T_out 步
         # [B,N,T_in*hidden] -> [B,N,T_out]
@@ -141,6 +158,7 @@ class STModel(nn.Module):
         h = self.embed(x, tod_idx=tod_idx, dow_idx=dow_idx)   # [B,T_in,N,hidden]
         for block in self.blocks:
             h = block(h, adj)                                  # [B,T_in,N,hidden]
+        h = self.dropout(h)                                    # 头前正则 (p=0 恒等)
 
         # 直接多步头: [B,T_in,N,hidden] -> [B,N,T_in*hidden] -> [B,N,T_out] -> [B,T_out,N]
         h = h.permute(0, 2, 1, 3).reshape(B, N, -1)           # 张量变换: 时间×特征 展平
@@ -151,9 +169,15 @@ class STModel(nn.Module):
 def build_model(
     genotype: Genotype, num_nodes: int, in_channels: int,
     seq_len_in: int, seq_len_out: int, adj: np.ndarray | None = None,
+    dropout: float = 0.0, num_heads: int | None = None,
 ) -> STModel:
-    """编译入口: genotype + 数据规格 → 可训练 STModel。"""
-    return STModel(genotype, num_nodes, in_channels, seq_len_in, seq_len_out, adj)
+    """编译入口: genotype + 数据规格 → 可训练 STModel。
+
+    dropout/num_heads 是 HPO 超参的接线口 (train_one 从 hps 读出传入); 默认 0.0/None
+    时与旧行为完全一致 (正则恒等, 各算子用自带默认头数)。
+    """
+    return STModel(genotype, num_nodes, in_channels, seq_len_in, seq_len_out, adj,
+                   dropout=dropout, num_heads=num_heads)
 
 
 def count_params(model: nn.Module) -> int:

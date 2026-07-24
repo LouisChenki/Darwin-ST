@@ -18,13 +18,18 @@ except Exception:
     pass
 
 from darwin_st.knowledge import all_seed_mechanisms
-from darwin_st.knowledge.embedding import SentenceTransformerEmbedder, HashEmbedder
+from darwin_st.knowledge.embedding import (HashEmbedder, SentenceTransformerEmbedder,
+                                           sentence_transformers_available, warn_hash_fallback)
 from darwin_st.knowledge.graph_store import Neo4jGraphStore
 from darwin_st.knowledge.retrieval import find_cross_domain_analogy
 
 
 def main():
     use_real = os.environ.get("REAL_EMBED", "1") == "1"
+    if use_real and not sentence_transformers_available():
+        # 默认要真语义但包未装: 醒目警告后回退 Hash (不静默, 否则 embedder.dim 处裸抛 ModuleNotFoundError)
+        warn_hash_fallback("REAL_EMBED=1 但 sentence-transformers 未安装")
+        use_real = False
     print(f"=== Darwin-ST 知识图谱构建 + 跨域检索验收 ===")
     print(f"embedding: {'SentenceTransformer(真实语义)' if use_real else 'Hash(占位)'}")
 

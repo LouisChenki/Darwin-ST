@@ -295,8 +295,15 @@ def build_store(out_dir: str):
     # 嵌入: 服务器用 SentenceTransformer (真语义), 本地默认 Hash (零依赖)。
     use_st = os.environ.get("KG_EMBEDDER", "").lower() in ("st", "sentence", "sbert")
     if use_st:
-        from darwin_st.knowledge.embedding import SentenceTransformerEmbedder
-        embedder = SentenceTransformerEmbedder()
+        from darwin_st.knowledge.embedding import (SentenceTransformerEmbedder,
+                                                  sentence_transformers_available,
+                                                  warn_hash_fallback)
+        if sentence_transformers_available():
+            embedder = SentenceTransformerEmbedder()
+        else:
+            # 显式要真语义但包未装: 醒目警告后回退 Hash (不静默, 否则灌出的库语义分大跌)
+            warn_hash_fallback("KG_EMBEDDER=st 但 sentence-transformers 未安装")
+            embedder = HashEmbedder()
     else:
         embedder = HashEmbedder()
 

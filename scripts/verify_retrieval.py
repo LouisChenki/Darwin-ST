@@ -30,7 +30,7 @@ try:
 except Exception:
     pass
 
-from darwin_st.knowledge.embedding import HashEmbedder  # noqa: E402
+from darwin_st.knowledge.embedding import HashEmbedder, warn_hash_fallback  # noqa: E402
 from darwin_st.knowledge.graph_store import InMemoryGraphStore  # noqa: E402
 from darwin_st.knowledge.qc import mechanisms_from_cards  # noqa: E402
 from darwin_st.knowledge.retrieval import find_cross_domain_analogy  # noqa: E402
@@ -81,7 +81,7 @@ def main():
             ok, skipped = len(mechs), []
             print(f"  embedding: SentenceTransformer(真实语义), 维度 {embedder.dim}", flush=True)
         except Exception as e:
-            print(f"  [warn] 真实语义不可用 ({e}), 回退 Hash", flush=True)
+            warn_hash_fallback(f"REAL_EMBED=1 但真实语义加载失败: {e}")
             store, embedder, ok, skipped = build_local_store(cards)
             print(f"  embedding: Hash(占位), 维度 {embedder.dim}", flush=True)
     else:

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 
 import torch
@@ -30,6 +31,7 @@ __all__ = [
     "OP_CATEGORY",
     "SYNTH_PREFIX",
     "op_category",
+    "accepts_num_heads",
     "builtin_op_signature",
     "build_op",
     "build_spatial_op",
@@ -598,6 +600,28 @@ def builtin_op_signature() -> str:
 def _all_ops() -> dict:
     """合并视图: 三类算子 + 已注入的 synth (synth 注册进 SPATIAL_OPS dict)。"""
     return {**SPATIAL_OPS, **TEMPORAL_OPS, **SPATIOTEMPORAL_OPS}
+
+
+def accepts_num_heads(name: str) -> bool:
+    """该算子构造函数是否显式接受 num_heads (多头注意力的头数可配)。
+
+    代码事实 (勿凭名字猜):
+      - 可配: attn (TemporalAttention) / st_graph_attn (STGraphAttn) / series_decomp_attn ——
+        __init__ 有 num_heads 参数 (默认 4)。
+      - 不可配: gat (GATConv 单头简化版) / dynamic_gat (DynamicGAT 单头缩放点积) —— 头数写死。
+    synth 算子经 _SynthWrapper 包装 (__init__(dim, num_nodes, **kw)), 无显式 num_heads
+    → 一律判 False (不把未知 kwarg 透传给合成代码, 防 TypeError)。
+
+    供 HPO 条件超参判定 (只给头数可配的架构采 num_heads) 与 builder 定向传参用。
+    不缓存: 运行时注入/换绑同名算子时签名可能变, inspect 开销在构建期可忽略。
+    """
+    cls = _all_ops().get(name)
+    if cls is None:
+        return False
+    try:
+        return "num_heads" in inspect.signature(cls.__init__).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def build_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Module:

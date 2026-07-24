@@ -10,8 +10,10 @@ import pytest
 
 from darwin_st.baseline_registry import (
     BASELINE_METRICS,
+    CLAIMED_UNVERIFIED,
     PROTOCOL_NOTES,
     get_baseline_metric,
+    get_claimed,
     get_sota,
     list_baselines,
 )
@@ -105,3 +107,22 @@ def test_sota_beats_classic_baselines():
         _, sota_mae = get_sota(ds)
         astgcn = get_baseline_metric(ds, "ASTGCN")
         assert sota_mae < astgcn
+
+
+def test_claimed_unverified_structure():
+    """存疑声称表: SSL-STMFormer (PeMS04) 已登记, 可经 get_claimed 只读访问。"""
+    entry = CLAIMED_UNVERIFIED.get("PeMS04", {}).get("SSL-STMFormer")
+    assert entry is not None
+    assert entry["mae"] == 17.06
+    assert "SSL-STMFormer" in get_claimed("PeMS04")
+    assert get_claimed("NoSuchDS") == {}
+
+
+def test_claimed_unverified_not_consumed_by_sota():
+    """存疑声称绝不进入主表, 不影响 get_sota / list_baselines 判定。"""
+    for ds in DATASETS:
+        for name in CLAIMED_UNVERIFIED.get(ds, {}):
+            assert name not in BASELINE_METRICS[ds]
+            assert name not in list_baselines(ds)
+    # PeMS04 锚点仍是 STD-MAE 17.80, 而非 SSL-STMFormer 声称的 17.06
+    assert get_sota("PeMS04") == ("STD-MAE", 17.80)

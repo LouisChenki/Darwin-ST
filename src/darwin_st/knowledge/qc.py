@@ -239,7 +239,7 @@ def mechanisms_from_cards(cards: list[dict]) -> list[Mechanism]:
     """把 mechanism_cards.json 的 dict 列表重建为 Mechanism 对象。
 
     QC 只用 name/abstract_function/preconditions/math_structure/domain/abstraction_level,
-    故跳过 evidence/related 等嵌套字段 (仿 graph_store._row_to_mech)。
+    故跳过 evidence/related 等嵌套字段 (QC 展示不需要, 非存储层丢失)。
     """
     out: list[Mechanism] = []
     for c in cards:

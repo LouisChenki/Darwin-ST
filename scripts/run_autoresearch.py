@@ -10,7 +10,8 @@
 
 环境变量 (均有默认):
     DATASET, RUN_TAG, MAX_ROUNDS, MAX_EVALS, N_GPUS, POP_SIZE,
-    HPO_TRIALS, MAX_EPOCHS, MEMORY_DB, TARGET_MAE, SPATIAL, TEMPORAL
+    HPO_TRIALS, MAX_EPOCHS, MEMORY_DB, TARGET_MAE, SPATIAL, TEMPORAL,
+    CHECKPOINT_DIR(权重存档目录, 默认空=关闭), CKPT_KEEP(存档保留个数, 默认20)
 """
 
 from __future__ import annotations
@@ -80,10 +81,13 @@ def main():
     )
 
     mem = MemoryStore(mem_db)
-    eval_fn = make_eval_fn(ds, hpo_cfg=hpo_cfg)
+    # 权重存档 (默认关): CHECKPOINT_DIR 非空 → 刷新纪录的模型权重落盘, 结束时 prune 留 top-K
+    ckpt_dir = os.environ.get("CHECKPOINT_DIR", "") or None
+    ckpt_keep = _env_int("CKPT_KEEP", 20)
+    eval_fn = make_eval_fn(ds, hpo_cfg=hpo_cfg, checkpoint_dir=ckpt_dir)
     # 进程后端: worker 自建 eval_fn (避闭包 pickle), 真正 4 卡并行 (绕 GIL)
     backend = os.environ.get("BACKEND", "auto")
-    eval_spec = EvalSpec(dataset=ds, hpo_cfg=hpo_cfg)
+    eval_spec = EvalSpec(dataset=ds, hpo_cfg=hpo_cfg, checkpoint_dir=ckpt_dir)
 
     def on_round(state):
         b = state.best_mae
@@ -111,6 +115,14 @@ def main():
         print(f"最优架构: depth={bg.depth} hidden={bg.hidden} adj={bg.adj_mode} "
               f"emb_node={bg.embedding.use_node} blocks="
               f"{[(b.spatial_op, b.temporal_op, b.fusion) for b in bg.blocks]}")
+    # 权重存档收尾: 只留 top-K 最优 (按 sidecar val_mae), 防长跑撑盘。失败不致命。
+    if ckpt_dir:
+        from darwin_st.optim.checkpoint import prune_to_top_k
+        try:
+            pruned = prune_to_top_k(ckpt_dir, keep=ckpt_keep)
+            print(f"[checkpoint] 权重保留 top-{ckpt_keep}, 清理 {len(pruned)} 个 → {ckpt_dir}")
+        except Exception as e:
+            print(f"[checkpoint] prune 失败 ({type(e).__name__}: {e}), 不致命")
     mem.close()
 
 

@@ -36,6 +36,8 @@ class TrainTrace:
     max_epochs: int = 0
     best_epoch: int = -1            # val_mae 最优的 epoch 下标
     best_mae: float = float("inf")
+    best_rmse: float = float("inf")  # best-checkpoint 同 epoch 的 val RMSE (接住已算出的评测, 零额外开销)
+    best_mape: float = float("inf")  # 同上, val MAPE
     final_train_loss: float = float("inf")
     stopped_early: bool = False     # 被时间熔断截断 (非自然收敛)
     converged: bool = False         # 被收敛早停截断 (val 曲线平台 patience 轮无实质改进; best 已存零损失)

@@ -29,6 +29,10 @@ uv sync          # 创建 .venv 并装依赖 (macOS 用 CPU/MPS torch, Linux 用
 
 跨域知识库与 Tier-2 创造层另需:Neo4j(可选,不可用自动回退内存图)、`sentence-transformers`(真实语义嵌入)、DeepSeek API key(`DEEPSEEK_API_KEY` 环境变量)。
 
+```bash
+uv sync --group semantic   # 装 sentence-transformers: 生产检索真语义嵌入, 服务器必装 (缺失退回 Hash, 检索质量显著退化)
+```
+
 ---
 
 ## 运行

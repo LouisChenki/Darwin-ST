@@ -171,3 +171,40 @@ def test_isolated_node_no_nan(x):
     for name in ("gcn", "gat", "cheb", "diffusion"):
         out = build_spatial_op(name, dim=Fd, num_nodes=N)(x, adj_isolated)
         assert torch.isfinite(out).all(), f"{name} 在孤立节点处产生 nan/inf"
+
+
+# ---------------------------------------------------------------------------
+# accepts_num_heads: 头数可配判定 (HPO 条件超参 + builder 定向传参的依据)
+# ---------------------------------------------------------------------------
+
+
+def test_accepts_num_heads_truth():
+    """按构造函数签名判定: attn/st_graph_attn/series_decomp_attn 可配; gat/dynamic_gat 写死。"""
+    from darwin_st.search.operators import accepts_num_heads
+
+    for name in ("attn", "st_graph_attn", "series_decomp_attn"):
+        assert accepts_num_heads(name) is True, f"{name} 应头数可配"
+    for name in ("gat", "dynamic_gat", "gcn", "tcn", "gru", "identity"):
+        assert accepts_num_heads(name) is False, f"{name} 头数不可配"
+    assert accepts_num_heads("nonexistent_op") is False   # 未知算子 → False, 不崩
+
+
+def test_accepts_num_heads_synth_wrapper_false():
+    """synth 算子经 _SynthWrapper 包装 (__init__(dim, num_nodes, **kw)) → 判 False (不透传未知 kwarg)。"""
+    import torch.nn as nn
+    from darwin_st.search import operators as ops_mod
+    from darwin_st.creation.registry import _make_factory
+    from darwin_st.search.operators import accepts_num_heads
+
+    class _FakeSynth(nn.Module):
+        def __init__(self, channels, num_nodes, **kw):
+            super().__init__()
+
+        def forward(self, x, adj=None):
+            return x
+
+    ops_mod.SPATIAL_OPS["synth_fake_heads"] = _make_factory(_FakeSynth)
+    try:
+        assert accepts_num_heads("synth_fake_heads") is False
+    finally:
+        ops_mod.SPATIAL_OPS.pop("synth_fake_heads", None)

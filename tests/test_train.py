@@ -66,6 +66,10 @@ def test_train_one_returns_finite_mae(tiny_data):
     assert 0 <= trace.best_epoch < 2
     assert trace.lr == 1e-3 and trace.lr_schedule == "none"
     assert not trace.nan_hit
+    # best-checkpoint 的 rmse/mape 被接住 (此前丢弃 → EvalResult.rmse 恒 inf)
+    assert np.isfinite(trace.best_rmse) and trace.best_rmse > 0
+    assert np.isfinite(trace.best_mape) and trace.best_mape > 0
+    assert trace.best_rmse >= trace.best_mae   # RMSE ≥ MAE (同一预测误差分布)
 
 
 def test_train_one_with_tod_dow_and_lr_schedule(tiny_data):
@@ -98,6 +102,26 @@ def test_train_one_time_budget(tiny_data):
     assert trace.stopped_early and trace.n_epochs_run <= 2
 
 
+def test_train_one_wires_dropout_and_num_heads(tiny_data, monkeypatch):
+    """HPO 旋钮接线: train_one 把 hps 的 dropout/num_heads 传给 build_model (修复死参数)。"""
+    import darwin_st.optim.train as train_mod
+    captured = {}
+    real_build = train_mod.build_model
+
+    def spy_build(genotype, **kw):
+        captured.update(kw)
+        return real_build(genotype, **kw)
+
+    monkeypatch.setattr(train_mod, "build_model", spy_build)
+    prof, data_dir, adj = tiny_data
+    geno = random_genotype(depth=1, spatial="gcn", temporal="attn", hidden=16)
+    mae, _ = train_one(geno, {"lr": 1e-3, "batch_size": 16, "dropout": 0.25, "num_heads": 2},
+                       data_dir, prof, adj, device="cpu", max_epochs=1)
+    assert captured["dropout"] == 0.25
+    assert captured["num_heads"] == 2
+    assert np.isfinite(mae)
+
+
 def test_evaluate_architecture_returns_result(tiny_data):
     prof, data_dir, adj = tiny_data
     geno = random_genotype(depth=1, spatial="gcn", temporal="tcn", hidden=16)
@@ -107,6 +131,9 @@ def test_evaluate_architecture_returns_result(tiny_data):
     assert np.isfinite(res.mae)
     assert res.extra["num_params"] > 0      # 参数量供 archive
     assert res.hps  # 最优超参非空
+    # val_rmse/val_mape 接通: 最优 trial best-checkpoint 的指标经 TrainTrace 带回 (不再恒 inf)
+    assert np.isfinite(res.rmse) and res.rmse > 0
+    assert np.isfinite(res.extra["val_mape"]) and res.extra["val_mape"] > 0
 
 
 def test_make_eval_fn_routes_seed_meta(tiny_data, monkeypatch):
@@ -119,7 +146,7 @@ def test_make_eval_fn_routes_seed_meta(tiny_data, monkeypatch):
     captured = []
 
     def fake_eval(genotype, device, data_dir, profile, adj, hpo_cfg=None,
-                  warm_start_hps=None, n_trials=None):
+                  warm_start_hps=None, n_trials=None, checkpoint_dir=None):
         captured.append({"warm_start_hps": warm_start_hps, "n_trials": n_trials})
         return EvalResult(genotype=genotype, status="OK", mae=10.0, device=device,
                           extra={"num_params": 1})

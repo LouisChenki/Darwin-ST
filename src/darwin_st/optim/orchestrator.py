@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from darwin_st.baseline_registry import get_sota
-from darwin_st.optim.archive import MAPElitesArchive
+from darwin_st.optim.archive import MAPElitesArchive, behavior_descriptor
 from darwin_st.optim.scheduler import EvalResult, GPUScheduler
 from darwin_st.search.evolution import AgingEvolution
 from darwin_st.search.genotype import Genotype
@@ -44,6 +44,22 @@ def _now_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_archive_parent_p() -> float:
+    """解析 env ARCHIVE_PARENT_P (仅构造期调一次)。默认 0.5; 非法值容错回 0.5; 裁剪到 [0,1]。
+
+    根因 B 修复: 接通 MAP-Elites 正典父代选择 (Mouret & Clune 2015: 从 archive 均匀选 elite → 变异)。
+    =0 退回纯 aging。集中在构造期读取: 运行期再改 env 不再静默生效 (防"谁改了环境变量行为突变")。
+    """
+    import os
+    raw = os.environ.get("ARCHIVE_PARENT_P")
+    if raw is None:
+        return 0.5
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return 0.5
 
 
 @dataclass
@@ -168,6 +184,9 @@ class Orchestrator:
         self._discard_above = config.discard_above
         self._n_valid = 0   # 已见的有限 MAE 评估数 (warmup 计数)
 
+        # env 开关构造期读一次存为实例属性 (构造后运行期改 env 不再生效, 行为可复现)
+        self._archive_parent_p = _parse_archive_parent_p()
+
     def _classify(self, mae: float) -> tuple[str, str | None]:
         """定结局: CRASH(无效) / KEEP / DISCARD。返回 (status, fail_reason)。"""
         if not _finite(mae):
@@ -255,21 +274,6 @@ class Orchestrator:
 
     # -- 流式驱动接线 (run_stream 回调): 4 卡持续满载, 破批同步 --
 
-    def _archive_parent_p(self) -> float:
-        """走 archive.select() 选父代的概率 (0..1)。默认 0.5; env ARCHIVE_PARENT_P 覆盖, =0 退回纯 aging。
-
-        根因 B 修复: 接通 MAP-Elites 正典父代选择 (Mouret & Clune 2015: 从 archive 均匀选 elite → 变异)。
-        此前 archive.select() 生产零调用, 108 格深度保护形同虚设。冷启动 archive 空时自动回落 evo.ask()。
-        """
-        import os
-        raw = os.environ.get("ARCHIVE_PARENT_P")
-        if raw is None:
-            return 0.5
-        try:
-            return max(0.0, min(1.0, float(raw)))
-        except ValueError:
-            return 0.5
-
     def _next_genotype(self):
         """流式驱动取下一个待评 genotype。refresh 屏障待定时返 None (让在飞排空)。
 
@@ -282,12 +286,14 @@ class Orchestrator:
         if self._pending_seed_genotypes:
             return self._pending_seed_genotypes.pop(0)   # 创造 seed: 已带 _seed_meta 显式大 HPO, 不覆盖
         # 根因 B: 概率走 archive 父代选择 (正典 MAP-Elites); archive 空则回落 aging
+        # (概率在构造期从 env 读定, 见 __init__ 的 _archive_parent_p)
         g = None
-        if self._archive_parent_p() > 0.0 and self.evo.rng.random() < self._archive_parent_p():
+        if self._archive_parent_p > 0.0 and self.evo.rng.random() < self._archive_parent_p:
             elite = self.archive.select()
             if elite is not None:
                 from darwin_st.search.evolution import random_mutation
-                g = random_mutation(elite.genotype, self.evo.rng)
+                g = random_mutation(elite.genotype, self.evo.rng,
+                                    builtin_weight=self.evo._builtin_weight)
         if g is None:
             g = self.evo.ask()
         # 自适应 HPO trials: 只盖进化 genotype (无 _seed_meta), 按实时 gap 定调参预算。
@@ -377,6 +383,11 @@ class Orchestrator:
     def _record_memory(self, res: EvalResult, status: str, fail_reason: str | None) -> int | None:
         from darwin_st.memory.store import Trial
 
+        num_params = int(res.extra.get("num_params", 0))
+        # BD 落库: 与 archive.add 用同一描述子 (从 genotype 直算, 无需训练, 零额外开销)。
+        # 此前恒 {} → memory.nearest_experiments 检索无料。CRASH 也记 (失败架构的 BD 也是经验)。
+        bd = behavior_descriptor(res.genotype, num_params)
+        val_mape = res.extra.get("val_mape", float("inf"))
         trial = Trial(
             run_tag=self.cfg.run_tag, dataset=self.cfg.dataset,
             space_version=self.scope.space_version,
@@ -384,8 +395,10 @@ class Orchestrator:
             status=status, created_at=_now_iso(),
             val_mae=res.mae if _finite(res.mae) else None,
             val_rmse=res.rmse if _finite(res.rmse) else None,
+            val_mape=float(val_mape) if _finite(val_mape) else None,
             fail_reason=fail_reason,
-            num_params=int(res.extra.get("num_params", 0)) or None,
+            behavior_descriptor=bd,
+            num_params=num_params or None,
             wall_seconds=res.wall_seconds or None,
         )
         return self.memory.record_trial(trial)

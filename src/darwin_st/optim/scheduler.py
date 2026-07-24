@@ -54,6 +54,8 @@ class EvalSpec:
     synth_persist_dir: str | None = None   # registry persist_dir; worker 启动 load_persisted 补 synth 算子
     eval_factory: str | None = None        # dotted "module:attr" 工厂, 签名 (dataset, hpo_cfg)->eval_fn;
                                            # None=默认 make_eval_fn。用于注入替代评测后端或 CPU 测试 spawn 通路。
+    checkpoint_dir: str | None = None      # 权重存档目录 (worker 直接写共享盘); None=关闭。
+                                           # 仅默认 make_eval_fn 消费 (自定义工厂签名不变, 向后兼容)。
 
 
 @dataclass
@@ -132,10 +134,11 @@ def _worker_init(eval_spec: "EvalSpec", n_workers: int) -> None:
 
         mod_name, attr = eval_spec.eval_factory.split(":")
         factory = getattr(importlib.import_module(mod_name), attr)
+        _WORKER_EVAL_FN = factory(eval_spec.dataset, eval_spec.hpo_cfg)
     else:
         from darwin_st.optim.train import make_eval_fn
-        factory = make_eval_fn
-    _WORKER_EVAL_FN = factory(eval_spec.dataset, eval_spec.hpo_cfg)
+        _WORKER_EVAL_FN = make_eval_fn(eval_spec.dataset, eval_spec.hpo_cfg,
+                                       checkpoint_dir=eval_spec.checkpoint_dir)
     _WORKER_INITED = True
 
 

@@ -6,9 +6,14 @@
   - embedding_text 只含抽象功能+前提(不含表面/域)
   - InMemoryGraphStore: 增删/向量搜/前提图遍历
   - find_cross_domain_analogy: 跨域过滤 + 互补集覆盖 + FAC 前提桥
+  - Neo4j 后端 evidence/anti_patterns/inferred 字段保真 (集成测试默认跳过:
+    需 DARWIN_ST_NEO4J_TEST=1 且 bolt://localhost:7687 可达)
 """
 
 from __future__ import annotations
+
+import json
+import os
 
 import numpy as np
 import pytest
@@ -20,6 +25,7 @@ from darwin_st.knowledge import (
     all_seed_mechanisms,
     find_cross_domain_analogy,
 )
+from darwin_st.knowledge.graph_store import Neo4jGraphStore, _dicts_to_evidence, _evidence_to_dicts
 from darwin_st.knowledge.ontology import Evidence
 from darwin_st.knowledge.retrieval import decompose_to_preconditions
 
@@ -226,3 +232,147 @@ def test_override_preconditions_filters_illegal(store):
         "长程时序依赖捕获不好", store, store.embedder,
         override_preconditions=["bogus1", "bogus2"])
     assert "long_range_dependency" in res2.target_preconditions
+
+
+# ---------------------------------------------------------------------------
+# Neo4j 后端: evidence/anti_patterns/inferred 字段保真
+# ---------------------------------------------------------------------------
+
+
+def _rich_mechanism(name: str = "rich_mech") -> Mechanism:
+    """三字段全填的机制卡: evidence 每条字段填全, anti_patterns 多条, inferred=False(已复核)。"""
+    return Mechanism(
+        name=name, abstract_function="测试用抽象功能",
+        preconditions=["long_range_dependency"], causal_behavior="因果链",
+        math_structure="数学结构", origin_domain="TimeSeries",
+        evidence=[Evidence("PeMS04", "MAE", "去掉后 MAE 18.29→21.65 (+18%)", "high", "STID arXiv:2208.05233"),
+                  Evidence("METR-LA", "MAE", "提升 3%")],
+        anti_patterns=["掩码率不当→预训练信号过弱", "大图 N² 开销"],
+        inferred=False,
+    )
+
+
+def test_evidence_dicts_roundtrip():
+    """Evidence↔dict 序列化辅助函数: 转换后字段全保真 (不依赖 Neo4j 服务)。"""
+    m = _rich_mechanism()
+    dicts = _evidence_to_dicts(m.evidence)
+    assert all(set(d) == {"dataset", "metric", "delta", "grade", "source"} for d in dicts)
+    assert _dicts_to_evidence(dicts) == m.evidence
+    # 容错: None/空/非 dict 项不崩
+    assert _dicts_to_evidence(None) == []
+    assert _dicts_to_evidence([{"dataset": "D"}, "junk"]) == [Evidence("D", "", "")]
+
+
+def test_neo4j_row_to_mech_restores_nested_fields():
+    """_row_to_mech: evidence(JSON 字符串)/anti_patterns/inferred 读回保真 (不依赖 Neo4j 服务)。"""
+    m = _rich_mechanism()
+    store = Neo4jGraphStore.__new__(Neo4jGraphStore)   # 跳过 __init__, 不连服务只测纯转换
+    rec = {
+        "name": m.name, "abstract_function": m.abstract_function,
+        "preconditions": m.preconditions, "causal_behavior": m.causal_behavior,
+        "math_structure": m.math_structure, "origin_domain": m.origin_domain,
+        # 与 add_mechanism 写入相同的形态: evidence 为 JSON 字符串
+        "evidence": json.dumps(_evidence_to_dicts(m.evidence), ensure_ascii=False),
+        "anti_patterns": m.anti_patterns, "inferred": m.inferred,
+    }
+    got = store._row_to_mech(rec)
+    assert got.evidence == m.evidence
+    assert got.anti_patterns == m.anti_patterns
+    assert got.inferred is False
+
+
+def test_neo4j_row_to_mech_backward_compat():
+    """向后兼容: 旧库节点缺三属性 → 默认 evidence=[]/anti_patterns=[]/inferred=True(待核)。"""
+    store = Neo4jGraphStore.__new__(Neo4jGraphStore)
+    got = store._row_to_mech({"name": "old_mech", "abstract_function": "x", "preconditions": []})
+    assert got.evidence == []
+    assert got.anti_patterns == []
+    assert got.inferred is True   # 旧卡视为待人工复核, 与 ontology 默认语义一致
+
+
+class _FakeDriver:
+    """假 neo4j driver: 捕获 auth, session 空转 (不依赖真实 Neo4j 服务)。"""
+
+    captured: dict = {}
+
+    def __init__(self, uri, auth=None, **kw):
+        _FakeDriver.captured = {"uri": uri, "auth": auth}
+
+    def session(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            class _S:
+                def run(self, *a, **k):
+                    return None
+            yield _S()
+        return _ctx()
+
+    def close(self):
+        pass
+
+
+def _patch_neo4j_module(monkeypatch):
+    """把假 neo4j 模块注进 sys.modules (Neo4jGraphStore.__init__ 内 from neo4j import ...)。"""
+    import sys
+    import types
+    fake = types.ModuleType("neo4j")
+    fake.GraphDatabase = types.SimpleNamespace(driver=_FakeDriver)
+    monkeypatch.setitem(sys.modules, "neo4j", fake)
+
+
+def test_neo4j_password_from_env(monkeypatch):
+    """密码默认读 NEO4J_PASSWORD (构造期一次): env 命中用 env; 缺省回旧默认值兼容。"""
+    _patch_neo4j_module(monkeypatch)
+    monkeypatch.setenv("NEO4J_PASSWORD", "env_secret")
+    Neo4jGraphStore(HashEmbedder(dim=8))
+    assert _FakeDriver.captured["auth"] == ("neo4j", "env_secret")
+    # env 缺失 → 旧默认值 (向后兼容)
+    monkeypatch.delenv("NEO4J_PASSWORD")
+    Neo4jGraphStore(HashEmbedder(dim=8))
+    assert _FakeDriver.captured["auth"] == ("neo4j", "darwin_st_2024")
+
+
+def test_neo4j_password_explicit_overrides_env(monkeypatch):
+    """显式 password 参数优先于 env (调用方明确指定时不被环境变量抢)。"""
+    _patch_neo4j_module(monkeypatch)
+    monkeypatch.setenv("NEO4J_PASSWORD", "env_secret")
+    Neo4jGraphStore(HashEmbedder(dim=8), password="explicit_pw")
+    assert _FakeDriver.captured["auth"] == ("neo4j", "explicit_pw")
+
+
+def _neo4j_reachable() -> bool:
+    """集成测试判据: 显式设 DARWIN_ST_NEO4J_TEST 且 bolt://localhost:7687 短超时可达。"""
+    if not os.environ.get("DARWIN_ST_NEO4J_TEST"):
+        return False
+    try:
+        from neo4j import GraphDatabase
+        d = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "darwin_st_2024"),
+                                 connection_timeout=2)
+        d.verify_connectivity()
+        d.close()
+        return True
+    except Exception:
+        return False
+
+
+_NEO4J_OK = _neo4j_reachable()
+
+
+@pytest.mark.skipif(not _NEO4J_OK, reason="无 Neo4j 服务 (需 DARWIN_ST_NEO4J_TEST=1 且本地 7687 可达)")
+def test_neo4j_add_get_roundtrip():
+    """集成: 真实 Neo4j add→get 往返, evidence/anti_patterns/inferred 全保真。"""
+    store = Neo4jGraphStore(HashEmbedder(dim=64))
+    m = _rich_mechanism(name="test_neo4j_roundtrip_tmp")
+    try:
+        store.add_mechanism(m)
+        got = store.get_mechanism(m.name)
+        assert got is not None
+        assert got.evidence == m.evidence
+        assert got.anti_patterns == m.anti_patterns
+        assert got.inferred is False
+    finally:
+        with store.driver.session() as s:   # 清理测试节点, 不污染库
+            s.run("MATCH (m:Mechanism {name:$n}) DETACH DELETE m", n=m.name)
+        store.close()

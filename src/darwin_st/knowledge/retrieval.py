@@ -5,31 +5,27 @@
   → 跨域拉回【互补机制集】(非单个最相似), 让 LLM 融合。
 
 两阶段 MAC/FAC (结构映射理论):
-  - MAC: 廉价语义召回(候选)。本 demo 用轻量 token 重叠作占位; 真实版换 embedding。
+  - MAC: 语义向量召回 (embedder + GraphStore.vector_search)。
     关键: 只在 abstract_function+preconditions 上算相似(embedding_text), 绝不含表面/域。
-  - FAC: 按【共享前提数】重排(结构对齐), 非余弦 —— 这才是跨域类比的判据。
+  - FAC: 按【共享前提数】沿前提图重排(结构对齐), 非余弦 —— 这才是跨域类比的判据。
 
 互补集选择 (Q3 升级): 不返回单个最相似, 而是贪心子模最大覆盖, 让选出的机制集
   覆盖瓶颈分解出的【多个前提】(IA-Select/Lin-Bilmes 思路, (1-1/e) 保证)。
 
 跨域 (origin_domain <> target) 是可选硬过滤: 强制返回他域机制以驱动跨域涌现。
 
-后端可插拔: similarity_fn 注入, demo 用本地 token 重叠, 真实版换 embedding 余弦。
+对外主接口 = find_cross_domain_analogy (GraphStore + Embedder 注入, 后端可插拔:
+内存/Neo4j 存储 × Hash/SentenceTransformer 嵌入)。旧版 token 重叠 demo
+(cross_domain_analogy) 已删除 —— 全仓库无引用, 且相似度判据与正式版不一致。
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from typing import Callable
-
-import numpy as np
 
 from darwin_st.knowledge.ontology import Mechanism, PRECONDITION_VOCAB
 
-__all__ = ["RetrievalResult", "tokenize", "token_overlap_similarity",
-           "decompose_to_preconditions", "cross_domain_analogy",
-           "find_cross_domain_analogy"]
+__all__ = ["RetrievalResult", "decompose_to_preconditions", "find_cross_domain_analogy"]
 
 
 @dataclass
@@ -41,37 +37,6 @@ class RetrievalResult:
     target_preconditions: list[str]
     target_domain: str | None
     rationale: list[str]   # 每个机制为何入选 (覆盖了哪个前提)
-
-
-# ---------------------------------------------------------------------------
-# 轻量相似度后端 (demo 占位; 真实版换 embedding 余弦)
-# ---------------------------------------------------------------------------
-
-_STOP = {"的", "了", "在", "是", "和", "与", "对", "及", "the", "a", "of", "to", "and", "in", "on"}
-
-
-def tokenize(text: str) -> set[str]:
-    """中英混合粗分词: 英文按词, 中文按 2-gram, 去停用词。"""
-    text = text.lower()
-    en = re.findall(r"[a-z_]+", text)
-    zh = re.findall(r"[一-鿿]+", text)
-    toks = set(w for w in en if w not in _STOP and len(w) > 1)
-    for seg in zh:
-        # 中文 2-gram
-        for i in range(len(seg) - 1):
-            toks.add(seg[i:i + 2])
-        if len(seg) == 1:
-            toks.add(seg)
-    return toks - _STOP
-
-
-def token_overlap_similarity(query: str, mech: Mechanism) -> float:
-    """Jaccard token 重叠 (MAC 占位)。只在 embedding_text 上算 (抽象功能+前提)。"""
-    q = tokenize(query)
-    m = tokenize(mech.embedding_text())
-    if not q or not m:
-        return 0.0
-    return len(q & m) / len(q | m)
 
 
 # ---------------------------------------------------------------------------
@@ -111,87 +76,6 @@ def decompose_to_preconditions(bottleneck: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 跨域类比检索: MAC + FAC + 互补集选择
-# ---------------------------------------------------------------------------
-
-
-def cross_domain_analogy(
-    bottleneck: str,
-    mechanisms: list[Mechanism],
-    target_domain: str | None = "ST",
-    cross_domain_only: bool = True,
-    max_results: int = 4,
-    similarity_fn: Callable[[str, Mechanism], float] = token_overlap_similarity,
-) -> RetrievalResult:
-    """给定瓶颈, 跨域检索一个【互补机制集】。
-
-    流程:
-      1) 分解瓶颈 → 目标前提集
-      2) (可选) origin_domain <> target 硬过滤 (强制跨域)
-      3) MAC: 语义相似召回候选
-      4) FAC + 互补集: 贪心子模最大覆盖目标前提 (优先覆盖未覆盖前提的高相关机制)
-    """
-    target_preconds = decompose_to_preconditions(bottleneck)
-
-    # 候选池: 可选跨域硬过滤
-    pool = list(mechanisms)
-    if cross_domain_only and target_domain is not None:
-        pool = [m for m in pool if m.origin_domain != target_domain]
-
-    # 每个候选: MAC 相似度 + 它能覆盖哪些目标前提
-    scored = []
-    for m in pool:
-        sim = similarity_fn(bottleneck, m)
-        covers = set(m.preconditions) & set(target_preconds)
-        scored.append((m, sim, covers))
-
-    # 贪心子模最大覆盖: 每轮选"能覆盖最多【未覆盖】目标前提, 平局看相似度"的机制
-    selected: list[Mechanism] = []
-    rationale: list[str] = []
-    covered: set[str] = set()
-    remaining = list(scored)
-
-    while remaining and len(selected) < max_results:
-        # 排序键: (新覆盖前提数, 相似度) 降序
-        def gain(item):
-            m, sim, covers = item
-            new_cover = covers - covered
-            return (len(new_cover), sim)
-
-        remaining.sort(key=gain, reverse=True)
-        best, sim, covers = remaining[0]
-        new_cover = covers - covered
-
-        # 若已无新覆盖且相似度也很低, 停止 (避免凑数)
-        if not new_cover and sim < 0.05 and selected:
-            break
-
-        selected.append(best)
-        covered |= covers
-        if new_cover:
-            rationale.append(
-                f"{best.name} (来自 {best.origin_domain}): 覆盖前提 {sorted(new_cover)}, 相似度 {sim:.2f}"
-            )
-        else:
-            rationale.append(
-                f"{best.name} (来自 {best.origin_domain}): 语义相关 {sim:.2f} (前提已被覆盖, 作补充)"
-            )
-        remaining.pop(0)
-
-        # 所有目标前提都覆盖了就停
-        if target_preconds and covered >= set(target_preconds):
-            break
-
-    return RetrievalResult(
-        mechanisms=selected,
-        covered_preconditions=covered,
-        target_preconditions=target_preconds,
-        target_domain=target_domain,
-        rationale=rationale,
-    )
-
-
-# ---------------------------------------------------------------------------
 # 正式版: GraphStore + embedding 支撑的跨域检索 (MAC + FAC + 互补集)
 # ---------------------------------------------------------------------------
 
@@ -212,8 +96,8 @@ def find_cross_domain_analogy(
     FAC: 把瓶颈分解成前提 → 沿前提图拉"共享前提"的机制 (跨域结构桥)。
     合并 MAC∪FAC 候选 → 贪心子模最大覆盖目标前提 → 互补机制集。
 
-    与 demo 版 cross_domain_analogy 同逻辑, 但相似度走真实 embedding + 图遍历召回,
-    语义模糊匹配更准, 且 FAC 保证"前提共享"的机制即使语义不相似也能被拉到。
+    相似度走真实 embedding + 图遍历召回, 语义模糊匹配更准, 且 FAC 保证"前提共享"的
+    机制即使语义不相似也能被拉到。
 
     override_preconditions: Tier-2 LLM 诊断直出的受控前提词 (∈ PRECONDITION_VOCAB)。给定时
     **跳过** decompose_to_preconditions 的脆弱关键词匹配, 直接用 LLM 前提词做 FAC 图召回

@@ -256,7 +256,7 @@ class MAPElitesArchive:
         return [c for c in all_cells() if c not in self.cells]
 
     def coverage(self) -> float:
-        """填充率 = 已填 / 总 36 格。"""
+        """填充率 = 已填 / 总 108 格 (4空间族×3时序族×3参数档×3深度档)。"""
         return len(self.cells) / self.TOTAL_CELLS
 
     def qd_score(self) -> float:

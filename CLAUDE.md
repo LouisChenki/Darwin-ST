@@ -12,7 +12,7 @@ The governing design lives in `docs/` — read these before substantial work: `A
 
 ```bash
 uv sync                              # create .venv, install deps (CPU/MPS torch on macOS, cu128 on Linux)
-uv run pytest tests/ -q              # full suite (~337 tests, device-agnostic, runs on CPU)
+uv run pytest tests/ -q              # full suite (~600 tests, device-agnostic, runs on CPU)
 uv run pytest tests/test_metrics.py -v          # one file
 uv run pytest tests/test_metrics.py::test_zeros_are_masked_out   # one test
 ```
@@ -40,7 +40,7 @@ src/darwin_st/
               builder.py (genotype → nn.Module, [B,T,N,C] convention, node dim N never flattened),
               evolution.py (aging/regularized evolution — removes OLDEST not worst).
   optim/      P2 engine — hpo.py (Optuna TPE + SuccessiveHalvingPruner=ASHA, one study per arch),
-              scheduler.py (GPUScheduler, one arch per GPU), archive.py (MAP-Elites 36-cell grid),
+              scheduler.py (GPUScheduler, one arch per GPU), archive.py (MAP-Elites 108-cell grid),
               orchestrator.py (the run loop: ask→evaluate→memory→archive→program-driven SOTA stop),
               train.py (real eval_fn: builder+hpo+training+masked eval; make_eval_fn(dataset)).
   knowledge/  P3 — cross-domain mechanism KG. ontology.py (Mechanism = abstract_function +

@@ -17,7 +17,6 @@ from darwin_st.knowledge.embedding import HashEmbedder, SentenceTransformerEmbed
 from darwin_st.knowledge.graph_store import InMemoryGraphStore, Neo4jGraphStore
 from darwin_st.knowledge.retrieval import (
     RetrievalResult,
-    cross_domain_analogy,
     find_cross_domain_analogy,
     decompose_to_preconditions,
 )
@@ -44,7 +43,6 @@ __all__ = [
     "InMemoryGraphStore",
     "Neo4jGraphStore",
     "RetrievalResult",
-    "cross_domain_analogy",
     "find_cross_domain_analogy",
     "decompose_to_preconditions",
     "parse_mechanism_cards",

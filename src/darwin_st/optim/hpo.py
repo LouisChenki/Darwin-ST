@@ -6,7 +6,7 @@
 源码级要点 (已核实, 见 P2_ALGORITHM_DESIGN.md §4):
   - **架构不是 Optuna 参数**: 每个架构开独立 study (search space 干净, 剪枝同架构可比)。
   - Sampler: TPESampler(multivariate=True, group=True, constant_liar=True)
-    · multivariate+group → 正确处理条件超参 (num_heads 仅注意力架构存在)
+    · multivariate+group → 正确处理条件超参 (num_heads 仅头数可配的注意力架构存在)
     · constant_liar → 多 worker 并行防扎堆 (4 卡必须)
   - Pruner: SuccessiveHalvingPruner —— **它本身就是 ASHA** (异步, 无同步障碍);
     4 卡用它不用 HyperbandPruner (单 bracket, TPE 约 8 个完成 trial 即启动)。
@@ -30,6 +30,7 @@ from optuna.samplers import TPESampler
 from optuna.trial import TrialState
 
 from darwin_st.search.genotype import Genotype
+from darwin_st.search.operators import accepts_num_heads
 
 __all__ = ["HPOConfig", "suggest_hps", "make_study", "optimize_architecture", "HPOResult"]
 
@@ -60,7 +61,9 @@ class HPOConfig:
 def suggest_hps(trial: optuna.Trial, genotype: Genotype, cfg: HPOConfig) -> dict:
     """define-by-run 定义该架构的超参搜索空间, 返回采样到的 hps。
 
-    条件超参: num_heads 仅当架构含注意力算子 (gat/attn) 时才存在 ——
+    条件超参: num_heads 仅当架构含【头数可配】的注意力算子时才存在 ——
+    attn / st_graph_attn / series_decomp_attn (accepts_num_heads 按构造函数签名判定;
+    gat/dynamic_gat 头数写死不可配, 不采 —— 采了也是没人消费的死参数)。
     配合 TPESampler(group=True) 正确建模。
     """
     hps = {
@@ -71,8 +74,13 @@ def suggest_hps(trial: optuna.Trial, genotype: Genotype, cfg: HPOConfig) -> dict
         # lr schedule 种类作为可择优超参 (扩搜索空间, 让 HPO 自己选用不用、用哪种)
         "lr_schedule": trial.suggest_categorical("lr_schedule", ["none", "cosine", "plateau"]),
     }
-    # 条件超参: 架构用到注意力才调头数
-    uses_attn = any(b.spatial_op == "gat" or b.temporal_op == "attn" for b in genotype.blocks)
+    # 条件超参: 任一块的空间/时序/一体槽坐了头数可配的注意力算子才调头数
+    uses_attn = any(
+        accepts_num_heads(op)
+        for b in genotype.blocks
+        for op in (b.spatial_op, b.temporal_op, b.joint_op)
+        if op is not None
+    )
     if uses_attn:
         hps["num_heads"] = trial.suggest_categorical("num_heads", [1, 2, 4, 8])
     return hps

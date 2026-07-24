@@ -19,14 +19,20 @@ UniST 等并非这些数据集的公认条目), 会导致 Agent 误判已超越 
   STID arxiv.org/abs/2208.05233 · HimNet arxiv.org/pdf/2405.10800
   STGformer arxiv.org/abs/2410.00385 · PDFormer arxiv.org/pdf/2301.07945
   Graph WaveNet arxiv.org/abs/1906.00121 · DCRNN arxiv.org/abs/1707.01926
+
+存疑声称 (仅登记展示, 不进入主表、不参与 get_sota 判定, 见 CLAIMED_UNVERIFIED):
+  SSL-STMFormer (AAAI'25) 声称 PeMS04 MAE 17.06; 但其文中 STD-MAE 基线数字与
+  官方系统性不符、无独立复现、社区未采纳, 口径存疑, 不作对标锚点。
 """
 
 from __future__ import annotations
 
 __all__ = [
     "BASELINE_METRICS",
+    "CLAIMED_UNVERIFIED",
     "PROTOCOL_NOTES",
     "get_baseline_metric",
+    "get_claimed",
     "list_baselines",
     "get_sota",
 ]
@@ -45,52 +51,64 @@ PROTOCOL_NOTES: dict[str, str] = {
 BASELINE_METRICS: dict[str, dict[str, dict[str, float | None]]] = {
     "PeMS04": {
         # 经典基线 (2018–2020)
-        "STGCN": {"mae": 19.57, "rmse": 31.38},
-        "DCRNN": {"mae": 19.63, "rmse": 31.26},
-        "GraphWaveNet": {"mae": 18.53, "rmse": 29.92},
-        "ASTGCN": {"mae": 22.93, "rmse": 35.22},
-        "MTGNN": {"mae": 19.17, "rmse": 31.70},
-        # 现代强基线 / 前沿 (2022–2024)
-        "STID": {"mae": 18.35, "rmse": 29.85},
-        "PDFormer": {"mae": 18.36, "rmse": 30.03},
-        "STAEformer": {"mae": 18.22, "rmse": 30.18},
-        "HimNet": {"mae": 18.14, "rmse": 30.02},
-        "STGformer": {"mae": 17.89, "rmse": 30.21},
-        "STD-MAE": {"mae": 17.80, "rmse": 29.83},  # 当前 SOTA 集群最低
+        "STGCN": {"mae": 19.57, "rmse": 31.38},  # 原论文来源待核 (数值取自 HimNet/STD-MAE 等对照表)
+        "DCRNN": {"mae": 19.63, "rmse": 31.26},  # DCRNN, arXiv:1707.01926
+        "GraphWaveNet": {"mae": 18.53, "rmse": 29.92},  # Graph WaveNet, arXiv:1906.00121
+        "ASTGCN": {"mae": 22.93, "rmse": 35.22},  # 原论文来源待核 (数值取自 HimNet/STD-MAE 等对照表)
+        "MTGNN": {"mae": 19.17, "rmse": 31.70},  # 原论文来源待核 (数值取自 HimNet/STD-MAE 等对照表)
+        # 现代强基线 / 前沿 (2022–2024); 以下 6 条 MAE 经 2026-07 一手文献核实
+        "STID": {"mae": 18.35, "rmse": 29.85},  # STID, CIKM'22, arXiv:2208.05233
+        "PDFormer": {"mae": 18.36, "rmse": 30.03},  # PDFormer, AAAI'23, arXiv:2301.07945
+        "STAEformer": {"mae": 18.22, "rmse": 30.18},  # STAEformer, CIKM'23, arXiv:2308.10425
+        "HimNet": {"mae": 18.14, "rmse": 30.02},  # HimNet, KDD'24, arXiv:2405.10800
+        "STGformer": {"mae": 17.89, "rmse": 30.21},  # STGformer, arXiv:2410.00385
+        "STD-MAE": {"mae": 17.80, "rmse": 29.83},  # STD-MAE, IJCAI'24, arXiv:2312.00516 —— 当前公认 SOTA
     },
     "PeMS08": {
-        "STGCN": {"mae": 16.08, "rmse": 25.39},
-        "DCRNN": {"mae": 15.22, "rmse": 24.17},
-        "GraphWaveNet": {"mae": 14.40, "rmse": 23.39},
-        "ASTGCN": {"mae": 18.61, "rmse": 28.16},
-        "MTGNN": {"mae": 15.18, "rmse": 24.24},
-        "STID": {"mae": 14.21, "rmse": 23.28},
-        "PDFormer": {"mae": 13.58, "rmse": 23.41},
-        "STAEformer": {"mae": 13.46, "rmse": 23.25},
-        "HimNet": {"mae": 13.57, "rmse": 23.21},
-        "STD-MAE": {"mae": 13.44, "rmse": 22.99},
-        "STGformer": {"mae": 13.41, "rmse": 23.10},  # 当前 SOTA 集群最低
+        "STGCN": {"mae": 16.08, "rmse": 25.39},  # 原论文来源待核
+        "DCRNN": {"mae": 15.22, "rmse": 24.17},  # DCRNN, arXiv:1707.01926
+        "GraphWaveNet": {"mae": 14.40, "rmse": 23.39},  # Graph WaveNet, arXiv:1906.00121
+        "ASTGCN": {"mae": 18.61, "rmse": 28.16},  # 原论文来源待核
+        "MTGNN": {"mae": 15.18, "rmse": 24.24},  # 原论文来源待核
+        "STID": {"mae": 14.21, "rmse": 23.28},  # STID, CIKM'22, arXiv:2208.05233
+        "PDFormer": {"mae": 13.58, "rmse": 23.41},  # PDFormer, AAAI'23, arXiv:2301.07945
+        "STAEformer": {"mae": 13.46, "rmse": 23.25},  # STAEformer, CIKM'23, arXiv:2308.10425
+        "HimNet": {"mae": 13.57, "rmse": 23.21},  # HimNet, KDD'24, arXiv:2405.10800
+        "STD-MAE": {"mae": 13.44, "rmse": 22.99},  # STD-MAE, IJCAI'24, arXiv:2312.00516
+        "STGformer": {"mae": 13.41, "rmse": 23.10},  # STGformer, arXiv:2410.00385 —— 当前 SOTA 集群最低
     },
     "METR-LA": {
         # 速度数据集; 此处为 @3/6/12 的平均 MAE
-        "STGCN": {"mae": 3.17, "rmse": 6.49},
-        "DCRNN": {"mae": 3.11, "rmse": 6.27},
-        "GraphWaveNet": {"mae": 3.05, "rmse": 6.13},
-        "GMAN": {"mae": 3.08, "rmse": 6.41},
-        "MTGNN": {"mae": 3.04, "rmse": 6.11},
-        "STID": {"mae": 3.19, "rmse": 6.55},
-        "STAEformer": {"mae": 2.93, "rmse": 6.00},
-        "HimNet": {"mae": 2.92, "rmse": 5.99},  # 当前 SOTA 集群最低
+        "STGCN": {"mae": 3.17, "rmse": 6.49},  # 原论文来源待核
+        "DCRNN": {"mae": 3.11, "rmse": 6.27},  # DCRNN, arXiv:1707.01926
+        "GraphWaveNet": {"mae": 3.05, "rmse": 6.13},  # Graph WaveNet, arXiv:1906.00121
+        "GMAN": {"mae": 3.08, "rmse": 6.41},  # 原论文来源待核
+        "MTGNN": {"mae": 3.04, "rmse": 6.11},  # 原论文来源待核
+        "STID": {"mae": 3.19, "rmse": 6.55},  # STID, CIKM'22, arXiv:2208.05233
+        "STAEformer": {"mae": 2.93, "rmse": 6.00},  # STAEformer, CIKM'23, arXiv:2308.10425
+        "HimNet": {"mae": 2.92, "rmse": 5.99},  # HimNet, KDD'24, arXiv:2405.10800 —— 当前 SOTA 集群最低
     },
     "PEMS-BAY": {
-        "STGCN": {"mae": 1.48, "rmse": 3.32},
-        "DCRNN": {"mae": 1.64, "rmse": 3.70},
-        "GraphWaveNet": {"mae": 1.58, "rmse": 3.55},
-        "GMAN": {"mae": 1.59, "rmse": 3.60},
-        "MTGNN": {"mae": 1.55, "rmse": 3.49},
-        "STID": {"mae": 1.62, "rmse": 3.67},
-        "STAEformer": {"mae": 1.50, "rmse": 3.45},
-        "HimNet": {"mae": 1.51, "rmse": 3.46},
+        "STGCN": {"mae": 1.48, "rmse": 3.32},  # 原论文来源待核
+        "DCRNN": {"mae": 1.64, "rmse": 3.70},  # DCRNN, arXiv:1707.01926
+        "GraphWaveNet": {"mae": 1.58, "rmse": 3.55},  # Graph WaveNet, arXiv:1906.00121
+        "GMAN": {"mae": 1.59, "rmse": 3.60},  # 原论文来源待核
+        "MTGNN": {"mae": 1.55, "rmse": 3.49},  # 原论文来源待核
+        "STID": {"mae": 1.62, "rmse": 3.67},  # STID, CIKM'22, arXiv:2208.05233
+        "STAEformer": {"mae": 1.50, "rmse": 3.45},  # STAEformer, CIKM'23, arXiv:2308.10425
+        "HimNet": {"mae": 1.51, "rmse": 3.46},  # HimNet, KDD'24, arXiv:2405.10800
+    },
+}
+
+
+# 存疑声称登记处 —— 仅展示用, 非对标锚点。
+# 规则: 声称优于主表 SOTA 但口径/复现存疑的条目登记在此, 绝不并入 BASELINE_METRICS,
+# 亦不得被 get_sota() / list_baselines() / leaderboard 导出消费。
+CLAIMED_UNVERIFIED: dict[str, dict[str, dict[str, float | None]]] = {
+    "PeMS04": {
+        # SSL-STMFormer (AAAI'25) 声称 PeMS04 MAE 17.06, 优于公认 SOTA STD-MAE 17.80。
+        # 存疑依据: 其文中 STD-MAE 基线数字与官方系统性不符; 无独立复现; 社区未采纳。
+        "SSL-STMFormer": {"mae": 17.06},
     },
 }
 
@@ -126,3 +144,13 @@ def get_sota(dataset_name: str, metric: str = "mae") -> tuple[str | None, float 
         return None, None
     name = next(iter(ranked))
     return name, ranked[name]
+
+
+def get_claimed(dataset_name: str) -> dict[str, dict[str, float | None]]:
+    """取该数据集的「存疑声称」副本 {模型: 指标}。
+
+    ⚠️ 仅展示用, 非对标锚点: 这些数字口径/复现存疑, 绝不可用于
+    「是否超越 SOTA」的程序化判定 (get_sota / list_baselines 均不消费它们)。
+    未知数据集返回 {}。
+    """
+    return {name: dict(entry) for name, entry in CLAIMED_UNVERIFIED.get(dataset_name, {}).items()}

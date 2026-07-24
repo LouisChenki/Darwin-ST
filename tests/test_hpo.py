@@ -1,7 +1,7 @@
 """hpo.py 的正确性回归测试 (无 GPU/真实训练, 用 mock train_eval_fn)。
 
 核心契约:
-  - suggest_hps 定义正确搜索空间; 条件超参 num_heads 仅注意力架构存在
+  - suggest_hps 定义正确搜索空间; 条件超参 num_heads 仅头数可配的注意力架构存在
   - optimize_architecture 找到接近最优的超参 (在合成 objective 上)
   - 剪枝/失败被正确计数, 不污染最优选择
   - 暖启动 enqueue 生效
@@ -41,13 +41,36 @@ def test_suggest_hps_basic_keys():
 
 
 def test_suggest_hps_conditional_num_heads():
-    """注意力架构才有 num_heads (条件超参)。"""
+    """头数可配的注意力算子才有 num_heads (条件超参)。
+
+    代码事实: attn/series_decomp_attn (时序槽) 与 st_graph_attn (一体槽) 的构造函数
+    接受 num_heads; gat/dynamic_gat 头数写死不可配 → 不采 (采了也是死参数)。
+    """
     cfg = HPOConfig()
     study = optuna.create_study()
-    for geno in (_geno("gat", "tcn"), _geno("gcn", "attn")):
+    yes = [
+        _geno("gcn", "attn"),
+        _geno("gcn", "series_decomp_attn"),
+        Genotype(blocks=[STBlock("identity", "identity", joint_op="st_graph_attn")]),
+    ]
+    for geno in yes:
         trial = study.ask()
         hps = suggest_hps(trial, geno, cfg)
-        assert "num_heads" in hps
+        assert "num_heads" in hps, f"{geno.blocks[0]} 应采 num_heads"
+
+
+def test_suggest_hps_no_num_heads_for_fixed_head_ops():
+    """头数写死的注意力算子 (gat/dynamic_gat) 不采 num_heads —— 死参数清出搜索空间。"""
+    cfg = HPOConfig()
+    study = optuna.create_study()
+    no = [
+        _geno("gat", "tcn"),
+        Genotype(blocks=[STBlock("identity", "identity", joint_op="dynamic_gat")]),
+    ]
+    for geno in no:
+        trial = study.ask()
+        hps = suggest_hps(trial, geno, cfg)
+        assert "num_heads" not in hps, f"{geno.blocks[0]} 不应采 num_heads (头数不可配)"
 
 
 def test_suggest_hps_lr_in_range():

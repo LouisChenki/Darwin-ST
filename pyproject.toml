@@ -24,6 +24,11 @@ dev = [
 kg = [
     "pypdf>=4.0.0",
 ]
+# 生产检索真语义嵌入 (knowledge/embedding.py 的 SentenceTransformerEmbedder): 服务器必装;
+# 缺失时检索退回 Hash 占位, 语义分大跌 (0.54-0.70 → 0.00-0.30, 见 docs/SERVER_VALIDATION.md)
+semantic = [
+    "sentence-transformers>=2.7.0",
+]
 
 [build-system]
 requires = ["hatchling"]

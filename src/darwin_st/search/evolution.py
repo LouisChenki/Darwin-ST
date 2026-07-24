@@ -72,9 +72,10 @@ def _joint_pool() -> list[str]:
 
 
 def _builtin_weight() -> float:
-    """内置算子在变异采样中占的**整体**权重 (0..1)。默认 0.5 (内置与 synth 各半)。
+    """解析 env BUILTIN_MUTATION_WEIGHT (仅 AgingEvolution 构造期调一次)。默认 0.5 (内置与 synth 各半)。
 
-    env BUILTIN_MUTATION_WEIGHT 覆盖; =0 退回旧的对全池均匀 rng.choice (向后兼容)。
+    env BUILTIN_MUTATION_WEIGHT 覆盖; 非法值容错回 0.5; 裁剪到 [0,1]; =0 退回旧的对全池均匀
+    rng.choice (向后兼容)。集中在构造期读取: 运行期再改 env 不再静默生效 (防行为突变不可复现)。
     根因 A 修复: 117 synth 淹没 6 内置 → 均匀采样下内置命中率仅 ~5%, 达到旧最优的
     adaptive+gru+attn 组合统计上不可达。按来源加权把内置整体命中率抬回 ~50%。
     """
@@ -88,13 +89,14 @@ def _builtin_weight() -> float:
         return 0.5
 
 
-def _weighted_pick(pool: list[str], rng: random.Random) -> str:
+def _weighted_pick(pool: list[str], rng: random.Random, builtin_weight: float = 0.5) -> str:
     """从候选池按**来源加权**采一个算子: 内置整体占 w, synth 整体占 1-w, 组内均匀。
 
-    w=_builtin_weight()。w<=0 或某一侧为空 → 退回对全池均匀 rng.choice (向后兼容/退化保护)。
+    w=builtin_weight (由调用方从 AgingEvolution 构造期读定的实例属性透传, 不在此读 env)。
+    w<=0 或某一侧为空 → 退回对全池均匀 rng.choice (向后兼容/退化保护)。
     组内均匀 = 每个内置算子概率 w/n_builtin, 每个 synth 算子 (1-w)/n_synth。
     """
-    w = _builtin_weight()
+    w = builtin_weight
     if w <= 0.0:
         return rng.choice(pool)
     builtin = [o for o in pool if not o.startswith(SYNTH_PREFIX)]
@@ -119,12 +121,14 @@ def _all_search_ops() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def random_mutation(geno: Genotype, rng: random.Random, max_attempts: int = 50) -> Genotype:
+def random_mutation(geno: Genotype, rng: random.Random, max_attempts: int = 50,
+                    builtin_weight: float = 0.5) -> Genotype:
     """对 genotype 施加一个**随机且合法**的变异, 返回新 genotype。
 
     随机挑变异类型 + 随机参数, 触及保护区或产生非法结构则换一种重试 (拒绝-重采)。
     变异类型按研究价值加权: 算子替换 / 嵌入开关 是高价值变异。
     所有尝试失败 (极少见) 则回退到必定合法的 change_hidden。
+    builtin_weight: 内置算子整体采样权重 (AgingEvolution 构造期从 env 读定后透传)。
     """
     # (类型, 权重) —— op-swap 与 embedding-toggle 高权重(研究指明高价值)
     # Stage2: swap 池纳入类别兼容全算子; 加 swap_joint/toggle_joint 让 joint 时空算子进搜索。
@@ -149,7 +153,7 @@ def random_mutation(geno: Genotype, rng: random.Random, max_attempts: int = 50) 
     for _ in range(max_attempts):
         op = rng.choices(ops, weights=weights, k=1)[0]
         try:
-            return _apply_random(geno, op, rng)
+            return _apply_random(geno, op, rng, builtin_weight)
         except (ValueError, KeyError):
             continue  # 触及保护区/非法 → 换一种重试
     # 兜底: change_hidden 几乎总合法
@@ -157,7 +161,8 @@ def random_mutation(geno: Genotype, rng: random.Random, max_attempts: int = 50) 
     return mutate(geno, "change_hidden", new_hidden=new_h)
 
 
-def _apply_random(geno: Genotype, op: str, rng: random.Random) -> Genotype:
+def _apply_random(geno: Genotype, op: str, rng: random.Random,
+                  builtin_weight: float = 0.5) -> Genotype:
     """为给定变异类型随机生成参数并应用 (可能抛异常, 由调用方捕获重试)。"""
     n = len(geno.blocks)
 
@@ -165,13 +170,13 @@ def _apply_random(geno: Genotype, op: str, rng: random.Random) -> Genotype:
         i = rng.randrange(n)
         cur = geno.blocks[i].spatial_op
         cands = [o for o in _spatial_slot_pool() if o != cur]
-        return mutate(geno, "swap_spatial", index=i, new_op=_weighted_pick(cands, rng))
+        return mutate(geno, "swap_spatial", index=i, new_op=_weighted_pick(cands, rng, builtin_weight))
 
     if op == "swap_temporal":
         i = rng.randrange(n)
         cur = geno.blocks[i].temporal_op
         cands = [o for o in _temporal_slot_pool() if o != cur]
-        return mutate(geno, "swap_temporal", index=i, new_op=_weighted_pick(cands, rng))
+        return mutate(geno, "swap_temporal", index=i, new_op=_weighted_pick(cands, rng, builtin_weight))
 
     if op == "swap_joint":
         # 仅对已处于一体模式的块生效 (否则 mutate 抛错→重采)
@@ -183,7 +188,7 @@ def _apply_random(geno: Genotype, op: str, rng: random.Random) -> Genotype:
         cands = [o for o in _joint_pool() if o != cur]
         if not cands:
             raise ValueError("无候选时空一体算子")
-        return mutate(geno, "swap_joint", index=i, new_op=_weighted_pick(cands, rng))
+        return mutate(geno, "swap_joint", index=i, new_op=_weighted_pick(cands, rng, builtin_weight))
 
     if op == "toggle_joint":
         i = rng.randrange(n)
@@ -220,8 +225,8 @@ def _apply_random(geno: Genotype, op: str, rng: random.Random) -> Genotype:
             )
         else:
             nb = STBlock(
-                spatial_op=_weighted_pick(_spatial_slot_pool(), rng),
-                temporal_op=_weighted_pick(_temporal_slot_pool(), rng),
+                spatial_op=_weighted_pick(_spatial_slot_pool(), rng, builtin_weight),
+                temporal_op=_weighted_pick(_temporal_slot_pool(), rng, builtin_weight),
                 fusion=rng.choice(list(VALID_FUSION)),
             )
         return mutate(geno, "add_block", new_block=nb)
@@ -309,6 +314,9 @@ class AgingEvolution:
         self.memory = memory
         self.base_genotype = base_genotype
         self.dataset = dataset
+        # env 开关构造期读一次存为实例属性 (构造后运行期改 env 不再生效, 行为可复现);
+        # 经 random_mutation 透传给 _weighted_pick (模块级函数不再自读 env)。
+        self._builtin_weight = _builtin_weight()
 
         self.population: deque[Member] = deque()  # FIFO: 左老右新
         self._seed_queue: list[Genotype] = []     # 待提议的 bootstrap 种子
@@ -321,7 +329,8 @@ class AgingEvolution:
             # 以基准为中心: 一半原样, 一半变异 (围绕用户给定创新点探索)
             self._seed_queue.append(self.base_genotype.copy())
             for _ in range(self.population_size - 1):
-                self._seed_queue.append(random_mutation(self.base_genotype, self.rng))
+                self._seed_queue.append(
+                    random_mutation(self.base_genotype, self.rng, builtin_weight=self._builtin_weight))
         else:
             self._seed_queue = seed_genotypes(self.population_size, self.rng, self.protected)
 
@@ -340,7 +349,7 @@ class AgingEvolution:
         # 2) 进化: 锦标赛 + 变异 + 查重
         for _ in range(100):  # 重采上限, 防止极端情况死循环
             parent = self._tournament()
-            child = random_mutation(parent.genotype, self.rng)
+            child = random_mutation(parent.genotype, self.rng, builtin_weight=self._builtin_weight)
             sig = child.signature()
             if sig in self._pending:
                 continue  # 正在评估中, 换一个
@@ -353,7 +362,7 @@ class AgingEvolution:
             return child
         # 兜底: 实在采不出新的, 返回一个父代的强制变异 (允许重复)
         parent = self._tournament()
-        child = random_mutation(parent.genotype, self.rng)
+        child = random_mutation(parent.genotype, self.rng, builtin_weight=self._builtin_weight)
         self._pending[child.signature()] = child
         return child
 

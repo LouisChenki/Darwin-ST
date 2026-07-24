@@ -293,57 +293,76 @@ def _cleanup_synth(names: list[str]) -> None:
         ops_mod.OP_CATEGORY.pop(n, None)
 
 
-def test_weighted_pick_lifts_builtin_share(monkeypatch):
-    """117 synth 淹没 6 内置时, 默认权重 0.5 下内置整体命中率应 ~50% (远高于均匀的 ~5%)。"""
+def test_weighted_pick_lifts_builtin_share():
+    """117 synth 淹没 6 内置时, 权重 0.5 下内置整体命中率应 ~50% (远高于均匀的 ~5%)。"""
     from darwin_st.search.evolution import _weighted_pick, _spatial_slot_pool
     from darwin_st.search.operators import SYNTH_PREFIX
 
     names = _register_fake_synth(117)
     try:
-        monkeypatch.delenv("BUILTIN_MUTATION_WEIGHT", raising=False)  # 默认 0.5
         rng = random.Random(0)
         pool = _spatial_slot_pool()
         # 前提: 池里 synth 远多于内置 (淹没场景)
         n_builtin = sum(1 for o in pool if not o.startswith(SYNTH_PREFIX))
         n_synth = sum(1 for o in pool if o.startswith(SYNTH_PREFIX))
         assert n_synth > 5 * n_builtin
-        picks = [_weighted_pick(pool, rng) for _ in range(4000)]
+        picks = [_weighted_pick(pool, rng, 0.5) for _ in range(4000)]
         builtin_share = sum(1 for p in picks if not p.startswith(SYNTH_PREFIX)) / len(picks)
         assert 0.4 < builtin_share < 0.6   # ~50%, 而非均匀的 ~5%
     finally:
         _cleanup_synth(names)
 
 
-def test_weighted_pick_zero_weight_is_uniform(monkeypatch):
-    """BUILTIN_MUTATION_WEIGHT=0 退回对全池均匀 (向后兼容): 内置命中率回到 ~n_builtin/n_pool。"""
+def test_weighted_pick_zero_weight_is_uniform():
+    """权重=0 退回对全池均匀 (向后兼容): 内置命中率回到 ~n_builtin/n_pool。"""
     from darwin_st.search.evolution import _weighted_pick, _spatial_slot_pool
     from darwin_st.search.operators import SYNTH_PREFIX
 
     names = _register_fake_synth(117)
     try:
-        monkeypatch.setenv("BUILTIN_MUTATION_WEIGHT", "0")
         rng = random.Random(0)
         pool = _spatial_slot_pool()
         n_builtin = sum(1 for o in pool if not o.startswith(SYNTH_PREFIX))
         expected = n_builtin / len(pool)
-        picks = [_weighted_pick(pool, rng) for _ in range(4000)]
+        picks = [_weighted_pick(pool, rng, 0.0) for _ in range(4000)]
         share = sum(1 for p in picks if not p.startswith(SYNTH_PREFIX)) / len(picks)
         assert abs(share - expected) < 0.03   # 贴近均匀期望
     finally:
         _cleanup_synth(names)
 
 
-def test_weighted_pick_single_source_falls_back(monkeypatch):
+def test_weighted_pick_single_source_falls_back():
     """池里只有内置 (无 synth, 如冷启动) → 加权退化为均匀, 不崩且全返内置。"""
     from darwin_st.search.evolution import _weighted_pick
     from darwin_st.search.operators import SYNTH_PREFIX
 
-    monkeypatch.delenv("BUILTIN_MUTATION_WEIGHT", raising=False)
     rng = random.Random(0)
     pool = ["gcn", "gat", "diffusion"]   # 纯内置
     picks = {_weighted_pick(pool, rng) for _ in range(200)}
     assert picks <= set(pool)
     assert all(not p.startswith(SYNTH_PREFIX) for p in picks)
+
+
+def test_builtin_weight_env_read_once_at_construction(monkeypatch):
+    """BUILTIN_MUTATION_WEIGHT 在构造期读一次: 构造后改 env 不影响已有实例 (治运行期静默生效)。"""
+    monkeypatch.setenv("BUILTIN_MUTATION_WEIGHT", "0.9")
+    evo = AgingEvolution(population_size=4, tournament_size=2, seed=0)
+    assert evo._builtin_weight == 0.9
+    # 构造后改 env → 已有实例不变 (冻结); 新实例才读到新值
+    monkeypatch.setenv("BUILTIN_MUTATION_WEIGHT", "0.0")
+    assert evo._builtin_weight == 0.9
+    evo2 = AgingEvolution(population_size=4, tournament_size=2, seed=0)
+    assert evo2._builtin_weight == 0.0
+
+
+def test_builtin_weight_env_invalid_and_clamped(monkeypatch):
+    """env 非法值容错回默认 0.5; 越界值裁剪到 [0,1] (构造期解析语义不变)。"""
+    monkeypatch.setenv("BUILTIN_MUTATION_WEIGHT", "not_a_float")
+    assert AgingEvolution(population_size=4, tournament_size=2, seed=0)._builtin_weight == 0.5
+    monkeypatch.setenv("BUILTIN_MUTATION_WEIGHT", "2.5")
+    assert AgingEvolution(population_size=4, tournament_size=2, seed=0)._builtin_weight == 1.0
+    monkeypatch.delenv("BUILTIN_MUTATION_WEIGHT")
+    assert AgingEvolution(population_size=4, tournament_size=2, seed=0)._builtin_weight == 0.5
 
 
 def test_reseed_enqueues_survivors():
