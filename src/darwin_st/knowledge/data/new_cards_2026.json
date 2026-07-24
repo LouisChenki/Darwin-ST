@@ -1,0 +1,437 @@
+{
+  "n": 16,
+  "mechanisms": [
+    {
+      "name": "decoupled_st_masked_pretraining",
+      "abstract_function": "把空间轴与时间轴解耦分别做掩码重建预训练, 学得可注入下游预测器的长程纯净时空表示",
+      "preconditions": ["redundant_structure", "label_scarcity", "long_range_dependency"],
+      "causal_behavior": "空间轴整传感器遮罩 + 时间轴 patch 遮罩分两支各自重建 → 避免时空混合遮罩造成的互泄答案 (任务过易) → 两轴各得纯化表征 → 长窗预训练表示经 skip 注入下游各层, 短窗预测也享长程信息",
+      "function_tags": ["self_supervised_representation", "temporal_modeling"],
+      "math_structure": "空间支: mask 整个传感器 i 的全部时间步 x_{i,:}, 时空自编码器重建; 时间支: 长窗 T_long=864 切 patch 随机遮 25% 重建; loss = 仅掩码位的 MAE; 下游: 预训练 encoder 第 l 层表示 h_l 经线性投影加到预测器对应层 (skip injection)",
+      "consequences": "长窗 T_long=864 上注意力 O(T²) 预训练算力代价大; 双分支两份预训练开销; 掩码率 0.25 需按数据集调",
+      "origin_domain": "SelfSupervised",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "PeMS04",
+          "metric": "MAE",
+          "delta": "STD-MAE 17.80 达 SOTA (长窗解耦预训练)",
+          "grade": "high",
+          "source": "STD-MAE IJCAI'24 arXiv:2312.00516"
+        }
+      ],
+      "anti_patterns": [
+        "时空混合遮罩 (同时遮空间+时间) 反而有害——轴间互泄答案使任务太易, 表征退化",
+        "下游只微调不做 skip 注入会浪费长窗预训练的长程信息优势"
+      ],
+      "related": {"REFINES": ["masked_autoencoding"]},
+      "provenance": "STD-MAE (IJCAI 2024, arXiv:2312.00516)",
+      "inferred": true
+    },
+    {
+      "name": "masked_attention_variants",
+      "abstract_function": "把多种掩码模式直接做进注意力内部并行训练, 强制表示同时捕获局部拓扑/长程相似/因果时序多方依赖",
+      "preconditions": ["redundant_structure", "label_scarcity", "long_range_dependency"],
+      "causal_behavior": "6 种注意力掩码变体并行 (随机/管状/块状/短程图 hop/长程 DTW 相似节点/未来时间) → 每种掩码强制注意力在特定缺失模式下重建 → 拼接多变体表示 → 局部性/长程性/因果性同时编码进表示",
+      "function_tags": ["self_supervised_representation", "spatial_aggregation", "temporal_modeling"],
+      "math_structure": "对每种掩码 m∈{random,tube,block,k-hop,DTW,future}: h_m = softmax(QKᵀ/√d + M_m) V, M_m∈{0,-inf} 掩码矩阵; h = W_o·concat(h_1..h_6); 各变体配重建损失作用于被掩位",
+      "consequences": "6 路并行注意力算力/显存约 6×; 变体间冗余需正则; DTW 相似度需离线预计算",
+      "origin_domain": "ST",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "PeMS04",
+          "metric": "MAE",
+          "delta": "声称 17.06 超 STD-MAE; 截至 2026-07 未见独立复现, 存疑",
+          "grade": "low",
+          "source": "SSL-STMFormer AAAI'25"
+        }
+      ],
+      "anti_patterns": [
+        "变体堆叠收益边际递减而成本线性涨, 需消融选子集",
+        "声称数字未经独立复现, 移植前务必小规模验证"
+      ],
+      "related": {"COMPOSES_WITH": ["tube_masking", "graph_masked_attention"]},
+      "provenance": "SSL-STMFormer (AAAI 2025)",
+      "inferred": true
+    },
+    {
+      "name": "adaptive_st_embedding",
+      "abstract_function": "用无语义的可学习时空嵌入张量直接加在输入上, 让模型数据自适应地区分每个节点与时刻的身份",
+      "preconditions": ["node_indistinguishability", "temporal_periodicity"],
+      "causal_behavior": "可学习张量 E_adp∈R^{N×T×d} 加在输入投影上 → 每个 (节点,时刻) 获数据驱动的独特身份 → 无需人工设计 tod/dow 语义即可打破不可区分性 → vanilla transformer 即达 SOTA",
+      "function_tags": ["identity_injection"],
+      "math_structure": "X' = Linear(X) + E_adp; E_adp∈R^{N×T_in×d} 纯可学习参数 (不查表/无语义/不手工设计); 后接普通 spatial/temporal attention 层",
+      "consequences": "参数量 N×T×d 比查表式嵌入大; 对训练中未见过的新节点/新时刻无泛化 (zero-shot 差); 几乎不增算力",
+      "origin_domain": "ST",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "PeMS04",
+          "metric": "MAE",
+          "delta": "STAEformer 18.22; 去掉该嵌入劣化约 +19%",
+          "grade": "high",
+          "source": "STAEformer CIKM'23 arXiv:2308.10425"
+        }
+      ],
+      "anti_patterns": [
+        "与手工 tod/dow 嵌入叠加易冗余——STAEformer 证明可学习版可完全替代手工版",
+        "节点数/时间步很大时 N×T×d 参数膨胀"
+      ],
+      "related": {"REFINES": ["identity_embedding"]},
+      "provenance": "STAEformer (CIKM 2023, arXiv:2308.10425)",
+      "inferred": true
+    },
+    {
+      "name": "parameterfree_graph_propagation",
+      "abstract_function": "用无参数的固定图传播算子保留多个阶次的邻域聚合, 以零参数代价补足注意力缺失的局部高阶信息",
+      "preconditions": ["non_euclidean_topology", "spatial_smoothness"],
+      "causal_behavior": "归一化邻接 L̂ 的 1..K 阶幂次直接乘特征 (SGC 式) → 显式保留局部高阶聚合 → 与注意力的全局自适应聚合拼接互补 → 局部高阶 × 全局自适应双通道各补其短",
+      "function_tags": ["spatial_aggregation"],
+      "math_structure": "H_k = L̂^k X (k=1..K), L̂ = D^{-1/2}(A+I)D^{-1/2}; 输出 = W·concat(H_1..H_K, Attn(X)); 传播无参数, 稀疏 L̂ 幂次可预计算",
+      "consequences": "L̂^k 需预计算 (稀疏图便宜, 幂次稠化后内存涨); K 过大则过平滑; 无参数表达力上限低, 单靠它不够需与注意力组合",
+      "origin_domain": "GraphLearning",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "PeMS04/08",
+          "metric": "MAE",
+          "delta": "STGformer 中无参数图传播支路与注意力组合优于纯注意力基线",
+          "grade": "moderate",
+          "source": "STGformer arXiv:2410.00385"
+        }
+      ],
+      "anti_patterns": [
+        "阶次 K 过大→过平滑退化, 节点表示趋同",
+        "稠密大图上 L̂^k 稠化内存爆炸, 需保持稀疏存储"
+      ],
+      "related": {"COMPOSES_WITH": ["self_attention"]},
+      "provenance": "STGformer (arXiv:2410.00385); 思想源自 SGC (2019)",
+      "inferred": true
+    },
+    {
+      "name": "shared_qkv_st_attention",
+      "abstract_function": "时间维与空间维共享同一组 Q/K/V 投影, 转置输入即得两种注意力, 配线性注意力把时空二次复杂度降到线性",
+      "preconditions": ["long_range_dependency", "high_dimensionality", "non_euclidean_topology"],
+      "causal_behavior": "同一组 W_Q,W_K,W_V 同时作用于 X∈R^{T×N×d} 及其转置 → 参数共享把时空注意力压进同一语义空间 → 核化线性注意力后 O(TN²+NT²) 降为 O((N+T)d²) → 大图长窗可负担",
+      "function_tags": ["temporal_modeling", "spatial_aggregation", "long_range_mixing"],
+      "math_structure": "时间注意力: 沿 T 轴 A_t = φ(Q)(φ(K)ᵀV); 空间注意力: X 转置后复用同一组投影沿 N 轴同理; φ 为核特征映射 (如 elu(x)+1); Q,K,V 投影矩阵两维共享",
+      "consequences": "共享投影牺牲部分维度特化表达力; 线性注意力核近似损失 softmax 精度; 需分母归一化防数值不稳",
+      "origin_domain": "ST",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "8600 节点大图 (PEMS 系)",
+          "metric": "推理速度",
+          "delta": "比 STAEformer 快约 100× (共享 QKV + 线性注意力)",
+          "grade": "moderate",
+          "source": "STGformer arXiv:2410.00385"
+        }
+      ],
+      "anti_patterns": [
+        "精度敏感任务上核化线性注意力近似退化, 需对照 softmax 版消融",
+        "T/N 各学各的投影会回到 O(TN²+NT²), 大图上不可负担"
+      ],
+      "related": {},
+      "provenance": "STGformer (arXiv:2410.00385)",
+      "inferred": true
+    },
+    {
+      "name": "frozen_backbone_router",
+      "abstract_function": "冻结多个已训练骨干模型, 只训练图条件轻量路由器按输入加权融合各骨干输出, 极低成本稳定涨点",
+      "preconditions": ["heterogeneity", "distribution_shift"],
+      "causal_behavior": "多骨干各自捕获不同模式 → 图条件路由器按输入/图结构生成融合权重 → 冻结骨干避免微调破坏已学知识 → 仅 ~17K 参数即获稳定集成增益, 超单模型与均匀平均",
+      "function_tags": ["adaptive_weighting", "robustness_regularization"],
+      "math_structure": "ŷ = Σ_i g_i(G, x)·f_i(x); f_i 为冻结骨干 (不反传); g = softmax(MLP([pool(x); pool(A)])) 为图条件路由器 (~17K 参数); 训练只更新 g",
+      "consequences": "需先训练/集齐多个骨干 (前期成本); 推理时全部骨干前向, 算力 = Σ骨干; 路由器在小验证集上可能过拟合",
+      "origin_domain": "Optimization",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "交通预测基准 (PEMS 系)",
+          "metric": "MAE",
+          "delta": "稳定超过任一单模型与均匀平均融合",
+          "grade": "moderate",
+          "source": "GC-MoE 2026"
+        }
+      ],
+      "anti_patterns": [
+        "骨干同质化 (各骨干相似) 时路由器无增益, 需骨干多样性",
+        "解冻骨干联合微调即破坏'稳定'这一核心优势"
+      ],
+      "related": {"REFINES": ["mixture_of_experts"]},
+      "provenance": "GC-MoE (2026)",
+      "inferred": true
+    },
+    {
+      "name": "spatial_axis_ssm_scan",
+      "abstract_function": "把选择性状态空间扫描沿传感器轴运行并配局部卷积门控支路, 以线性复杂度建模空间维长程传播",
+      "preconditions": ["non_euclidean_topology", "long_range_dependency", "sequential_order"],
+      "causal_behavior": "传感器按启发式/可学习顺序排成序列 → Mamba selective scan 沿传感器轴递推 (输入相关 B,C,Δ) → 局部卷积门控支路补短程邻域 → 线性复杂度下获得跨传感器长程传播",
+      "function_tags": ["spatial_aggregation", "long_range_mixing"],
+      "math_structure": "排序 π 后序列 x_{π(1..N)}: h_i = Ā(Δ_i) h_{i-1} + B̄(x_i) x_i, y_i = C(x_i) h_i; 并行支路 y'_i = σ(Conv1d(x_i)) ⊙ y_i; 输出按 π 逆映射回图",
+      "consequences": "交通域精度增益边际 (ST-Mamba 仅约 0.16%), 主要价值在长序列/大图效率; 传感器排序 π 无自然定义, 不同排法结果有差; 双向扫描成本翻倍",
+      "origin_domain": "SSM",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "交通基准 (PEMS 系)",
+          "metric": "MAE",
+          "delta": "ST-Mamba 精度增益仅约 0.16% (边际), 价值在效率",
+          "grade": "moderate",
+          "source": "FAST / SpoT-Mamba / ST-Mamba 系 2024-25"
+        }
+      ],
+      "anti_patterns": [
+        "期待精度大幅提升会落空——移植动机应是效率而非精度",
+        "随意打乱传感器顺序会破坏空间局部性, 排序需依图结构"
+      ],
+      "related": {"REFINES": ["state_space_model"]},
+      "provenance": "FAST / SpoT-Mamba 系 (2024-25)",
+      "inferred": true
+    },
+    {
+      "name": "soft_node_grouping_mixing",
+      "abstract_function": "用 softmax 可学习分配把节点软分组为宏节点, 在宏节点空间用多项式基做 token mixing 后映射回节点",
+      "preconditions": ["node_indistinguishability", "spatial_smoothness", "heterogeneity"],
+      "causal_behavior": "可学习分配 S = softmax(Θ)∈R^{N×M} 把 N 节点软聚合为 M 宏节点 → 宏节点间用 KAN 式多项式基 mixing → 逆映射回节点 → 分组归纳偏置压缩空间自由度并显式建模簇结构",
+      "function_tags": ["spatial_aggregation", "dimensionality_reduction"],
+      "math_structure": "Z = SᵀX (N→M); Z' = Σ_k a_k·B_k(Z), B_k 为多项式/样条基 (KAN 式); X' = S Z'; S = softmax(Θ), Θ∈R^{N×M} 可学习",
+      "consequences": "作者自认提升 modest; 软分配引入 N×M 额外参数; 宏节点数 M 需调; 多项式基阶数过高易不稳",
+      "origin_domain": "ST",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "交通基准 (PEMS 系)",
+          "metric": "MAE",
+          "delta": "STKAN 提升 modest (作者自述)",
+          "grade": "low",
+          "source": "STKAN 2026"
+        }
+      ],
+      "anti_patterns": [
+        "硬分派 (argmax) 不可微, 需保持 soft 或加温度退火",
+        "期待大幅涨点不现实——提升 modest 是作者原话"
+      ],
+      "related": {"REFINES": ["learnable_prototype_semantic_grouping"]},
+      "provenance": "STKAN (2026)",
+      "inferred": true
+    },
+    {
+      "name": "state_dependent_memory_kernel",
+      "abstract_function": "把分数阶导数的固定幂律记忆核替换为依赖当前状态的注意力核, 让长记忆的衰减方式随系统状态自适应",
+      "preconditions": ["long_range_dependency", "sequential_order", "distribution_shift"],
+      "causal_behavior": "分数阶模型记忆核为固定幂律 (t-τ)^{-α} 不可调 → 换成依赖状态的注意力核 K(t,τ,x(t),x(τ)) → 记忆窗口随状态伸缩 → 漂移/突变期自动缩短记忆, 平稳期放长",
+      "function_tags": ["temporal_modeling", "long_range_mixing", "adaptive_weighting"],
+      "math_structure": "替换分数阶固定核: x'(t) = ∫ K_θ(t,τ,x(t),x(τ)) f(x(τ)) dτ, K_θ = softmax_τ( q(x(t))·k(x(τ)) ); 离散化为历史状态的自适应加权和",
+      "consequences": "核依赖状态后失去闭式/FFT 加速, 计算更贵; 注意力核需 warmup 防早期梯度不稳; 理论保证弱于固定幂律核",
+      "origin_domain": "Control",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "时空基准",
+          "metric": "MAE",
+          "delta": "STG-FADE 自适应长记忆核超固定幂律核",
+          "grade": "moderate",
+          "source": "STG-FADE NeurIPS'25"
+        }
+      ],
+      "anti_patterns": [
+        "完全丢弃幂律归纳偏置在极长记忆场景可能退化, 可保留幂律作初始化",
+        "状态相关核不 warmup 易训练早期发散"
+      ],
+      "related": {"ALTERNATIVE_TO": ["state_dependent_ssm_parameterization"]},
+      "provenance": "STG-FADE (NeurIPS 2025)",
+      "inferred": true
+    },
+    {
+      "name": "delay_differential_modeling",
+      "abstract_function": "用延迟微分方程显式建模节点间影响传播的时空延迟, 替代即时耦合假设使动力学贴合物理传播过程",
+      "preconditions": ["non_euclidean_topology", "long_range_dependency", "sequential_order"],
+      "causal_behavior": "交通流影响从传感器 j 传到 i 有物理延迟 τ_ij → DDE dx_i/dt = f(x_i(t), Σ_j A_ij x_j(t-τ_ij)) 显式建模 → 比即时 ODE/GNN 更贴合传播物理 → 长程预测更准",
+      "function_tags": ["temporal_modeling", "spatial_aggregation"],
+      "math_structure": "dx_i/dt = f_θ(x_i(t), Σ_{j∈N(i)} A_ij g_θ(x_j(t-τ_ij))); τ_ij 可学习或按距离/速度估计; 需历史缓冲 H 取延迟值, 数值求解步长 < min τ",
+      "consequences": "需维护历史缓冲 (内存↑); τ 可学习时优化面不光滑; 求解步长受最小延迟约束, 长仿真成本高",
+      "origin_domain": "Control",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "PeMS04",
+          "metric": "MAE",
+          "delta": "STDDE 18.11",
+          "grade": "moderate",
+          "source": "STDDE arXiv:2402.01231"
+        }
+      ],
+      "anti_patterns": [
+        "延迟 τ 全学成 0 则退化为即时模型, 失去建模意义——需初始化/正则防塌缩",
+        "历史缓冲太短会截断长延迟依赖"
+      ],
+      "related": {"REFINES": ["delay_aware_feature_transformation"]},
+      "provenance": "STDDE (arXiv:2402.01231, 2024)",
+      "inferred": true
+    },
+    {
+      "name": "future_query_periodic_attention",
+      "abstract_function": "用未来时刻的周期时间码作 query、历史表示作 key 的跨注意力, 把预测转化为周期条件检索以增强零样本迁移",
+      "preconditions": ["temporal_periodicity", "distribution_shift", "sequential_order"],
+      "causal_behavior": "未来 tod/dow 嵌入作 query, 历史 patch 表示作 key/value → 注意力按周期相位对齐检索历史相似模式 → 不依赖目标域标注即可迁移 → zero-shot 接近全数据训练",
+      "function_tags": ["temporal_modeling", "identity_injection"],
+      "math_structure": "q_f = E_tod(t_f) + E_dow(d_f); A = softmax(q_f K_hᵀ/√d); ŷ_f = A·V_h; K_h,V_h 来自历史 patch transformer; 配 instance norm 抗幅值漂移",
+      "consequences": "依赖周期假设, 非周期突发事件弱; query 只含时间码时表达力受限于周期码区分度",
+      "origin_domain": "TimeSeries",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "多城市交通基准",
+          "metric": "MAE",
+          "delta": "OpenCity zero-shot 与全数据 SOTA 差距 <8%",
+          "grade": "high",
+          "source": "OpenCity arXiv:2408.10269"
+        }
+      ],
+      "anti_patterns": [
+        "周期码粒度太粗 (如只到小时) 时 query 碰撞, 检索退化",
+        "不做归一化时跨域幅值差异破坏周期检索"
+      ],
+      "related": {},
+      "provenance": "OpenCity (arXiv:2408.10269)",
+      "inferred": true
+    },
+    {
+      "name": "multi_strategy_patch_pretraining",
+      "abstract_function": "在 patch 级用多种掩码策略并行预训练时空表示, 再以 prompt 学习低成本适配不同下游数据布局",
+      "preconditions": ["redundant_structure", "label_scarcity", "multi_scale_structure"],
+      "causal_behavior": "patch 化统一不同数据集形状 → 4 种掩码策略并行预训练 → 多策略互补覆盖不同冗余/尺度模式 → prompt 学习适配下游 → 单模型跨数据集泛化",
+      "function_tags": ["self_supervised_representation", "multi_scale_fusion"],
+      "math_structure": "X∈R^{N×T} → M 个 patch token; 策略集 {m_1..m_4} 各采样掩码模式; loss = Σ_s λ_s·recon(visible_s → masked_s); 下游: 可学习 prompt token 拼前缀, 只训 prompt + 头部",
+      "consequences": "多策略预训练成本 × 策略数; patch 形状跨数据集对齐需插值/重采样; prompt 容量有限, 复杂下游欠拟合",
+      "origin_domain": "SelfSupervised",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "多时空数据集",
+          "metric": "MAE",
+          "delta": "UniST 跨数据集 zero/few-shot 有效",
+          "grade": "moderate",
+          "source": "UniST ICML'24 / TKDE'25"
+        }
+      ],
+      "anti_patterns": [
+        "单一掩码策略对多形态数据覆盖不足——多策略互补是关键",
+        "prompt 太短在差异大的下游欠拟合"
+      ],
+      "related": {"REFINES": ["masked_autoencoding"]},
+      "provenance": "UniST (ICML 2024 / TKDE 2025)",
+      "inferred": true
+    },
+    {
+      "name": "correlation_adaptive_augmentation",
+      "abstract_function": "按区域间相关性自适应设定 Bernoulli 掩码概率并配路网拓扑增强, 让自监督增强难度匹配局部数据结构",
+      "preconditions": ["redundant_structure", "spatial_smoothness", "heterogeneity"],
+      "causal_behavior": "高相关区域的传感器太易被重建 (任务太易) → 按区域相关矩阵上调该区域掩码概率 + 路网删/加边扰动 → 增强难度与局部冗余匹配 → SSL 信号在空间上更均匀有效",
+      "function_tags": ["self_supervised_representation", "robustness_regularization"],
+      "math_structure": "p_i = clip(p_0 + α·corr̄_i), corr̄_i 为节点 i 与邻域平均相关; 掩码 M_i ~ Bernoulli(p_i); 路网增强: 沿邻接 A 随机删/加边扰动",
+      "consequences": "需预计算区域相关矩阵, 分布漂移时需重估; 概率自适应增加调参维度",
+      "origin_domain": "SelfSupervised",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "PeMS04 等",
+          "metric": "MAE",
+          "delta": "SSL-STMFormer 消融中相关自适应增强有正贡献",
+          "grade": "low",
+          "source": "SSL-STMFormer AAAI'25"
+        }
+      ],
+      "anti_patterns": [
+        "全局统一掩码率在高异质网络上难度失衡 (高相关区太易/低相关区太难)",
+        "相关矩阵须只用训练段估计, 防测试信息泄漏"
+      ],
+      "related": {"REFINES": ["adaptive_input_masking"]},
+      "provenance": "SSL-STMFormer (AAAI 2025)",
+      "inferred": true
+    },
+    {
+      "name": "soft_cluster_heterogeneity_ssl",
+      "abstract_function": "用软聚类分配作辅助自监督任务, 让表示显式承载空间异质性的簇结构",
+      "preconditions": ["heterogeneity", "node_indistinguishability"],
+      "causal_behavior": "节点表示经 soft 簇分配 (可学习簇心) → 辅助任务约束分配一致性 → 表示被迫编码'属于哪类行为模式' → 空间异质性结构化为可寻址的簇",
+      "function_tags": ["self_supervised_representation", "identity_injection"],
+      "math_structure": "s_i = softmax(h_i Cᵀ/τ), C∈R^{K×d} 可学习簇心; 辅助损失 = 簇内对比一致性 + 分配熵正则 (防坍缩); 与主 SSL 损失加权求和",
+      "consequences": "簇数 K 需先验; 辅助任务与主任务权重需平衡; 无正则时簇易坍缩",
+      "origin_domain": "SelfSupervised",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "PeMS04 等",
+          "metric": "MAE",
+          "delta": "SSL-STMFormer 消融中软聚类辅助任务有正贡献",
+          "grade": "low",
+          "source": "SSL-STMFormer AAAI'25"
+        }
+      ],
+      "anti_patterns": [
+        "无防坍缩正则 (分配熵/均匀性) 时所有节点挤进一簇",
+        "K 取错把连续行为谱强行切块, 反伤表示"
+      ],
+      "related": {"REFINES": ["contrastive_clustering"]},
+      "provenance": "SSL-STMFormer (AAAI 2025)",
+      "inferred": true
+    },
+    {
+      "name": "region_city_contrastive",
+      "abstract_function": "在区域与城市两个尺度上做表征对比, 用跨尺度一致性锚定时间异质性",
+      "preconditions": ["heterogeneity", "multi_scale_structure", "temporal_periodicity"],
+      "causal_behavior": "同节点在区域尺度与城市尺度两视图表征 → InfoNCE 拉近跨尺度正对、推远负对 → 表示同时含局部细节与全局上下文 → 不同时段的异质模式被跨尺度锚定",
+      "function_tags": ["self_supervised_representation", "multi_scale_fusion"],
+      "math_structure": "z_r = pool_region(h), z_c = pool_city(h); L = -log exp(sim(z_rⁱ,z_cⁱ)/τ) / Σ_j exp(sim(z_rⁱ,z_cʲ)/τ) (InfoNCE)",
+      "consequences": "双尺度编码两份前向成本; 批量小时负样本不足对比退化; 尺度层级划分依赖先验",
+      "origin_domain": "SelfSupervised",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "PeMS04 等",
+          "metric": "MAE",
+          "delta": "SSL-STMFormer 消融中区域-城市对比有正贡献",
+          "grade": "low",
+          "source": "SSL-STMFormer AAAI'25"
+        }
+      ],
+      "anti_patterns": [
+        "两尺度视图同源无差异时对比退化为恒等映射",
+        "批量太小负样本不足, InfoNCE 信号弱"
+      ],
+      "related": {"REFINES": ["multiscale_contrastive_learning"]},
+      "provenance": "SSL-STMFormer (AAAI 2025)",
+      "inferred": true
+    },
+    {
+      "name": "scale_conditioned_expert_mixing",
+      "abstract_function": "把不同时间尺度的模式分给不同专家子网处理并按尺度条件路由, 用条件计算解耦多尺度异质动态",
+      "preconditions": ["multi_scale_structure", "heterogeneity", "sequential_order"],
+      "causal_behavior": "输入经尺度描述子路由到对应尺度专家 (趋势/周期/瞬态) → 各专家专精单一尺度动态 → 门控按尺度证据加权融合 → 避免单网络在冲突尺度目标间梯度互相干扰",
+      "function_tags": ["multi_scale_fusion", "temporal_modeling", "adaptive_weighting"],
+      "math_structure": "y = Σ_i g_i(x)·E_i(x); g = softmax(W·s(x)), s(x) 为尺度描述子 (多分辨率统计/频带能量); E_i 为尺度专精子网 (不同 kernel 宽/膨胀率/周期偏置); 可加 top-k 稀疏化与负载均衡损失",
+      "consequences": "专家数 × 子网参数; top-k 路由负载不均需均衡损失; 尺度描述子设计不当则路由坍缩到单专家",
+      "origin_domain": "TimeSeries",
+      "abstraction_level": "concept",
+      "evidence": [
+        {
+          "dataset": "时序基准 (多尺度)",
+          "metric": "MAE",
+          "delta": "MoE 式条件计算在时序基础模型 (Time-MoE 等) 验证有效",
+          "grade": "low",
+          "source": "B6 概念综合: MoE × 多尺度时序 (Time-MoE ICLR'25 佐证)"
+        }
+      ],
+      "anti_patterns": [
+        "路由退化到单专家等于白加容量——需负载均衡正则",
+        "尺度描述子与数据真实尺度错位时专家学不到专精"
+      ],
+      "related": {"REFINES": ["mixture_of_experts"]},
+      "provenance": "B6 概念综合 (2026-07 调研): MoE 思想 × 多尺度时序, 补 multi_scale+heterogeneity+sequential_order 检索缺口",
+      "inferred": true
+    }
+  ]
+}
