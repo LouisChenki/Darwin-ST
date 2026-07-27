@@ -470,6 +470,23 @@ def test_adaptive_patience_applied_in_run():
     assert 3 <= orch.archive.stagnation_patience <= 12
 
 
+def test_stagnation_min_delta_config_and_env(monkeypatch):
+    """停滞最小相对改进阈值: config 字段默认 0.005 生效; env STAGNATION_MIN_DELTA 覆盖; 非法 env 回 config。"""
+    monkeypatch.delenv("STAGNATION_MIN_DELTA", raising=False)
+    orch = Orchestrator(OrchestratorConfig(max_rounds=1), _make_eval_fn(), devices=1)
+    assert orch.archive.stagnation_min_delta == 0.005            # 默认阈值生效
+    orch = Orchestrator(OrchestratorConfig(max_rounds=1, stagnation_min_delta=0.01),
+                        _make_eval_fn(), devices=1)
+    assert orch.archive.stagnation_min_delta == 0.01             # config 字段生效
+    monkeypatch.setenv("STAGNATION_MIN_DELTA", "0.02")
+    orch = Orchestrator(OrchestratorConfig(max_rounds=1, stagnation_min_delta=0.01),
+                        _make_eval_fn(), devices=1)
+    assert orch.archive.stagnation_min_delta == 0.02             # env 覆盖 config
+    monkeypatch.setenv("STAGNATION_MIN_DELTA", "not-a-float")
+    orch = Orchestrator(OrchestratorConfig(max_rounds=1), _make_eval_fn(), devices=1)
+    assert orch.archive.stagnation_min_delta == 0.005            # 非法 env → 回 config 默认
+
+
 def test_creation_cooldown_resets_since_improve():
     """B: 创造成功后手动重置 archive._since_improve=0 (精修窗口干净计数)。"""
     from darwin_st.search.genotype import Genotype, STBlock

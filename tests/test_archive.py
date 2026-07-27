@@ -184,6 +184,45 @@ def test_stagnation_detection():
     assert arc.stagnated()
 
 
+# ---------------------------------------------------------------------------
+# 停滞最小相对改进阈值 (修"微改进饿杀创造": 噪声级改进不重置停滞计数)
+# ---------------------------------------------------------------------------
+
+
+def test_stagnation_min_delta_micro_improvement_still_counts():
+    """微改进 (0.1%, < 默认阈值 0.5%): best 照常更新 (严格 <), 但停滞计数不重置。"""
+    arc = MAPElitesArchive(seed=0, stagnation_patience=2)   # 默认 stagnation_min_delta=0.005
+    arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)
+    arc.add(_geno("gcn", "tcn"), fitness=19.98, num_params=10_000)  # 0.1% 改进
+    assert arc._best_fitness == 19.98          # best 更新逻辑不变 (严格 < 即更新)
+    assert arc._since_improve == 1             # 但不停滞重置 (微改进照常计停滞)
+    arc.add(_geno("gcn", "tcn"), fitness=19.96, num_params=10_000)  # 仍 0.1% 级
+    assert arc._since_improve == 2
+    assert arc.stagnated()                     # patience=2 蓄满 → 创造/岛屿重置得以触发
+
+
+def test_stagnation_min_delta_real_improvement_resets():
+    """真改进 (1%, ≥ 默认阈值 0.5%): 重置停滞计数 (原语义保持)。"""
+    arc = MAPElitesArchive(seed=0, stagnation_patience=3)
+    arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)
+    arc.add(_geno("gcn", "tcn"), fitness=25.0, num_params=10_000)   # 被拒, +1
+    arc.add(_geno("gcn", "tcn"), fitness=25.0, num_params=10_000)   # 被拒, +1
+    assert arc._since_improve == 2
+    arc.add(_geno("gcn", "tcn"), fitness=19.8, num_params=10_000)   # 1% 改进 ≥ 0.5%
+    assert arc._best_fitness == 19.8
+    assert arc._since_improve == 0
+    assert not arc.stagnated()
+
+
+def test_stagnation_min_delta_default_and_configurable():
+    """阈值默认 0.005; 构造参数可配 (自定义 2% 时 1.5% 改进不重置)。"""
+    assert MAPElitesArchive(seed=0).stagnation_min_delta == 0.005
+    arc = MAPElitesArchive(seed=0, stagnation_patience=2, stagnation_min_delta=0.02)
+    arc.add(_geno("gcn", "tcn"), fitness=20.0, num_params=10_000)
+    arc.add(_geno("gcn", "tcn"), fitness=19.7, num_params=10_000)   # 1.5% < 2% → 不重置
+    assert arc._since_improve == 1
+
+
 def test_island_reset_keeps_better_half():
     arc = MAPElitesArchive(seed=0)
     pool = ["gcn", "gat", "cheb", "diffusion"]

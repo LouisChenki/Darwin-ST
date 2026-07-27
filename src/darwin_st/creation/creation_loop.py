@@ -146,6 +146,9 @@ class CreationLoop:
         # B3 proxy 粗筛: proxy_fn(genotype) -> float (短训 val MAE), 设备/数据绑定由外部注入;
         # None 或 cfg.use_proxy=False → 全部 seed 走大预算, 行为与 B3 之前完全一致
         self.proxy_fn = proxy_fn
+        # 最近一次 _assign_seed_budgets 的逐候选 proxy 失败原因 (异常摘要/"inf"/None),
+        # 与 _assign_seed_budgets 返回的 proxy MAE 列表对齐, 供履历 record 的 proxy_error 落盘。
+        self._last_proxy_errors: list[str | None] = []
         # B2 微进化: 精炼器默认复用 synthesizer 的 LLM (低温配置独立); 显式传 None 之外的对象可 mock
         if refiner is not None:
             self.refiner = refiner
@@ -263,12 +266,14 @@ class CreationLoop:
             seed._seed_meta["creation_round"] = round_idx  # B4: 结局回授归属的诊断轮次
             seeds.append(seed)
 
-        # B3 proxy 粗筛: 短训排序分预算 (前 top_k 深评, 其余浅评), proxy 分进履历
+        # B3 proxy 粗筛: 短训排序分预算 (前 top_k 深评, 其余浅评), proxy 分+失败原因进履历
         proxy_maes = self._assign_seed_budgets(seeds)
         if self.archive is not None:
-            for r, reg_name, seed, pmae in zip(successes, op_names, seeds, proxy_maes):
+            for r, reg_name, seed, pmae, perr in zip(successes, op_names, seeds, proxy_maes,
+                                                     self._last_proxy_errors):
                 self._record_to_archive(req, r, round_idx, reg_name=reg_name,
-                                        seed_signature=seed.signature(), proxy_mae=pmae)
+                                        seed_signature=seed.signature(), proxy_mae=pmae,
+                                        proxy_error=perr)
 
         compositions = [r.plan.composition for r in successes]
         insight = (f"融合 {mech_names} 解决'{bottleneck}': {len(results)} 假设中 "
@@ -358,7 +363,7 @@ class CreationLoop:
         proxy_maes = self._assign_seed_budgets([seed])
         self._record_refinement(family, mode, result, round_idx, reg_name=reg_name,
                                 seed_signature=seed.signature(), mechanisms=mechanisms,
-                                proxy_mae=proxy_maes[0])
+                                proxy_mae=proxy_maes[0], proxy_error=self._last_proxy_errors[0])
         insight = (f"精炼 {family} ({mode}): {parent_reg} → {reg_name}, 待评测 "
                    f"(族 best MAE={best.get('real_mae')})")
         self._record_insight(insight, dataset, mechanisms, success=True)
@@ -392,7 +397,8 @@ class CreationLoop:
     def _record_refinement(self, family: str, mode: str, result, round_idx: int,
                            reg_name: str | None = None, seed_signature: str | None = None,
                            mechanisms: list[str] | None = None,
-                           proxy_mae: float | None = None) -> None:
+                           proxy_mae: float | None = None,
+                           proxy_error: str | None = None) -> None:
         """精炼履历写 B1 履历本: composition 记 refine:<mode>, mechanisms 沿用父版 plan 源机制。"""
         if self.archive is None:
             return
@@ -416,7 +422,7 @@ class CreationLoop:
             composition=f"refine:{mode}",
             rationale=plan.rationale if plan else "",
             code=code, gate=gate, error=error, seed_signature=seed_signature,
-            proxy_mae=proxy_mae)
+            proxy_mae=proxy_mae, proxy_error=proxy_error)
         try:
             self.archive.record(rec)
         except Exception:
@@ -436,22 +442,46 @@ class CreationLoop:
              升深评大预算 (seed_hpo_trials), 深评名额不超 top_k。
         否则 (无 proxy_fn / 开关关 / 候选数 ≤ top_k): 全部保持 _make_seed_genotype 挂的大预算,
         proxy_fn 一次不调, 行为与 B3 之前完全一致; 返回全 None (履历 proxy_mae 记空)。
+
+        可观测 (线上实证: 一轮 4 候选 proxy 全 inf —— 与 worker 争 cuda:0 致 OOM/NaN —— 粗筛
+        形同虚设且无任何日志): proxy 异常/非有限返回都打 [B3] 警告 (候选简述+原因截断),
+        失败原因同时留在 self._last_proxy_errors (与返回列表对齐) 供履历 proxy_error 落盘。
         """
         if (not self.cfg.use_proxy) or self.proxy_fn is None \
                 or len(seeds) <= self.cfg.proxy_top_k:
+            self._last_proxy_errors = [None] * len(seeds)
             return [None] * len(seeds)
         proxy_maes: list[float] = []
+        proxy_errors: list[str | None] = []
         for seed in seeds:
+            brief = self._proxy_brief(seed)
             try:
-                proxy_maes.append(float(self.proxy_fn(seed)))
-            except Exception:
-                proxy_maes.append(float("inf"))   # 单个候选 proxy 崩溃不拖死整轮创造
+                mae = float(self.proxy_fn(seed))
+            except Exception as e:
+                mae = float("inf")            # 单个候选 proxy 崩溃不拖死整轮创造
+                err: str | None = f"{type(e).__name__}: {e}"[:200]
+                print(f"[B3] proxy 候选 {brief} 短训异常 → 记 inf 排尾 (不拖死整轮): {err}")
+            else:
+                err = None
+                if not math.isfinite(mae):    # 训练 NaN/熔断 (或争卡 OOM 后) 返回 inf
+                    err = "inf" if math.isinf(mae) else "nan"
+                    print(f"[B3] proxy 候选 {brief} 短训返回 {err} → 记 inf 排尾 "
+                          f"(疑似训练 NaN/时间熔断, 或与 worker 争卡 OOM), 粗筛继续")
+            proxy_maes.append(mae)
+            proxy_errors.append(err)
+        self._last_proxy_errors = proxy_errors
         for seed in seeds:
             seed._seed_meta["hpo_trials"] = self.cfg.small_hpo_trials   # 暂挂浅评小预算
         order = sorted(range(len(seeds)), key=lambda i: proxy_maes[i])  # 稳定排序保并列原序
         for i in order[: self.cfg.proxy_top_k]:
             seeds[i]._seed_meta["hpo_trials"] = self.cfg.seed_hpo_trials  # 胜者升深评
         return proxy_maes
+
+    @staticmethod
+    def _proxy_brief(seed: Genotype) -> str:
+        """候选简述 (proxy 日志用): 算子名 + genotype 签名截断。"""
+        meta = getattr(seed, "_seed_meta", None) or {}
+        return f"{meta.get('operator_name', '?')}(sig={seed.signature()[:12]})"
 
     def _make_seed_genotype(self, best: Genotype | None, op_name: str,
                             best_hps: dict | None = None) -> Genotype:
@@ -492,7 +522,8 @@ class CreationLoop:
 
     def _record_to_archive(self, req: FusionRequest, r, round_idx: int,
                            reg_name: str | None = None, seed_signature: str | None = None,
-                           proxy_mae: float | None = None) -> None:
+                           proxy_mae: float | None = None,
+                           proxy_error: str | None = None) -> None:
         """把一条 SynthesisResult 落成 CreationRecord 追加进履历本 (B1)。
 
         成功: gate="all" + 代码 + plan 字段 + 注册名 + seed 签名 (orchestrator 回填识别用)。
@@ -520,7 +551,8 @@ class CreationLoop:
             composition=plan.composition if plan else "",
             rationale=plan.rationale if plan else "",
             code=code, gate=gate, error=error, seed_signature=seed_signature,
-            proxy_mae=proxy_mae)          # B3: proxy 粗筛分 (未走 proxy 路径为 None)
+            proxy_mae=proxy_mae,          # B3: proxy 粗筛分 (未走 proxy 路径为 None)
+            proxy_error=proxy_error)      # B3: proxy 失败原因 (异常摘要/"inf"; 成功为 None)
         try:
             self.archive.record(rec)
         except Exception:

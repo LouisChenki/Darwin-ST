@@ -62,6 +62,21 @@ def _parse_archive_parent_p() -> float:
         return 0.5
 
 
+def _parse_stagnation_min_delta() -> float | None:
+    """解析 env STAGNATION_MIN_DELTA (仅构造期调一次)。返回 None = 未设置/非法 → 用 config 字段。
+
+    与 _parse_archive_parent_p 同一哲学: 构造期读定, 运行期再改 env 不再静默生效 (行为可复现)。
+    """
+    import os
+    raw = os.environ.get("STAGNATION_MIN_DELTA")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return None
+
+
 @dataclass
 class OrchestratorConfig:
     dataset: str = "PeMS04"
@@ -103,6 +118,12 @@ class OrchestratorConfig:
     # B2 微进化节奏: 停滞触发创造时, 先尝试族内精炼 (maybe_refine), 无候选族 (返回 None)
     #   才回落从零创造 (maybe_create)。保持简单二档; B4 将加信用分仲裁, 此处不做复杂策略。
     refine_first: bool = True
+    # 停滞重置的最小相对改进阈值 (修"微改进饿杀创造"): best 相对改进 ≥ 此值才重置停滞计数,
+    #   更小的微改进照常计停滞。线上实证: best 在 18.949 平台时每隔 1-2 轮出现 0.001-0.003
+    #   (相对 <0.02%) 的训练噪声级"改进"重置计数, patience=6 永远蓄不满, 创造迟迟不触发。
+    #   默认 0.005 (0.5%), 与 early_stop_min_delta 的相对语义一致 (scale-free 跨数据集)。
+    #   只影响停滞重置; state.best_mae / archive 最优本身仍严格 < 即更新。env STAGNATION_MIN_DELTA 可覆盖。
+    stagnation_min_delta: float = 0.005
 
 
 @dataclass
@@ -173,7 +194,12 @@ class Orchestrator:
             base_genotype=base_genotype,
             dataset=config.dataset,
         )
-        self.archive = MAPElitesArchive(seed=config.seed)
+        env_delta = _parse_stagnation_min_delta()   # 构造期读一次, 运行期改 env 不再生效
+        self.archive = MAPElitesArchive(
+            seed=config.seed,
+            # 停滞最小相对改进阈值: env STAGNATION_MIN_DELTA 优先, 否则 config 字段 (构造期读定)
+            stagnation_min_delta=(env_delta if env_delta is not None
+                                  else config.stagnation_min_delta))
         self.scheduler = GPUScheduler(
             eval_fn, devices=devices, eval_spec=eval_spec, backend=backend)
         self.state = RunState()

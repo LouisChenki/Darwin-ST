@@ -46,6 +46,7 @@ class CreationRecord:
     seed_val_mae: float | None = None    # 回填: seed 实测 MAE
     adopted: bool | None = None          # 回填: seed 评测结局 (KEEP=True)
     proxy_mae: float | None = None       # B3 proxy 粗筛短训分 (未走 proxy 路径/旧履历行为 None)
+    proxy_error: str | None = None       # B3 proxy 失败原因 (异常摘要或 "inf"; 成功/未走 proxy 为 None)
 
 
 class CreationArchive:

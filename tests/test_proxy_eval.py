@@ -217,6 +217,59 @@ def test_assign_budgets_use_proxy_off_unchanged():
 
 
 # ---------------------------------------------------------------------------
+# proxy 失败可观测/可诊断 (线上实证: 一轮 4 候选全 inf, 无日志可查)
+# ---------------------------------------------------------------------------
+
+
+def test_assign_budgets_exception_logs_warning(capsys):
+    """proxy 异常 → 打印 [B3] 警告 (候选简述+异常摘要截断), 失败原因留在 _last_proxy_errors。"""
+    cfg = CreationConfig(seed_hpo_trials=20, small_hpo_trials=3, proxy_top_k=2)
+    calls = []
+
+    def proxy(g):
+        calls.append(g)
+        if len(calls) == 2:                   # 第二个候选崩溃
+            raise RuntimeError("mock CUDA OOM")
+        return 0.1
+
+    loop = _bare_loop(cfg, proxy_fn=proxy)
+    seeds = _seeds(loop, 3)
+    loop._assign_seed_budgets(seeds)
+    out = capsys.readouterr().out
+    assert "[B3]" in out and "RuntimeError" in out and "mock CUDA OOM" in out
+    assert "gcn" in out                       # 候选简述 (算子名)
+    assert loop._last_proxy_errors[0] is None
+    assert "mock CUDA OOM" in loop._last_proxy_errors[1]
+    assert loop._last_proxy_errors[2] is None
+
+
+def test_assign_budgets_inf_logs_note(capsys):
+    """proxy 返回 inf (训练 NaN/熔断) → 打印 [B3] 说明 (候选名+疑似原因), 记 "inf"。"""
+    cfg = CreationConfig(seed_hpo_trials=20, small_hpo_trials=3, proxy_top_k=2)
+    scores = iter([0.1, float("inf"), 0.2])
+    loop = _bare_loop(cfg, proxy_fn=lambda g: next(scores))
+    seeds = _seeds(loop, 3)
+    loop._assign_seed_budgets(seeds)
+    out = capsys.readouterr().out
+    assert "[B3]" in out and "inf" in out
+    assert "NaN" in out or "争卡" in out      # 疑似原因说明
+    assert loop._last_proxy_errors == [None, "inf", None]
+
+
+def test_assign_budgets_all_inf_keeps_original_top_k(capsys):
+    """全 inf (粗筛形同虚设场景): 预算分配行为不变 —— 稳定排序按原顺序 top-k 深评; 每候选都打日志。"""
+    cfg = CreationConfig(seed_hpo_trials=20, small_hpo_trials=3, proxy_top_k=2)
+    loop = _bare_loop(cfg, proxy_fn=lambda g: float("inf"))
+    seeds = _seeds(loop, 3)
+    proxy_maes = loop._assign_seed_budgets(seeds)
+    assert proxy_maes == [float("inf")] * 3
+    budgets = [s._seed_meta["hpo_trials"] for s in seeds]
+    assert budgets == [20, 20, 3]             # 全 inf 并列 → 原顺序前 top_k 深评, 其余浅评
+    out = capsys.readouterr().out
+    assert out.count("[B3]") == 3             # 每个 inf 候选都留日志
+
+
+# ---------------------------------------------------------------------------
 # maybe_create 集成 (MockLLM + mock proxy_fn + 履历)
 # ---------------------------------------------------------------------------
 
@@ -313,3 +366,44 @@ def test_creation_record_old_jsonl_without_proxy_mae(tmp_path):
                             "composition": "additive_residual"}) + "\n")
     recs = CreationArchive(path)._load()
     assert len(recs) == 1 and recs[0].proxy_mae is None
+
+
+def test_maybe_create_records_proxy_error(store, tmp_path):
+    """履历 record 带 proxy_error: 异常候选记异常摘要, inf 候选记 "inf", 正常候选为 None。"""
+    arch = CreationArchive(str(tmp_path / "ca.jsonl"))
+    responses = [_PLAN_ARRAY_3, _good_code("ProxyOpA"), _good_code("ProxyOpB"),
+                 _good_code("ProxyOpC")]
+    calls = []
+
+    def proxy(g):
+        calls.append(g)
+        if len(calls) == 2:                   # B 异常
+            raise RuntimeError("mock CUDA OOM")
+        if len(calls) == 3:                   # C 训练 NaN/熔断 → inf
+            return float("inf")
+        return 0.1                            # A 正常
+
+    loop = _loop_with_proxy(store, responses, proxy, archive=arch)
+    outcome = loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    assert outcome.n_success == 3
+    by_name = {r.operator_name: r for r in arch._load() if r.gate == "all"}
+    a, b, c = outcome.operator_names
+    assert by_name[a].proxy_error is None
+    assert "mock CUDA OOM" in (by_name[b].proxy_error or "")
+    assert by_name[c].proxy_error == "inf"
+    # proxy_mae 对齐记录不变: A=0.1, B/C=inf
+    assert by_name[a].proxy_mae == pytest.approx(0.1)
+    assert by_name[b].proxy_mae == float("inf")
+    assert by_name[c].proxy_mae == float("inf")
+
+
+def test_creation_record_old_jsonl_without_proxy_error(tmp_path):
+    """向后兼容: 旧 jsonl 行 (无 proxy_error 字段) 正常加载, proxy_error 默认 None。"""
+    import json
+    path = str(tmp_path / "ca.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"round_idx": 0, "created_at": "2026-01-01T00:00:00+00:00",
+                            "operator_name": "synth_old", "gate": "all",
+                            "proxy_mae": 0.3}) + "\n")
+    recs = CreationArchive(path)._load()
+    assert len(recs) == 1 and recs[0].proxy_error is None

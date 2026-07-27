@@ -180,6 +180,9 @@ def main():
     # B3 评估中间档 (proxy 粗筛): 合成 seed 先在主进程短训打分, 前 proxy_top_k 才给深评大 HPO,
     # 其余小预算浅评 —— 单轮创造 GPU 成本减半以上。只绑主进程一个设备 (PROXY_DEVICE 默认 cuda:0);
     # 进程后端 worker 不需要 proxy (proxy 只在主进程创造时用)。USE_PROXY=0 关闭 (行为同 B3 前)。
+    # 避免与 worker 争卡: worker 进程后端占满全部 N_GPUS 时 proxy 与 worker 同卡竞争易 OOM
+    # (线上实证: 一轮 4 候选 proxy_mae 全 inf, 粗筛形同虚设) —— 建议 N_GPUS 留一卡
+    # (如 4 卡机 N_GPUS=3, PROXY_DEVICE=cuda:3) 或 proxy 失败时按 inf 降级 (已有 [B3] 日志)。
     proxy_fn = None
     if ccfg.use_proxy:
         from darwin_st.data import prepare as P

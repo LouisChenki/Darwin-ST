@@ -169,12 +169,18 @@ class MAPElitesArchive:
     TOTAL_CELLS = len(all_cells())  # 108 (4 空间族 × 3 时序族 × 3 参数档 × 3 深度档)
 
     def __init__(self, seed: int = 0, p_uniform: float = 0.4, tournament_size: int = 4,
-                 stagnation_patience: int = 20):
+                 stagnation_patience: int = 20, stagnation_min_delta: float = 0.005):
         import random
         self.rng = random.Random(seed)
         self.p_uniform = p_uniform
         self.tournament_size = tournament_size
         self.stagnation_patience = stagnation_patience
+        # 停滞重置的最小相对改进阈值: best 相对改进 ≥ 此值才重置 _since_improve。
+        # 线上实证 (修"微改进饿杀创造"): best 在 18.949 平台时每隔 1-2 轮出现 0.001-0.003
+        # (相对 <0.02%) 的训练噪声级"改进"把停滞计数重置, patience=6 永远蓄不满, 创造迟迟不触发。
+        # 默认 0.005 (0.5%) 与 train 的 early_stop_min_delta 相对语义一致 (scale-free 跨数据集)。
+        # 注意: 只影响停滞重置分支; _best_fitness 本身仍严格 < 即更新 (真实最优不丢)。
+        self.stagnation_min_delta = stagnation_min_delta
 
         self.cells: dict[tuple, Elite] = {}        # cell → 精英
         self._order = 0                            # 全局插入计数
@@ -198,8 +204,11 @@ class MAPElitesArchive:
                                 bd=bd, trial_id=trial_id, insert_order=self._order)
         self._recent.append(key)
         if fitness < self._best_fitness:
+            # best 更新保持严格 < (真实最优不丢); 停滞计数只在相对改进 ≥ min_delta 时重置,
+            # 更小的微改进 (训练噪声级) 照常计停滞 —— 防"微改进饿杀创造" (见 __init__ 注释)。
+            significant = fitness < self._best_fitness * (1.0 - self.stagnation_min_delta)
             self._best_fitness = fitness
-            self._since_improve = 0
+            self._since_improve = 0 if significant else self._since_improve + 1
         else:
             self._since_improve += 1
         return True
