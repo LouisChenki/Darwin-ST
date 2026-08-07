@@ -10,7 +10,13 @@
   - detect_synth_ops: 从 genotype 认出用到的 synth_ 跨域合成算子。
   - render_*: 渲成 Markdown(榜单表 / 模型卡 / 总览索引)。
 
-文件落盘(sqlite 读、synth 代码拷贝、写 .md)由 scripts/export_leaderboard.py 这层薄壳负责。
+另含**方法版本榜**(仿 artificialanalysis 门面: 每个大版本只上榜其最佳模型, 展示方法演进):
+  - VersionRecord/VersionRow + parse_versions: versions.json 的记录结构与解析。
+  - build_version_rows: 版本最佳与已发表 baseline 混排, 算榜单位次与 vs-SOTA 差。
+  - render_version_board_md / render_version_readme_md: 渲版本主榜表 / 门面 README。
+
+文件落盘(sqlite 读、synth 代码拷贝、写 .md)由 scripts/export_leaderboard.py 这层薄壳负责;
+版本榜的 versions.json 读取、趋势图绘制、README 落盘由 scripts/build_version_board.py 负责。
 """
 
 from __future__ import annotations
@@ -30,6 +36,12 @@ __all__ = [
     "render_leaderboard_md",
     "render_model_card",
     "render_index_md",
+    "VersionRecord",
+    "VersionRow",
+    "parse_versions",
+    "build_version_rows",
+    "render_version_board_md",
+    "render_version_readme_md",
 ]
 
 
@@ -345,3 +357,160 @@ def render_index_md(dataset_summaries: list[dict]) -> str:
 
 def _finite(x: float) -> bool:
     return x == x and x not in (float("inf"), float("-inf"))
+
+
+# --------------------------------------------------------------------------
+# 方法版本榜 (Version Board) —— 每个大版本只上榜其最佳模型, 展示方法演进
+# --------------------------------------------------------------------------
+
+@dataclass
+class VersionRecord:
+    """方法版本记录 (leaderboard/versions.json 一条)。
+
+    - version/date/best_mae/dataset 必填; dataset 预留多数据集扩展。
+    - tag: 该版本的 git tag 或 commit (无则 None)。
+    - retrospective: 对应 docs/ 复盘文档的仓库相对路径 (无则 None)。
+    - model_dir: 该版本最佳模型在完整存档里的相对目录 (有存档则填, 供"当前最佳"链接)。
+    """
+
+    version: str
+    date: str
+    best_mae: float
+    dataset: str
+    tag: str | None = None
+    title: str = ""
+    retrospective: str | None = None
+    model_dir: str | None = None
+
+
+@dataclass
+class VersionRow:
+    """版本榜单一行: 版本记录 + 与 baseline 混排后的位次 + vs SOTA 差。"""
+
+    record: VersionRecord
+    rank: int                 # 该版本最佳在与 baseline 混排榜上的位次 (从 1)
+    board_size: int           # 混排榜总行数 (baseline 数 + 1)
+    vs_sota: float | None     # best_mae - sota_mae (正=落后 SOTA)
+
+
+def parse_versions(data: list[dict]) -> list[VersionRecord]:
+    """把 versions.json 的 dict 列表解析成 VersionRecord (容错: 缺省字段取默认)。"""
+    records = []
+    for d in data:
+        records.append(VersionRecord(
+            version=str(d["version"]), date=str(d["date"]),
+            best_mae=float(d["best_mae"]), dataset=str(d["dataset"]),
+            tag=d.get("tag"), title=str(d.get("title", "")),
+            retrospective=d.get("retrospective"), model_dir=d.get("model_dir"),
+        ))
+    return records
+
+
+def build_version_rows(
+    versions: list[VersionRecord],
+    baselines: dict[str, dict],
+    sota_mae: float | None,
+) -> list[VersionRow]:
+    """算每个版本的榜单位次与 vs-SOTA 差, 按日期升序返回 (演进叙事序)。
+
+    位次口径: 把**该版本最佳单独**与已发表 baseline 混排 (不同版本互不占位),
+    同分 baseline 在前 (与 build_leaderboard 一致) —— 即
+    rank = 1 + 满足 baseline.mae <= best_mae 的 baseline 数。
+    空版本列表返回 []; sota_mae=None 时 vs_sota 为 None。
+    """
+    baseline_maes = [e["mae"] for e in baselines.values() if e.get("mae") is not None]
+    rows = []
+    for rec in sorted(versions, key=lambda r: (r.date, r.version)):
+        rank = 1 + sum(1 for m in baseline_maes if m <= rec.best_mae)
+        rows.append(VersionRow(
+            record=rec, rank=rank, board_size=len(baseline_maes) + 1,
+            vs_sota=(rec.best_mae - sota_mae) if sota_mae is not None else None,
+        ))
+    return rows
+
+
+def _fmt_mae3(x: float) -> str:
+    """MAE 格式化: 至多 3 位小数并去尾零 (18.349/18.356 可区分, 20.67 不补零)。"""
+    return f"{x:.3f}".rstrip("0").rstrip(".")
+
+
+def render_version_board_md(
+    dataset: str,
+    rows: list[VersionRow],
+    sota_name: str | None = None,
+    sota_mae: float | None = None,
+) -> str:
+    """渲染方法版本主榜 Markdown 表 (AA 风: 列少而精, 名次醒目, 版本行加粗)。
+
+    列: 版本(含一句话说明) / 日期 / Best MAE / vs SOTA / 榜单位次 / Tag / 复盘。
+    """
+    lines = [f"## 方法版本榜 ({dataset})", ""]
+    if sota_name and sota_mae is not None:
+        lines.append(f"参照 SOTA: **{sota_name}** (MAE {sota_mae:.2f}); MAE 越低越好。")
+        lines.append("")
+    lines += ["| 版本 | 日期 | Best MAE | vs SOTA | 榜单位次 | Tag | 复盘 |",
+              "|---|---|---:|---:|---:|---|---|"]
+    for r in rows:
+        rec = r.record
+        ver = f"**{rec.version}**"
+        if rec.title:
+            ver += f"<br>{rec.title}"
+        tag = f"`{rec.tag}`" if rec.tag else "—"
+        # README 落在 leaderboard/ 下, 仓库根相对路径 (docs/...) 需上跳一级才可在 GitHub 解析
+        retro = (f"[复盘](../{rec.retrospective})" if rec.retrospective and not rec.retrospective.startswith("../")
+                 else (f"[复盘]({rec.retrospective})" if rec.retrospective else "—"))
+        lines.append(
+            f"| {ver} | {rec.date} | **{_fmt_mae3(rec.best_mae)}** | "
+            f"{_fmt_delta(r.vs_sota)} | **{r.rank}** / {r.board_size} | {tag} | {retro} |"
+        )
+    lines += ["",
+              f"> 位次口径: 该版本最佳单独与已发表 baseline 混排 (不同版本互不占位); "
+              f"完整模型存档见 [{dataset}.md]({dataset}.md)。", ""]
+    return "\n".join(lines)
+
+
+def render_version_readme_md(
+    dataset: str,
+    rows: list[VersionRow],
+    sota_name: str | None,
+    sota_mae: float | None,
+    *,
+    trend_image: str | None = None,
+    archive_md: str | None = None,
+) -> str:
+    """渲染版本榜门面 README: 一句话说明 + 版本主榜 + 趋势图 + 当前最佳 + 存档/文档链接。
+
+    trend_image: 趋势图相对路径 (如 assets/pems04_version_trend.png); None 则省略该节。
+    archive_md: 完整模型存档榜单文件名 (默认 f"{dataset}.md")。
+    """
+    archive_md = archive_md or f"{dataset}.md"
+    lines = ["# Darwin-ST 排行榜", "",
+             "自治时空预测研究系统 (进化 NAS + LLM 跨域创造) 的方法版本榜: "
+             "每个大版本只上榜其最佳模型, 展示方法一版版变强的演进主线。", ""]
+
+    board = render_version_board_md(dataset, rows, sota_name=sota_name, sota_mae=sota_mae)
+    lines.append(board)
+
+    if trend_image:
+        lines += ["## 成绩随版本演进", "",
+                  f"![{dataset} 方法版本成绩演进]({trend_image})", ""]
+
+    # 当前最佳: rows 按日期升序, 最后一个版本即当前方法; 其 best 即项目当前最佳
+    if rows:
+        cur = rows[-1]
+        lines += ["## 当前最佳", "",
+                  f"- **{cur.record.version}** ({cur.record.date}): "
+                  f"Best MAE **{_fmt_mae3(cur.record.best_mae)}**, "
+                  f"榜单位次 **{cur.rank}** / {cur.board_size}" +
+                  (f", 距 SOTA ({sota_name} {sota_mae:.2f}) {_fmt_delta(cur.vs_sota)}"
+                   if sota_mae is not None else "")]
+        if cur.record.model_dir:
+            lines.append(f"- 模型卡: [{cur.record.model_dir}]({cur.record.model_dir}/)")
+        if cur.record.tag:
+            lines.append(f"- git tag: `{cur.record.tag}`")
+        lines.append("")
+
+    lines += ["## 完整存档与设计文档", "",
+              f"- 完整模型存档榜 (全部入榜模型 + baseline 混排): [{archive_md}]({archive_md})",
+              "- 各版本复盘与设计文档: [docs/](../docs/)", ""]
+    return "\n".join(lines)

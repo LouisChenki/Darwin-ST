@@ -1,0 +1,39 @@
+[
+  {
+    "version": "v0",
+    "date": "2026-06-25",
+    "best_mae": 20.67,
+    "tag": null,
+    "title": "纯 NAS + HPO 进化搜索（无 Tier-2 创造），传统 AutoML 天花板",
+    "retrospective": "docs/SERVER_VALIDATION.md",
+    "dataset": "PeMS04"
+  },
+  {
+    "version": "v1",
+    "date": "2026-06-25",
+    "best_mae": 18.69,
+    "tag": null,
+    "title": "Tier-2 创造闭环首通：LLM 跨域合成算子注入进化（线程版）",
+    "retrospective": "docs/SERVER_VALIDATION.md",
+    "dataset": "PeMS04"
+  },
+  {
+    "version": "v2",
+    "date": "2026-07-01",
+    "best_mae": 18.349,
+    "tag": "v-sota-pems04-18.35",
+    "title": "Stage1 搜索空间升级（joint/cross/iterative fusion）+ 24h 长跑",
+    "retrospective": "docs/SOTA_RETROSPECTIVE.md",
+    "dataset": "PeMS04"
+  },
+  {
+    "version": "v3",
+    "date": "2026-08-07",
+    "best_mae": 18.356,
+    "tag": "acceptable+18.356",
+    "title": "Tier-2 v1 方法升级（履历/家谱精炼/proxy/信用分/独立采样 + 631 卡机制库）",
+    "retrospective": "docs/TIER2_V1_RETROSPECTIVE.md",
+    "dataset": "PeMS04",
+    "model_dir": "models/PeMS04/06_mae18.36_6bcc97b9"
+  }
+]
