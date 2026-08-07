@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_InfoBootstrapResidual",
+  "class_name": "InfoBootstrapResidual",
+  "needs_adj": false,
+  "plan_name": "InfoBootstrapResidual",
+  "composition": "additive_residual",
+  "source_mechanisms": [
+    "minimal_predictive_sufficiency"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": 19.13794708251953
+}

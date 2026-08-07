@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_st_graph_attn_with_vib_compression",
+  "class_name": "st_graph_attn_with_vib_compression",
+  "needs_adj": false,
+  "plan_name": "st_graph_attn_with_vib_compression",
+  "composition": "sequential",
+  "source_mechanisms": [
+    "minimal_predictive_sufficiency"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": 50.88640594482422
+}

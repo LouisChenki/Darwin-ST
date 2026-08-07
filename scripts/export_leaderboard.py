@@ -89,7 +89,10 @@ def _copy_synth_ops(synth_ops, synth_meta, dest_ops_dir) -> list[str]:
 
 
 def _find_checkpoint(ckpt_dir: str | None, dataset: str, signature: str | None) -> str | None:
-    """在权重存档目录里按文件名找该模型对应的 .pt (命名 <dataset>_<sig[:12]>.pt, 见 train.py)。
+    """在权重存档目录里按文件名找该模型对应的 .pt (命名 <dataset>_<genotype_sig[:12]>.pt)。
+
+    注意签名口径: 文件名用的是 genotype-only 签名 (Genotype.signature()), 与 db 里
+    genotype+hp 的 trial 签名不同 —— 调用方须传基因型签名 (见 export 处的换算)。
 
     先精确匹配 sig[:12]; 找不到再退 sig[:8] 前缀 glob (手工改存档/旧命名兜底)。无命中 → None。
     """
@@ -171,7 +174,14 @@ def export(memory_db: str, out_dir: str, datasets: list[str],
                        json.dumps(r.hp, ensure_ascii=False, indent=2))
                 if r.synth_ops:
                     _copy_synth_ops(r.synth_ops, synth_meta, os.path.join(mdir, "operators"))
-                weights_file = _copy_checkpoint(ckpt_dir, ds, r.signature, mdir)
+                # 权重存档按 genotype-only 签名命名 (train.py 的 ckpt 路径), 与 db 的
+                # genotype+hp 签名不同 —— 须用基因型签名匹配, 解析失败退回 db 签名兜底。
+                try:
+                    from darwin_st.search.genotype import Genotype
+                    _ckpt_sig = Genotype.from_dict(r.genotype).signature() if r.genotype else r.signature
+                except Exception:
+                    _ckpt_sig = r.signature
+                weights_file = _copy_checkpoint(ckpt_dir, ds, _ckpt_sig, mdir)
                 _write(os.path.join(mdir, "model_card.md"),
                        render_model_card(r, ds, sota_name, sota_mae,
                                          synth_meta=synth_meta, protocol_note=protocol,

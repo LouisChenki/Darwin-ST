@@ -1,0 +1,25 @@
+{
+  "blocks": [
+    {
+      "spatial_op": "mixhop",
+      "temporal_op": "gru",
+      "fusion": "residual"
+    },
+    {
+      "spatial_op": "mixhop",
+      "temporal_op": "gru",
+      "fusion": "residual"
+    }
+  ],
+  "hidden": 192,
+  "adj_mode": "rw",
+  "embedding": {
+    "use_node": true,
+    "node_dim": 64,
+    "use_tod": true,
+    "tod_dim": 64,
+    "use_dow": true,
+    "dow_dim": 64
+  },
+  "protected": []
+}

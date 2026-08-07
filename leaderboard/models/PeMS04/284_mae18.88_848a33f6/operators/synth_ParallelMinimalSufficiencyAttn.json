@@ -1,0 +1,13 @@
+{
+  "reg_name": "synth_ParallelMinimalSufficiencyAttn",
+  "class_name": "ParallelMinimalSufficiencyAttn",
+  "needs_adj": false,
+  "plan_name": "ParallelMinimalSufficiencyAttn",
+  "composition": "parallel",
+  "source_mechanisms": [
+    "st_graph_attn",
+    "minimal_predictive_sufficiency"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": null
+}

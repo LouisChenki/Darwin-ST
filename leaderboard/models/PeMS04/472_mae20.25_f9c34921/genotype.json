@@ -1,0 +1,30 @@
+{
+  "blocks": [
+    {
+      "spatial_op": "cheb",
+      "temporal_op": "stjoint_conv",
+      "fusion": "residual"
+    },
+    {
+      "spatial_op": "st_graph_attn",
+      "temporal_op": "stjoint_conv",
+      "fusion": "residual"
+    },
+    {
+      "spatial_op": "st_graph_attn",
+      "temporal_op": "stjoint_conv",
+      "fusion": "residual"
+    }
+  ],
+  "hidden": 128,
+  "adj_mode": "rw",
+  "embedding": {
+    "use_node": true,
+    "node_dim": 64,
+    "use_tod": true,
+    "tod_dim": 64,
+    "use_dow": true,
+    "dow_dim": 64
+  },
+  "protected": []
+}

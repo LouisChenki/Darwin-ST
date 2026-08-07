@@ -1,0 +1,35 @@
+{
+  "blocks": [
+    {
+      "spatial_op": "stjoint_conv",
+      "temporal_op": "tcn",
+      "fusion": "sequential"
+    },
+    {
+      "spatial_op": "stjoint_conv",
+      "temporal_op": "tcn",
+      "fusion": "sequential"
+    },
+    {
+      "spatial_op": "stjoint_conv",
+      "temporal_op": "tcn",
+      "fusion": "sequential"
+    },
+    {
+      "spatial_op": "stjoint_conv",
+      "temporal_op": "tcn",
+      "fusion": "sequential"
+    }
+  ],
+  "hidden": 128,
+  "adj_mode": "sym",
+  "embedding": {
+    "use_node": true,
+    "node_dim": 64,
+    "use_tod": true,
+    "tod_dim": 64,
+    "use_dow": true,
+    "dow_dim": 64
+  },
+  "protected": []
+}

@@ -1,0 +1,12 @@
+{
+  "reg_name": "synth_StGraphAttnWithMpsGated_v25",
+  "class_name": "StGraphAttnWithMpsGated_v25",
+  "needs_adj": false,
+  "plan_name": "StGraphAttnWithMpsGated_v25",
+  "composition": "gated_routed",
+  "source_mechanisms": [
+    "minimal_predictive_sufficiency"
+  ],
+  "category": "spatiotemporal",
+  "real_mae": 18.596242904663086
+}

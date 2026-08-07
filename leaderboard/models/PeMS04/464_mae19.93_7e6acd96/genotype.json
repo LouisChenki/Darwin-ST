@@ -1,0 +1,45 @@
+{
+  "blocks": [
+    {
+      "spatial_op": "synth_StGraphAttnWithMpsGated_v7",
+      "temporal_op": "identity",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "st_separable",
+      "temporal_op": "st_graph_attn",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "adaptive",
+      "temporal_op": "st_separable",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "dynamic_gat",
+      "temporal_op": "identity",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "synth_InfoBootstrapResidual",
+      "temporal_op": "stjoint_conv",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "synth_StGraphAttnWithMpsGated_v4",
+      "temporal_op": "synth_InfoBootstrapResidual",
+      "fusion": "residual"
+    }
+  ],
+  "hidden": 64,
+  "adj_mode": "rw",
+  "embedding": {
+    "use_node": false,
+    "node_dim": 64,
+    "use_tod": true,
+    "tod_dim": 64,
+    "use_dow": true,
+    "dow_dim": 64
+  },
+  "protected": []
+}

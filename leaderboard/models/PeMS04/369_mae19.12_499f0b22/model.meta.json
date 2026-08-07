@@ -1,0 +1,7 @@
+{
+  "signature": "2544a5ba8f81035ae91fea656bccfe9a3611b55d",
+  "dataset": "PeMS04",
+  "best_epoch": 57,
+  "val_mae": 19.121471405029297,
+  "created_at": "2026-07-26T18:06:14"
+}

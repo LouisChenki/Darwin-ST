@@ -1,0 +1,8 @@
+{
+  "lr": 0.0012229259598449068,
+  "weight_decay": 1.7055210796748734e-06,
+  "dropout": 0.37464990198758563,
+  "batch_size": 16,
+  "lr_schedule": "plateau",
+  "num_heads": 1
+}

@@ -1,0 +1,41 @@
+{
+  "blocks": [
+    {
+      "spatial_op": "st_graph_attn",
+      "temporal_op": "st_graph_attn",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "st_graph_attn",
+      "temporal_op": "st_graph_attn",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "st_graph_attn",
+      "temporal_op": "st_separable",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "diffusion",
+      "temporal_op": "stjoint_conv",
+      "fusion": "parallel",
+      "joint_op": "dynamic_gat"
+    },
+    {
+      "spatial_op": "synth_StGraphAttnWithMpsGated_v2",
+      "temporal_op": "identity",
+      "fusion": "residual"
+    }
+  ],
+  "hidden": 64,
+  "adj_mode": "rw",
+  "embedding": {
+    "use_node": true,
+    "node_dim": 64,
+    "use_tod": true,
+    "tod_dim": 64,
+    "use_dow": true,
+    "dow_dim": 64
+  },
+  "protected": []
+}

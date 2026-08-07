@@ -34,3 +34,5 @@ src/darwin_st/knowledge/data/*.md
 
 #Python
 .venv
+# 模型权重二进制 (体积大, 留服务器数据盘; git 只存档基因型/超参/模型卡/算子代码)
+leaderboard/models/**/model.pt

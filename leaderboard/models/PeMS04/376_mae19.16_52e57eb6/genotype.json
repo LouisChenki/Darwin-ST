@@ -1,0 +1,31 @@
+{
+  "blocks": [
+    {
+      "spatial_op": "gat",
+      "temporal_op": "series_decomp_attn",
+      "fusion": "residual"
+    },
+    {
+      "spatial_op": "gat",
+      "temporal_op": "synth_StGraphAttnWithMpsGated_v4",
+      "fusion": "residual"
+    },
+    {
+      "spatial_op": "gat",
+      "temporal_op": "series_decomp_attn",
+      "fusion": "residual",
+      "joint_op": "st_graph_attn"
+    }
+  ],
+  "hidden": 64,
+  "adj_mode": "sym",
+  "embedding": {
+    "use_node": true,
+    "node_dim": 64,
+    "use_tod": true,
+    "tod_dim": 64,
+    "use_dow": true,
+    "dow_dim": 64
+  },
+  "protected": []
+}

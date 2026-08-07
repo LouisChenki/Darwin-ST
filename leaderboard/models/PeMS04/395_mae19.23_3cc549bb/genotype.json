@@ -1,0 +1,30 @@
+{
+  "blocks": [
+    {
+      "spatial_op": "st_graph_attn",
+      "temporal_op": "st_graph_attn",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "st_graph_attn",
+      "temporal_op": "st_separable",
+      "fusion": "cross"
+    },
+    {
+      "spatial_op": "diffusion",
+      "temporal_op": "stjoint_conv",
+      "fusion": "parallel"
+    }
+  ],
+  "hidden": 64,
+  "adj_mode": "none",
+  "embedding": {
+    "use_node": true,
+    "node_dim": 64,
+    "use_tod": true,
+    "tod_dim": 64,
+    "use_dow": true,
+    "dow_dim": 64
+  },
+  "protected": []
+}
