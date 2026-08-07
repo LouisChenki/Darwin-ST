@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from darwin_st.data.metrics import (
+    masked_huber,
     masked_mae,
     masked_mape,
     masked_rmse,
@@ -50,6 +51,35 @@ def test_mask_reweight_equals_mean_over_valid():
     valid = labels != 0.0
     ref = torch.abs(preds - labels)[valid].mean()  # 直接对有效位求均值
     assert torch.isclose(got, ref, atol=1e-6)
+
+
+def test_masked_huber_quadratic_and_linear_branch():
+    """δ=1: |err|≤δ 走二次支路 0.5·err², |err|>δ 走线性支路 δ·(|err|−0.5δ); 缺失位被 mask。"""
+    preds = torch.tensor([1.5, 5.0, 999.0])
+    labels = torch.tensor([1.0, 2.0, 0.0])   # 第三位缺失, 不计
+    # 有效误差: 0.5 → 0.5·0.5²=0.125; 3.0 → 3.0−0.5=2.5 → mean = 1.3125
+    out = masked_huber(preds, labels, null_val=0.0, delta=1.0)
+    assert torch.isclose(out, torch.tensor(1.3125), atol=1e-6)
+
+
+def test_masked_huber_matches_torch_elementwise():
+    """无缺失时与 torch F.huber_loss (mean) 一致; 大误差下小于同尺度 MSE (抗离群)。"""
+    torch.manual_seed(0)
+    preds = torch.randn(4, 6, 10)
+    labels = torch.randn(4, 6, 10)
+    out = masked_huber(preds, labels, delta=2.0)
+    ref = torch.nn.functional.huber_loss(preds, labels, reduction="mean", delta=2.0)
+    assert torch.isclose(out, ref, atol=1e-6)
+
+
+def test_masked_huber_differentiable():
+    """训练 loss 必须可微: 反向传播后 preds 拿到有限梯度。"""
+    preds = torch.tensor([1.0, 2.0, 0.5], requires_grad=True)
+    labels = torch.tensor([0.5, 5.0, 1.0])
+    loss = masked_huber(preds, labels, null_val=0.0, delta=1.0)
+    loss.backward()
+    assert preds.grad is not None
+    assert torch.isfinite(preds.grad).all()
 
 
 def test_rmse_is_sqrt_of_masked_mse():

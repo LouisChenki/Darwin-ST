@@ -83,6 +83,20 @@ def test_suggest_hps_lr_in_range():
         study.tell(trial, 1.0)
 
 
+def test_suggest_hps_loss_dimension():
+    """loss 作为 HPO 维度: 每 trial 采 mae/huber 之一; seeded 采样下两类都出现 (维度真实生效)。"""
+    cfg = HPOConfig()
+    study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=0))
+    seen = set()
+    for _ in range(10):
+        trial = study.ask()
+        hps = suggest_hps(trial, _geno(), cfg)
+        assert hps["loss"] in {"mae", "huber"}
+        seen.add(hps["loss"])
+        study.tell(trial, 1.0)
+    assert seen == {"mae", "huber"}
+
+
 # ---------------------------------------------------------------------------
 # study 配置
 # ---------------------------------------------------------------------------

@@ -26,8 +26,9 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
-__all__ = ["masked_mae", "masked_rmse", "masked_mape", "compute_all_metrics"]
+__all__ = ["masked_mae", "masked_huber", "masked_rmse", "masked_mape", "compute_all_metrics"]
 
 
 def _build_mask(labels: torch.Tensor, null_val: float) -> torch.Tensor:
@@ -57,6 +58,23 @@ def masked_mae(preds: torch.Tensor, labels: torch.Tensor, null_val: float = 0.0)
     mask = _build_mask(labels, null_val)
     loss = torch.abs(preds - labels) * mask
     loss = torch.nan_to_num(loss, nan=0.0)  # 防 preds 中的 nan 污染(应在评测层提前熔断)
+    return loss.mean()
+
+
+def masked_huber(
+    preds: torch.Tensor, labels: torch.Tensor, null_val: float = 0.0, delta: float = 1.0
+) -> torch.Tensor:
+    """masked Huber 损失 (δ=delta) —— SOTA 风格的**真实尺度训练 loss**。
+
+    |err| ≤ δ 走二次支路 0.5·err², 否则线性支路 δ·(|err| − 0.5δ) (torch F.huber_loss 口径,
+    与 STGformer/HimNet/STAEformer/PDFormer 等仓库实现一致): 小误差保留 L2 的平滑梯度,
+    大误差降为 L1 抗离群。mask 重加权与 masked_mae 完全相同 (仅有效位求均值)。
+    preds/labels 须为真实尺度 (与评测口径一致, 逆变换由调用方负责)。
+    """
+    mask = _build_mask(labels, null_val)
+    err = F.huber_loss(preds, labels, reduction="none", delta=delta)
+    loss = err * mask
+    loss = torch.nan_to_num(loss, nan=0.0)  # 与 masked_mae 同款防 nan 污染
     return loss.mean()
 
 

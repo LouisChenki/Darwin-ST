@@ -122,6 +122,47 @@ def test_train_one_wires_dropout_and_num_heads(tiny_data, monkeypatch):
     assert np.isfinite(mae)
 
 
+# ---------------------------------------------------------------------------
+# 训练损失作为 HPO 维度 (loss="huber" → 真实尺度 masked Huber, 对齐 SOTA)
+# ---------------------------------------------------------------------------
+
+
+def test_train_one_huber_loss_real_scale(tiny_data):
+    """loss="huber": 玩具数据 CPU 可训, loss 有限, 且为真实尺度 (量级 ≫ 归一化尺度 mae)。
+
+    tiny_data 的 scaler = (mean=50, std=20): huber 在逆变换后的真实尺度计 loss,
+    同数据同架构下其 train_loss 应显著大于归一化尺度 mae 路径 (~std 倍量级差)。
+    """
+    prof, data_dir, adj = tiny_data
+    geno = random_genotype(depth=1, spatial="gcn", temporal="tcn", hidden=16)
+    mae_h, trace_h = train_one(
+        geno, {"lr": 1e-3, "weight_decay": 1e-4, "batch_size": 16, "loss": "huber"},
+        data_dir, prof, adj, device="cpu", max_epochs=2)
+    assert np.isfinite(mae_h) and mae_h > 0          # val 评测口径不变 (真实尺度 masked MAE)
+    assert trace_h.loss == "huber"
+    assert trace_h.n_epochs_run == 2
+    assert all(np.isfinite(v) for v in trace_h.train_loss)
+    # 真实尺度: y_real ∈ [50,70], 初期预测欠拟合 → huber loss 明显 >1 (归一化尺度则 <1)
+    assert trace_h.train_loss[0] > 2.0
+
+    # 与 mae 路径的行为差异: 同数据同架构, 归一化尺度 loss 小约一个 std 量级
+    _, trace_m = train_one(geno, {"lr": 1e-3, "weight_decay": 1e-4, "batch_size": 16},
+                           data_dir, prof, adj, device="cpu", max_epochs=2)
+    assert trace_m.loss == "mae"
+    assert trace_h.train_loss[0] > trace_m.train_loss[0]
+
+
+def test_train_one_default_loss_is_mae(tiny_data):
+    """默认不变回归: hps 不带 loss 键 → 归一化尺度 masked MAE, 量级 <1 (玩具数据 y∈[0,1])。"""
+    prof, data_dir, adj = tiny_data
+    geno = random_genotype(depth=1, spatial="gcn", temporal="tcn", hidden=16)
+    mae, trace = train_one(geno, {"lr": 1e-3, "batch_size": 16},
+                           data_dir, prof, adj, device="cpu", max_epochs=2)
+    assert trace.loss == "mae"
+    assert np.isfinite(mae) and mae > 0
+    assert all(v < 2.0 for v in trace.train_loss)    # 归一化尺度, 与 huber 真实尺度区分开
+
+
 def test_evaluate_architecture_returns_result(tiny_data):
     prof, data_dir, adj = tiny_data
     geno = random_genotype(depth=1, spatial="gcn", temporal="tcn", hidden=16)

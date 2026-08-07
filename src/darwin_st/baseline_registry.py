@@ -58,7 +58,7 @@ BASELINE_METRICS: dict[str, dict[str, dict[str, float | None]]] = {
         "MTGNN": {"mae": 19.17, "rmse": 31.70},  # 原论文来源待核 (数值取自 HimNet/STD-MAE 等对照表)
         # 现代强基线 / 前沿 (2022–2024); 以下 6 条 MAE 经 2026-07 一手文献核实
         "STID": {"mae": 18.35, "rmse": 29.85},  # STID, CIKM'22, arXiv:2208.05233
-        "PDFormer": {"mae": 18.36, "rmse": 30.03},  # PDFormer, AAAI'23, arXiv:2301.07945
+        "PDFormer": {"mae": 18.321, "rmse": 29.965},  # PDFormer, AAAI'23, arXiv:2301.07945 v3 Tab.2 一手值 (此前 18.36/30.03 为 STGformer 论文二手转载, 2026-08 文献审计更正)
         "STAEformer": {"mae": 18.22, "rmse": 30.18},  # STAEformer, CIKM'23, arXiv:2308.10425
         "HimNet": {"mae": 18.14, "rmse": 30.02},  # HimNet, KDD'24, arXiv:2405.10800
         "STGformer": {"mae": 17.89, "rmse": 30.21},  # STGformer, arXiv:2410.00385
@@ -85,7 +85,7 @@ BASELINE_METRICS: dict[str, dict[str, dict[str, float | None]]] = {
         "GMAN": {"mae": 3.08, "rmse": 6.41},  # 原论文来源待核
         "MTGNN": {"mae": 3.04, "rmse": 6.11},  # 原论文来源待核
         "STID": {"mae": 3.19, "rmse": 6.55},  # STID, CIKM'22, arXiv:2208.05233
-        "STAEformer": {"mae": 2.93, "rmse": 6.00},  # STAEformer, CIKM'23, arXiv:2308.10425
+        "STAEformer": {"mae": 2.93, "rmse": 6.00},  # STAEformer, CIKM'23, arXiv:2308.10425 —— 口径待核（与一手论文任何 horizon 不符）
         "HimNet": {"mae": 2.92, "rmse": 5.99},  # HimNet, KDD'24, arXiv:2405.10800 —— 当前 SOTA 集群最低
     },
     "PEMS-BAY": {
@@ -95,7 +95,7 @@ BASELINE_METRICS: dict[str, dict[str, dict[str, float | None]]] = {
         "GMAN": {"mae": 1.59, "rmse": 3.60},  # 原论文来源待核
         "MTGNN": {"mae": 1.55, "rmse": 3.49},  # 原论文来源待核
         "STID": {"mae": 1.62, "rmse": 3.67},  # STID, CIKM'22, arXiv:2208.05233
-        "STAEformer": {"mae": 1.50, "rmse": 3.45},  # STAEformer, CIKM'23, arXiv:2308.10425
+        "STAEformer": {"mae": 1.50, "rmse": 3.45},  # STAEformer, CIKM'23, arXiv:2308.10425 —— 口径待核（与一手论文任何 horizon 不符）
         "HimNet": {"mae": 1.51, "rmse": 3.46},  # HimNet, KDD'24, arXiv:2405.10800
     },
 }

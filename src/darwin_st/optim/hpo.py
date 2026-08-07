@@ -61,6 +61,8 @@ class HPOConfig:
 def suggest_hps(trial: optuna.Trial, genotype: Genotype, cfg: HPOConfig) -> dict:
     """define-by-run 定义该架构的超参搜索空间, 返回采样到的 hps。
 
+    无条件维度: lr/weight_decay/dropout/batch_size/lr_schedule/loss (损失类型也交给 HPO
+    按架构择优: mae=归一化尺度, huber=真实尺度, 对齐 SOTA 训练实践)。
     条件超参: num_heads 仅当架构含【头数可配】的注意力算子时才存在 ——
     attn / st_graph_attn / series_decomp_attn (accepts_num_heads 按构造函数签名判定;
     gat/dynamic_gat 头数写死不可配, 不采 —— 采了也是没人消费的死参数)。
@@ -73,6 +75,9 @@ def suggest_hps(trial: optuna.Trial, genotype: Genotype, cfg: HPOConfig) -> dict
         "batch_size": trial.suggest_categorical("batch_size", list(cfg.batch_choices)),
         # lr schedule 种类作为可择优超参 (扩搜索空间, 让 HPO 自己选用不用、用哪种)
         "lr_schedule": trial.suggest_categorical("lr_schedule", ["none", "cosine", "plateau"]),
+        # 训练损失种类作为可择优超参: mae=归一化尺度 masked MAE (原默认), huber=真实尺度 masked
+        # Huber (SOTA 实践, 见 train_one)。消费方 hps.get("loss", "mae") 兜底, 旧暖启动字典无此键不受影响
+        "loss": trial.suggest_categorical("loss", ["mae", "huber"]),
     }
     # 条件超参: 任一块的空间/时序/一体槽坐了头数可配的注意力算子才调头数
     uses_attn = any(

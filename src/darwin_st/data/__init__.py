@@ -4,7 +4,13 @@
 可在本地用 pytest 验证正确性。详见 docs/BLUEPRINT.md §2。
 """
 
-from darwin_st.data.metrics import masked_mae, masked_rmse, masked_mape, compute_all_metrics
+from darwin_st.data.metrics import (
+    masked_mae,
+    masked_huber,
+    masked_rmse,
+    masked_mape,
+    compute_all_metrics,
+)
 from darwin_st.data.protocol import (
     DatasetProfile,
     PROFILES,
@@ -32,6 +38,7 @@ from darwin_st.data.prepare import (
 
 __all__ = [
     "masked_mae",
+    "masked_huber",
     "masked_rmse",
     "masked_mape",
     "compute_all_metrics",

@@ -109,6 +109,17 @@ def test_sota_beats_classic_baselines():
         assert sota_mae < astgcn
 
 
+def test_pdformer_pems04_primary_source():
+    """PDFormer PeMS04 取一手论文值 (AAAI'23, arXiv:2301.07945 v3 Table 2), 非二手转载。"""
+    assert get_baseline_metric("PeMS04", "PDFormer", "mae") == 18.321
+    assert get_baseline_metric("PeMS04", "PDFormer", "rmse") == 29.965
+    # 修正后 PDFormer(18.321) 在混排中前移到 STID(18.35) 之前 —— 有意的诚实修正
+    ranked = list(list_baselines("PeMS04", "mae"))
+    assert ranked.index("PDFormer") < ranked.index("STID")
+    # SOTA 锚点与存疑声称机制不受影响
+    assert get_sota("PeMS04") == ("STD-MAE", 17.80)
+
+
 def test_claimed_unverified_structure():
     """存疑声称表: SSL-STMFormer (PeMS04) 已登记, 可经 get_claimed 只读访问。"""
     entry = CLAIMED_UNVERIFIED.get("PeMS04", {}).get("SSL-STMFormer")

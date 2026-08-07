@@ -34,6 +34,6 @@
     "title": "Tier-2 v1 方法升级（履历/家谱精炼/proxy/信用分/独立采样 + 631 卡机制库）",
     "retrospective": "docs/TIER2_V1_RETROSPECTIVE.md",
     "dataset": "PeMS04",
-    "model_dir": "models/PeMS04/06_mae18.36_6bcc97b9"
+    "model_dir": "models/PeMS04/07_mae18.36_6bcc97b9"
   }
 ]

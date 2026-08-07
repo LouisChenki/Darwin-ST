@@ -8,7 +8,9 @@ orchestrator 需要的 eval_fn(genotype, device) → EvalResult。
   每 epoch report val-MAE 给 ASHA 剪枝 → 取最优超参的 MAE 作为该架构得分。
 
 训练纪律 (docs/P2_ALGORITHM_DESIGN.md):
-  - masked MAE 训练 loss(归一化尺度)+ evaluate 真实尺度 masked 指标
+  - 训练 loss 可经 hps["loss"] 择优: "mae"=归一化尺度 masked MAE (默认, 现状不变);
+    "huber"=真实尺度 masked Huber δ=1.0 (对齐 STGformer/HimNet/STAEformer/PDFormer 实践)
+  - evaluate 真实尺度 masked 指标
   - **NaN 熔断**: loss 出现 nan/inf 立即停该 trial(记崩, 不空跑)
   - **时间熔断**: 单 trial 超时间预算即停(防重算子吃满算力)
   - 梯度裁剪(防时空图卷积梯度爆炸)
@@ -28,7 +30,7 @@ import optuna
 import torch
 
 from darwin_st.data import prepare as P
-from darwin_st.data.metrics import masked_mae
+from darwin_st.data.metrics import masked_huber, masked_mae
 from darwin_st.data.protocol import DatasetProfile, get_profile
 from darwin_st.optim.checkpoint import maybe_save_best
 from darwin_st.optim.hpo import HPOConfig, optimize_architecture
@@ -80,6 +82,10 @@ def train_one(
     每 epoch 向 trial.report 上报 val-MAE 供 ASHA 剪枝(trial 为 None 则跳过剪枝)。
     NaN/时间/收敛熔断触发时提前返回当前最优(或 inf)。
 
+    hps["loss"] 选择训练损失: "mae" (默认) = 归一化尺度 masked MAE (现状不变);
+    "huber" = 真实尺度 masked Huber δ=1.0 (对齐 SOTA 实践)。TrainTrace.loss 记录本次
+    损失类型, train_loss 曲线数值口径以此为准 (huber 时绝对值比归一化尺度大约 std 倍)。
+
     max_train_batches: 非 None 时每 epoch 训练 batch 数上限 (提前 break 内层 batch 循环) ——
     B3 proxy 短训粗筛的廉价抓手: 不动数据管道, 只让每个 epoch 变短。None (默认) = 全量, 行为不变。
 
@@ -126,7 +132,19 @@ def train_one(
     else:
         scheduler = None
 
-    trace = TrainTrace(max_epochs=max_epochs, lr_schedule=sched_kind, lr=lr)
+    # 训练损失作为 HPO 可择优维度 (hps["loss"], 缺省 "mae" = 现状不变):
+    #   "mae"   → 归一化尺度 masked MAE (逐字节沿用原路径)
+    #   "huber" → 真实尺度 masked Huber (对齐 SOTA 实践)。scaler 是**标量** mean/std
+    #             (prepare.py 仅对目标通道拟合 ZScoreScaler, 见 load_scaler), 而 pred/y
+    #             形状 [B,T_out,N] 本就只含目标通道 → 标量逐元素广播, 无通道维广播歧义。
+    #             仅在 huber 时读一次 scaler.npy (两个 float, 开销可忽略), mae 路径零额外 IO。
+    loss_kind = str(hps.get("loss", "mae"))
+    scaler_mean = scaler_std = None
+    if loss_kind == "huber":
+        sc = P.load_scaler(data_dir)
+        scaler_mean, scaler_std = sc.mean, sc.std
+
+    trace = TrainTrace(max_epochs=max_epochs, lr_schedule=sched_kind, lr=lr, loss=loss_kind)
     best_mae = float("inf")
     epochs_since_improve = 0                # 收敛早停计数: 连续多少 epoch 无 >min_delta(相对) 改进
     start = time.time()
@@ -144,7 +162,16 @@ def train_one(
                 x, y = x.to(device), y.to(device)
                 pred = model(x)
             opt.zero_grad()
-            loss = masked_mae(pred, y)                    # 归一化尺度训练 loss
+            if loss_kind == "huber":
+                # 真实尺度 masked Huber: pred/y 先逆变换回真实尺度 (标量 mean/std, 元素级,
+                # 对 pred 可微 —— 梯度经 std 缩放回归一化参数空间); mask 规则与评测完全一致
+                # (null_val 不计, 在真实尺度标签上判定, 同 P.evaluate)。δ=1.0 先固定
+                # (SOTA 用 δ=1~2) —— 后续可升为 HPO 维度。
+                loss = masked_huber(pred * scaler_std + scaler_mean,
+                                    y * scaler_std + scaler_mean,
+                                    null_val=profile.null_val, delta=1.0)
+            else:
+                loss = masked_mae(pred, y)                    # 归一化尺度训练 loss (默认, 现状不变)
             if torch.isnan(loss) or torch.isinf(loss):   # NaN 熔断
                 trace.nan_hit = True
                 trace.n_epochs_run = epoch

@@ -26,7 +26,7 @@ class TrainTrace:
     """单次训练 (一个 trial) 的逐 epoch 动态轨迹。全字段可 pickle / JSON-able。"""
 
     # 逐 epoch 曲线 (len = 实际跑的 epoch 数, ≤ max_epochs)
-    train_loss: list[float] = field(default_factory=list)      # 每 epoch 训练 loss 均值 (归一化尺度)
+    train_loss: list[float] = field(default_factory=list)      # 每 epoch 训练 loss 均值 (尺度依 loss 字段: mae=归一化, huber=真实)
     val_mae: list[float] = field(default_factory=list)         # 每 epoch val MAE (真实尺度 masked)
     grad_norm_mean: list[float] = field(default_factory=list)  # 每 epoch clip 前梯度总范数均值
     grad_norm_max: list[float] = field(default_factory=list)   # 每 epoch 梯度总范数最大值
@@ -44,3 +44,4 @@ class TrainTrace:
     nan_hit: bool = False           # 训练中遇到 NaN/Inf loss
     lr_schedule: str = "none"       # 该 trial 用的调度 (none/cosine/plateau)
     lr: float = 0.0                 # 该 trial lr (辅助梯度诊断)
+    loss: str = "mae"               # 该 trial 训练损失类型 (mae=归一化尺度 masked MAE / huber=真实尺度 masked Huber)
