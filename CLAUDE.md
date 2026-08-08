@@ -80,7 +80,7 @@ Memory files track the live connection; the recurring gotchas:
 - Background commands must use `nohup bash -lc "..."` — without `-l`, conda's PATH isn't loaded and `python` is not found. Long ops (training, git fetch, aider) must be detached + polled, never awaited in one SSH call.
 - GitHub is rate-limited: set `GITHUB_MIRROR=https://gh-proxy.com/` (downloads) and `git remote set-url origin https://gh-proxy.com/https://github.com/...` (fetch).
 - Cache must point at the data disk: `DARWIN_ST_CACHE=/root/autodl-tmp/...` (system disk is only 30GB).
-- DeepSeek/HF: model is `deepseek-v4-pro` (or `-flash`); set `HF_ENDPOINT=https://hf-mirror.com` for model downloads. API keys live in a server file outside the repo, never committed.
+- DeepSeek/HF: model 默认 `deepseek-v4-flash` (新版已超 pro preview; 需要更强时可 env 切回 `-pro`); set `HF_ENDPOINT=https://hf-mirror.com` for model downloads. API keys live in a server file outside the repo, never committed.
 - Pipe-buffering hides progress: run entry scripts with `python -u`.
 
 ## Git

@@ -50,7 +50,7 @@ class OpenAICompatLLM:
         api_key_env: str = "DEEPSEEK_API_KEY",
         timeout: float = 120.0,
     ):
-        self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+        self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
         self.base_url = (base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")).rstrip("/")
         self._api_key = os.environ.get(api_key_env, "")
         if not self._api_key:

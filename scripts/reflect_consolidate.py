@@ -18,7 +18,7 @@ LLM 产 ADD/EDIT/UPVOTE/DOWNVOTE 操作 → 校验 → 落库 → Hermes 容量�
     REFLECT_EVERY      仅影响日志语义, force 模式必触发 (默认 20, 透传 ReflectionConfig)
     INSIGHTS_CAPACITY  insights 表容量上限 (默认 50)
     DEEPSEEK_API_KEY   必需 (OpenAICompatLLM 从 env 读, 同 run_creation_loop)
-    DEEPSEEK_MODEL     反思模型 (默认 deepseek-v4-pro, 可切 flash 省成本)
+    DEEPSEEK_MODEL     反思模型 (默认 deepseek-v4-flash, 新版已超 pro preview)
 
 退出码: 0 正常; 2 参数/环境缺失; 1 反思批次全部失败 (LLM/解析)。
 """
@@ -75,7 +75,7 @@ def main() -> int:
     print(f"=== 离线反思巩固 ===")
     print(f"db={args.memory_db}\n履历本={archive_path} (共 {n_records} 条, "
           f"游标从 0 起全量反思)")
-    print(f"模型={os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-pro')} "
+    print(f"模型={os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')} "
           f"容量={cfg.insights_capacity} 每批ADD上限={cfg.max_new_lessons}")
     print(f"反思前 insights: {len(mem.list_insights_by_confidence())} 条")
 

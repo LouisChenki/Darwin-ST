@@ -11,7 +11,7 @@
           STAGNATION(默认2, 调小快速触发创造) /
           CHECKPOINT_DIR(权重存档目录, 默认空=关闭) / CKPT_KEEP(存档保留个数, 默认20) /
           USE_PROXY(B3 粗筛开关, 默认1) / PROXY_DEVICE(proxy 短训设备, 默认 cuda:0) /
-          DEEPSEEK_MODEL(强模型, 默认 deepseek-v4-pro) /
+          DEEPSEEK_MODEL(主模型, 默认 deepseek-v4-flash (新版已超 pro preview)) /
           DEEPSEEK_FAST_MODEL(B5 双模型路由的便宜快模型, 默认 deepseek-v4-flash;
           置空 → 不单建 fast_llm, 全部假设走强模型) /
           REFLECT(反思巩固开关, 默认1) / REFLECT_EVERY(每 N 条新履历反思一批, 默认20) /
@@ -150,7 +150,7 @@ def main():
         print(f"[知识] 内存图机制数: {len(store.all_mechanisms())}")
 
     # --- 创造层 (真实 DeepSeek + Aider) ---
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")   # 默认 flash (新版已超 pro preview; 2026-08 用户拍板)
     llm = OpenAICompatLLM()
     # B5 双模型路由: 第 0 个假设用强模型 (质量锚点), 其余用便宜快模型 (成本);
     # fast 全败自动 escalation 回强模型。DEEPSEEK_FAST_MODEL 置空 → 全部强模型 (行为同 B5 前)。

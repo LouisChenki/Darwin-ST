@@ -72,7 +72,7 @@ def main():
     )
 
     # 3) 真实 DeepSeek 合成 (plan 用 LLM, 代码用 Aider 沙箱)
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
     aider_model = f"deepseek/{model}"
     print(f"\n[合成] 计划用 {model}, 代码用 Aider({aider_model}) 沙箱写入...")
     llm = OpenAICompatLLM()
