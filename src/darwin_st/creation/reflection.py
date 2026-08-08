@@ -58,7 +58,8 @@ class ReflectionConfig:
     prompt_top_n: int = 3             # 注入 prompt 的教训条数
     lesson_max_chars: int = 120       # 单条教训渲染上限
     prompt_max_chars: int = 500       # 经验块总长上限 (超再截尾)
-    max_tokens: int = 8192            # 反思 LLM 输出预算 (推理模型按 reasoning+输出总量给; 空响应自动加倍)
+    max_tokens: int = 16384           # 反思 LLM 输出预算 (推理模型按 reasoning+输出总量给; 空响应自动加倍
+                                      # 到 32768。实测 API 接受 65536(flash), 余额充足给足 —— 不再省 token)
     max_existing_insights: int = 15   # 反思输入展示的现有教训上限 (实测 36 条近似旧教训诱发推理模型
                                       # 24k reasoning 空转 (finish_reason=length, content 空), 故截断+从略注记)
 

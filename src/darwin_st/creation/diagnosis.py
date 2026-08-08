@@ -363,7 +363,7 @@ def _parse_diagnosis(text: str) -> BottleneckDiagnosis | None:
 
 def diagnose_bottleneck_llm(summary: DiagnosisSummary, history: list[dict],
                             round_idx: int, llm, temperature: float = 0.7,
-                            max_tokens: int = 8192,
+                            max_tokens: int = 16384,
                             insights: list[dict] | None = None) -> BottleneckDiagnosis | None:
     """LLM 瓶颈诊断: 摘要 + 历史 → 严格 JSON → BottleneckDiagnosis。
 
@@ -373,8 +373,9 @@ def diagnose_bottleneck_llm(summary: DiagnosisSummary, history: list[dict],
     **max_tokens 必须给足 (关键, 踩过坑)**: DeepSeek-v4 是推理模型, 内部 reasoning trace 先吃
     token, 之后才吐可见 JSON。可见 JSON 很短 (~200 token), 但 reasoning 可能很长且不定长。
     预算太小 → reasoning 把额度耗尽 → 可见内容为空 → 解析失败静默退回规则版 (诊断多样化失效)。
-    实测: max_tokens=10 必空; 1024 在 temperature>0 下概率性返回空; 故默认给 8192 留足 reasoning
-    余量。若仍空 (极长 reasoning), 重试一次加倍预算; 再不行才退规则版 (并打日志, 不再静默)。
+    实测: max_tokens=10 必空; 1024 在 temperature>0 下概率性返回空; 故默认给 16384 留足 reasoning
+    余量 (API 实测接受 65536(flash)/32768(pro), 账号余额充足)。若仍空 (极长 reasoning),
+    重试一次加倍预算; 再不行才退规则版 (并打日志, 不再静默)。
     """
     if llm is None:
         return None

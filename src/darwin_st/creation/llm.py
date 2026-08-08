@@ -20,7 +20,12 @@ __all__ = ["LLMClient", "MockLLM", "OpenAICompatLLM"]
 
 
 class LLMClient(Protocol):
-    def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 4096) -> str: ...
+    def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 16384) -> str: ...
+
+
+# 默认 max_tokens=16384: DeepSeek-v4 推理模型的 reasoning 先吃输出额度, 可见输出排在后面,
+# 实测 API 接受 65536(flash)/32768(pro), 余额充足 —— 默认给足, 别再让 reasoning 把可见输出挤没
+# (历史教训: 诊断 1024 空响应, 反思 4096/8192 finish_reason=length)。
 
 
 class MockLLM:
@@ -30,7 +35,7 @@ class MockLLM:
         self.responder = responder
         self.call_count = 0
 
-    def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 4096) -> str:
+    def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 16384) -> str:
         self.call_count += 1
         return self.responder(messages)
 
@@ -52,7 +57,7 @@ class OpenAICompatLLM:
             raise RuntimeError(f"环境变量 {api_key_env} 未设置 (key 不应硬编码)")
         self.timeout = timeout
 
-    def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 4096) -> str:
+    def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 16384) -> str:
         payload = json.dumps({
             "model": self.model, "messages": messages,
             "temperature": temperature, "max_tokens": max_tokens, "stream": False,
