@@ -13,7 +13,9 @@
           USE_PROXY(B3 粗筛开关, 默认1) / PROXY_DEVICE(proxy 短训设备, 默认 cuda:0) /
           DEEPSEEK_MODEL(强模型, 默认 deepseek-v4-pro) /
           DEEPSEEK_FAST_MODEL(B5 双模型路由的便宜快模型, 默认 deepseek-v4-flash;
-          置空 → 不单建 fast_llm, 全部假设走强模型)
+          置空 → 不单建 fast_llm, 全部假设走强模型) /
+          REFLECT(反思巩固开关, 默认1) / REFLECT_EVERY(每 N 条新履历反思一批, 默认20) /
+          INSIGHTS_CAPACITY(insights 表容量上限, 默认50)
 """
 
 from __future__ import annotations
@@ -205,6 +207,18 @@ def main():
                          config=ccfg,
                          llm=llm, archive=CreationArchive(archive_path),
                          proxy_fn=proxy_fn)
+
+    # 反思巩固 (Reflection Consolidation): 攒够 REFLECT_EVERY 条新履历触发一次 LLM 反思,
+    # 蒸馏条件式教训进 insights 表 (Hermes 容量 INSIGHTS_CAPACITY 上限), 并回注合成/诊断 prompt。
+    # 用强模型低温 (0.3) 反思; REFLECT=0 关闭 (行为同接入前, prompt 逐字节不变)。
+    if os.environ.get("REFLECT", "1") == "1":
+        from darwin_st.creation.creation_archive import CreationArchive as _CA  # 同一路径同一档案
+        from darwin_st.creation.reflection import ReflectionConfig, ReflectionLoop
+        rcfg = ReflectionConfig(reflect_every_records=_env_int("REFLECT_EVERY", 20),
+                                insights_capacity=_env_int("INSIGHTS_CAPACITY", 50))
+        cloop.reflection = ReflectionLoop(mem, _CA(archive_path), llm, rcfg)
+        print(f"[反思] 开: 每 {rcfg.reflect_every_records} 条新履历反思一批, "
+              f"insights 容量 {rcfg.insights_capacity}")
 
     # 权重存档 (默认关): CHECKPOINT_DIR 非空 → 训练中刷新纪录的模型权重落盘该目录,
     # 脚本结束时 prune_to_top_k 只留最优 CKPT_KEEP 个防撑盘。worker 进程直接写共享盘。

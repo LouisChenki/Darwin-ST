@@ -96,7 +96,8 @@ _SYS_CODE = """你是 PyTorch 算子实现专家。根据给定的融合计划, 
 
 
 def build_plan_prompt(req: FusionRequest, forced_composition: str | None = None,
-                      exemplars: dict | None = None) -> list[dict]:
+                      exemplars: dict | None = None,
+                      insights: list[dict] | None = None) -> list[dict]:
     ctx = req.to_prompt_context()
     import json
     user = "瓶颈与跨域机制集:\n" + json.dumps(ctx, ensure_ascii=False, indent=2)
@@ -106,10 +107,14 @@ def build_plan_prompt(req: FusionRequest, forced_composition: str | None = None,
     # B5 独立采样: 强制组合文法硬约束 (放末尾最靠近输出, 提升遵从); None 时与现状逐字节一致。
     if forced_composition is not None:
         user += f"\n\n【硬约束】本方案必须使用 composition={forced_composition} (不得选择其它组合文法)。"
+    # 反思经验注入 (Reflection Consolidation): 顺序 机制上下文 → exemplars → 硬约束 → 经验块;
+    # insights=None/空列表 → 不注入, prompt 与现状逐字节一致 (回归铁律)。
+    user += _format_insights(insights)
     return [{"role": "system", "content": _SYS_PLAN}, {"role": "user", "content": user}]
 
 
-def build_plan_many_prompt(req: FusionRequest, n: int, exemplars: dict | None = None) -> list[dict]:
+def build_plan_many_prompt(req: FusionRequest, n: int, exemplars: dict | None = None,
+                           insights: list[dict] | None = None) -> list[dict]:
     import json
     ctx = req.to_prompt_context()
     user = (f"请提出 {n} 个不同的融合方案。\n瓶颈与跨域机制集:\n"
@@ -118,7 +123,21 @@ def build_plan_many_prompt(req: FusionRequest, n: int, exemplars: dict | None = 
     # exemplars=None 时 prompt 与注入前逐字节一致 (回归保证)。
     if exemplars and (exemplars.get("successes") or exemplars.get("failures")):
         user += _format_exemplars(exemplars)
+    # 反思经验注入 (顺序: 机制上下文 → exemplars → 经验块); None/空 → 逐字节不变。
+    user += _format_insights(insights)
     return [{"role": "system", "content": _SYS_PLAN_MANY}, {"role": "user", "content": user}]
+
+
+def _format_insights(insights: list[dict] | None) -> str:
+    """反思经验块注入段 (creation/reflection.render_insights_block, 同一 render 同一格式)。
+
+    None/空列表 → 返回 "" (拼到 user 末尾等于不注入, 旧 prompt 逐字节不变)。
+    """
+    if not insights:
+        return ""
+    from darwin_st.creation.reflection import ReflectionConfig, render_insights_block
+    block = render_insights_block(insights, ReflectionConfig())
+    return ("\n\n" + block) if block else ""
 
 
 def _format_exemplars(exemplars: dict) -> str:
@@ -327,7 +346,8 @@ class OperatorSynthesizer:
     def synthesize(self, req: FusionRequest, needs_adj: bool = False,
                    temperature: float | None = None, *,
                    llm: LLMClient | None = None, forced_composition: str | None = None,
-                   exemplars: dict | None = None) -> SynthesisResult:
+                   exemplars: dict | None = None,
+                   insights: list[dict] | None = None) -> SynthesisResult:
         """单假设合成 (向后兼容): 生成一个计划, 合成一个算子。
 
         temperature=None → 用 cfg.temperature (行为不变); 显式给定则覆盖 (B4 温度自适应)。
@@ -335,12 +355,14 @@ class OperatorSynthesizer:
         forced_composition: B5 独立采样的强制组合文法; plan 实出 composition 不符 → 记失败
         (last_error 注明"未按指定组合文法"), 不进入代码阶段。None → 不强制 (行为不变)。
         exemplars: B1 履历回读注入 plan prompt; None 时 prompt 与现状逐字节一致。
+        insights: 反思经验注入 plan prompt; None/空 → 不注入 (逐字节一致)。
         """
         temp = self.cfg.temperature if temperature is None else temperature
         use_llm = llm if llm is not None else self.llm
         try:
             plan_text = use_llm.chat(
-                build_plan_prompt(req, forced_composition=forced_composition, exemplars=exemplars),
+                build_plan_prompt(req, forced_composition=forced_composition,
+                                  exemplars=exemplars, insights=insights),
                 temperature=temp)
             plan = self._plan_from_dict(extract_json(plan_text))
         except Exception as e:
@@ -353,7 +375,8 @@ class OperatorSynthesizer:
 
     def synthesize_independent(self, req: FusionRequest, n_hypotheses: int = 4,
                                needs_adj: bool = False, exemplars: dict | None = None,
-                               temperature: float | None = None) -> list[SynthesisResult]:
+                               temperature: float | None = None,
+                               insights: list[dict] | None = None) -> list[SynthesisResult]:
         """B5 假设独立采样 (FunSearch/AlphaEvolve 机制): N 次独立单假设合成, 返回去重后结果。
 
         与 synthesize_many (单次调用产 N) 互补, 治"一次生成同质化":
@@ -364,6 +387,7 @@ class OperatorSynthesizer:
             fast 假设重试全败后用强模型补试一次 (escalation); fast_llm=None 全部强模型。
         去重: operator_name 重名 或 (frozenset(source_mechanisms), composition) 与已接受结果
         重复 → 跳过该结果 (不计入返回); 无 plan 的计划阶段失败结果原样保留。
+        insights: 反思经验注入 plan prompt; None/空 → 不注入 (逐字节一致)。
         """
         base = self.cfg.temperature if temperature is None else temperature
         comps = sorted(COMPOSITION_OPS)
@@ -375,11 +399,13 @@ class OperatorSynthesizer:
             t_i = min(1.0, max(0.3, base + _INDEPENDENT_TEMP_LADDER[i % len(_INDEPENDENT_TEMP_LADDER)]))
             llm_i = self.llm if (i == 0 or self.fast_llm is None) else self.fast_llm
             res = self.synthesize(req, needs_adj=needs_adj, temperature=t_i, llm=llm_i,
-                                  forced_composition=forced, exemplars=exemplars)
+                                  forced_composition=forced, exemplars=exemplars,
+                                  insights=insights)
             if not res.success and llm_i is not self.llm:
                 # escalation: fast 全败 → 同槽位强模型补试一次 (同强制文法/同温度)
                 res = self.synthesize(req, needs_adj=needs_adj, temperature=t_i, llm=self.llm,
-                                      forced_composition=forced, exemplars=exemplars)
+                                      forced_composition=forced, exemplars=exemplars,
+                                      insights=insights)
             plan = res.plan
             if plan is not None:
                 sig = (frozenset(plan.source_mechanisms), plan.composition)
@@ -392,19 +418,22 @@ class OperatorSynthesizer:
 
     def synthesize_many(self, req: FusionRequest, n_hypotheses: int = 4,
                         needs_adj: bool = False, exemplars: dict | None = None,
-                        temperature: float | None = None) -> list[SynthesisResult]:
+                        temperature: float | None = None,
+                        insights: list[dict] | None = None) -> list[SynthesisResult]:
         """多假设合成: 一次生成 N 个融合方案, 各自合成+验证, 返回全部结果(含失败)。
 
         成功的算子由调用方全部注入 → 进化 + 真实 MAE 评测当裁判(不用 LLM 互评筛)。
         exemplars: B1 创造档案履历 (creation_archive.exemplar_context), 非空则注入 plan prompt
         (成功先例+失败教训, 治"每轮创造失忆重启"); None 时 prompt 与现状逐字节一致。
         temperature=None → 用 cfg.temperature (行为不变); 显式给定则覆盖 (B4 温度自适应)。
+        insights: 反思经验注入 plan prompt; None/空 → 不注入 (逐字节一致)。
         """
         temp = self.cfg.temperature if temperature is None else temperature
         # 1) 一次生成 N 个计划
         try:
-            text = self.llm.chat(build_plan_many_prompt(req, n_hypotheses, exemplars=exemplars),
-                                  temperature=temp)
+            text = self.llm.chat(
+                build_plan_many_prompt(req, n_hypotheses, exemplars=exemplars, insights=insights),
+                temperature=temp)
             plan_dicts = extract_json_array(text)
         except Exception as e:
             return [SynthesisResult(False, attempts=0,

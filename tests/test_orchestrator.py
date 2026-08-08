@@ -226,6 +226,94 @@ def test_archive_populated():
     assert orch.archive.best() is not None
 
 
+# ---------------------------------------------------------------------------
+# 谱系接线 (_parent_sig → parent_id → record_trial 自动补 lineage 边)
+# ---------------------------------------------------------------------------
+
+
+def test_record_memory_links_parent_child_lineage():
+    """父→子端到端: 子代带 _parent_sig → _record_memory 落 parent_id + lineage 一条边。"""
+    from darwin_st.search.genotype import STBlock, mutate
+    mem = MemoryStore(":memory:")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=1, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1, memory=mem)
+    parent = Genotype(blocks=[STBlock("gcn", "tcn")])
+    orch._digest(EvalResult(genotype=parent, status="OK", mae=20.0, rmse=30.0,
+                            device="cpu", hps={"lr": 1e-3}))
+    pid = mem.best_so_far("PeMS04")["id"]
+    child = mutate(parent, "change_hidden", new_hidden=128)
+    child._parent_sig = parent.signature()   # 提议路径 (evo.ask/_next_genotype) 挂的父代签名
+    orch._digest(EvalResult(genotype=child, status="OK", mae=19.0, rmse=28.0,
+                            device="cpu", hps={"lr": 1e-3}))
+    edges = mem.conn.execute("SELECT parent_id, child_id FROM lineage").fetchall()
+    assert len(edges) == 1 and edges[0]["parent_id"] == pid
+    crow = mem.conn.execute("SELECT id, parent_id FROM experiments WHERE id != ?", (pid,)).fetchone()
+    assert edges[0]["child_id"] == crow["id"] and crow["parent_id"] == pid
+    mem.close()
+
+
+def test_record_memory_without_parent_sig_no_edge():
+    """无 _parent_sig (bootstrap 种子/外部基线) → parent_id 落 NULL, 不补 lineage 边, 不崩。"""
+    from darwin_st.search.genotype import STBlock
+    mem = MemoryStore(":memory:")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=1, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1, memory=mem)
+    g = Genotype(blocks=[STBlock("gcn", "tcn")])
+    orch._digest(EvalResult(genotype=g, status="OK", mae=20.0, rmse=30.0,
+                            device="cpu", hps={"lr": 1e-3}))
+    row = mem.conn.execute("SELECT parent_id FROM experiments").fetchone()
+    assert row["parent_id"] is None
+    assert mem.conn.execute("SELECT COUNT(*) AS n FROM lineage").fetchone()["n"] == 0
+    mem.close()
+
+
+def test_record_memory_parent_sig_not_found_safe_null():
+    """_parent_sig 指向未落库的父代 (如外部种子) → 查不到安全落 NULL, 不补边不崩。"""
+    from darwin_st.search.genotype import STBlock, mutate
+    mem = MemoryStore(":memory:")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=1, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1, memory=mem)
+    g = mutate(Genotype(blocks=[STBlock("gcn", "tcn")]), "change_hidden", new_hidden=128)
+    g._parent_sig = Genotype(blocks=[STBlock("gat", "gru")]).signature()   # 未落库的"父代"
+    orch._digest(EvalResult(genotype=g, status="OK", mae=20.0, rmse=30.0,
+                            device="cpu", hps={"lr": 1e-3}))
+    row = mem.conn.execute("SELECT parent_id FROM experiments").fetchone()
+    assert row["parent_id"] is None
+    assert mem.conn.execute("SELECT COUNT(*) AS n FROM lineage").fetchone()["n"] == 0
+    mem.close()
+
+
+def test_next_genotype_archive_branch_attaches_parent_sig(monkeypatch):
+    """archive.select+变异 路径: 子代挂 _parent_sig = 被选精英的 genotype 签名。"""
+    from darwin_st.search.genotype import STBlock
+    monkeypatch.setenv("ARCHIVE_PARENT_P", "1.0")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=6, tournament_size=3)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    g = Genotype(blocks=[STBlock("gcn", "tcn")])
+    orch.archive.add(g, fitness=18.0, num_params=80_000)
+    child = orch._next_genotype()
+    assert getattr(child, "_parent_sig", None) == g.signature()
+
+
+def test_lineage_grows_during_run():
+    """端到端跑自治循环: bootstrap 后的变异子代落库自动连边 (lineage 从空表变真谱系)。"""
+    mem = MemoryStore(":memory:")
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=6, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(rng=random.Random(0)), devices=1, memory=mem)
+    state = orch.run()
+    n_edges = mem.conn.execute("SELECT COUNT(*) AS n FROM lineage").fetchone()["n"]
+    # bootstrap (4 个种子无父代) 之后的评估都应连边 (两条提议路径都挂 _parent_sig)
+    assert n_edges >= state.evals - cfg.population_size >= 1
+    ids = {r["id"] for r in mem.conn.execute("SELECT id FROM experiments").fetchall()}
+    rows = mem.conn.execute("SELECT parent_id, child_id FROM lineage").fetchall()
+    assert all(r["parent_id"] in ids and r["child_id"] in ids for r in rows)
+    mem.close()
+
+
 def test_search_explores_deep_architectures():
     """深度探索修复端到端: eval_fn 奖励 depth (mae=base-depth*1.0), 搜索应探到 depth>=3 架构,
     且 archive 填充 3-4 深度带 (证明浅层坍缩被破)。"""

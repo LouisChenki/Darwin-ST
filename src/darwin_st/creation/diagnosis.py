@@ -262,8 +262,13 @@ def _build_system() -> str:
     )
 
 
-def _build_user(summary: DiagnosisSummary, history: list[dict], round_idx: int) -> str:
-    """user: 分块小标题; 训练曲线只给三段+派生标签 (NL); 历史按 MAE 升序 (最优末尾)。"""
+def _build_user(summary: DiagnosisSummary, history: list[dict], round_idx: int,
+                insights: list[dict] | None = None) -> str:
+    """user: 分块小标题; 训练曲线只给三段+派生标签 (NL); 历史按 MAE 升序 (最优末尾)。
+
+    insights: 反思经验块 (creation/reflection.render_insights_block, 与合成 prompt 同一 render);
+    None/空 → 不注入, prompt 与现状逐字节一致 (回归铁律)。
+    """
     tl = summary.train_loss_segments
     vm = summary.val_mae_segments
     gap_line = (f"当前最优落后 SOTA 约 {summary.sota_gap:.2f} MAE。"
@@ -286,7 +291,7 @@ def _build_user(summary: DiagnosisSummary, history: list[dict], round_idx: int) 
         # B4 硬规则: 累计分 ≤ −1 的方向已被实测证伪, 禁令直写进 prompt (LLMatic curiosity)
         hist_block += "\n【硬规则】累计分 ≤ -1 的前提词组合已被实测证伪, 禁止再次提出。"
 
-    return (
+    user = (
         f"### 诊断轮次\n第 {round_idx + 1} 轮瓶颈诊断。\n\n"
         f"### 当前最优架构\n{summary.arch_summary}\n"
         f"空间算子: {summary.used_spatial}\n时序算子: {summary.used_temporal}\n\n"
@@ -304,6 +309,13 @@ def _build_user(summary: DiagnosisSummary, history: list[dict], round_idx: int) 
         f'{{"reasoning":"...","evidence":"...","diagnosis":"...",'
         f'"preconditions":["..."],"direction":"..."}}'
     )
+    # 反思经验注入: 追加在 user 末尾; 空 → 逐字节不变
+    if insights:
+        from darwin_st.creation.reflection import ReflectionConfig, render_insights_block
+        block = render_insights_block(insights, ReflectionConfig())
+        if block:
+            user += "\n\n" + block
+    return user
 
 
 def _parse_diagnosis(text: str) -> BottleneckDiagnosis | None:
@@ -351,10 +363,12 @@ def _parse_diagnosis(text: str) -> BottleneckDiagnosis | None:
 
 def diagnose_bottleneck_llm(summary: DiagnosisSummary, history: list[dict],
                             round_idx: int, llm, temperature: float = 0.7,
-                            max_tokens: int = 8192) -> BottleneckDiagnosis | None:
+                            max_tokens: int = 8192,
+                            insights: list[dict] | None = None) -> BottleneckDiagnosis | None:
     """LLM 瓶颈诊断: 摘要 + 历史 → 严格 JSON → BottleneckDiagnosis。
 
     返回 None 表示任何失败 (LLM 异常 / 坏 JSON / 全非法前提词) → 调用方退回规则版。
+    insights: 反思经验块注入 user 末尾 (render_insights_block); None/空 → prompt 逐字节不变。
 
     **max_tokens 必须给足 (关键, 踩过坑)**: DeepSeek-v4 是推理模型, 内部 reasoning trace 先吃
     token, 之后才吐可见 JSON。可见 JSON 很短 (~200 token), 但 reasoning 可能很长且不定长。
@@ -366,7 +380,7 @@ def diagnose_bottleneck_llm(summary: DiagnosisSummary, history: list[dict],
         return None
     messages = [
         {"role": "system", "content": _build_system()},
-        {"role": "user", "content": _build_user(summary, history, round_idx)},
+        {"role": "user", "content": _build_user(summary, history, round_idx, insights=insights)},
     ]
     for attempt, mt in enumerate((max_tokens, max_tokens * 2)):
         try:

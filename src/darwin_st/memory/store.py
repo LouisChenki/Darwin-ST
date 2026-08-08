@@ -235,6 +235,30 @@ class MemoryStore:
         ).fetchone()
         return row is not None
 
+    def latest_trial_id_by_genotype_sig(
+        self, geno_sig: str, statuses: tuple[str, ...] = ("KEEP", "CRASH")
+    ) -> int | None:
+        """按 genotype 级签名 (Genotype.signature() 口径, 不含 hp) 查最近一条给定状态的 trial id。
+
+        谱系接线用: 子代提议时只带父代 genotype 签名。注意本表 signature 列是
+        compute_signature(genotype, hp) (含 hp), 与 Genotype.signature() 口径不同
+        (父代 hp 评测后才知, 提议时不可复算), 故不能走 idx_exp_signature 直接等值查,
+        改为解析 genotype_json 后按同口径 (有序 JSON + sha1) 逐行比对。状态过滤后行数
+        有限 (每次评估才一行), 每次 record 扫一遍代价可忽略。查不到 (外部种子/未落库) 返回 None。
+        """
+        placeholders = ",".join("?" for _ in statuses)
+        rows = self.conn.execute(
+            f"SELECT id, genotype_json FROM experiments WHERE status IN ({placeholders}) "
+            "ORDER BY id DESC",
+            tuple(statuses),
+        ).fetchall()
+        for r in rows:
+            blob = json.dumps(json.loads(r["genotype_json"]), sort_keys=True,
+                              ensure_ascii=False, separators=(",", ":"))
+            if hashlib.sha1(blob.encode("utf-8")).hexdigest() == geno_sig:
+                return int(r["id"])
+        return None
+
     def nearest_experiments(
         self, behavior_descriptor: dict, dataset: str | None = None, k: int = 5,
         status: str | None = "KEEP",
@@ -336,6 +360,55 @@ class MemoryStore:
             d["evidence_ids"] = json.loads(d["evidence_ids"])
             out.append(d)
         return out
+
+    def list_insights_by_confidence(self, dataset: str | None = None,
+                                    limit: int | None = None) -> list[dict]:
+        """按 confidence 降序 (并列取新: id 大者先) 取洞察, 可限量。反思环节 prompt 注入用。"""
+        clauses, params = [], []
+        if dataset is not None:
+            clauses.append("(dataset=? OR dataset IS NULL)")
+            params.append(dataset)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT * FROM insights {where} ORDER BY confidence DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        out = []
+        for r in self.conn.execute(sql, params).fetchall():
+            d = dict(r)
+            d["evidence_ids"] = json.loads(d["evidence_ids"])
+            out.append(d)
+        return out
+
+    def update_insight(self, insight_id: int, text: str | None = None,
+                       condition: str | None = None, confidence: float | None = None,
+                       evidence_ids: list[int] | None = None) -> bool:
+        """按 id 局部更新一条洞察 (None 字段不动)。返回是否命中。反思环节维护用。"""
+        sets, params = [], []
+        if text is not None:
+            sets.append("insight_text=?")
+            params.append(text)
+        if condition is not None:
+            sets.append("condition=?")
+            params.append(condition)
+        if confidence is not None:
+            sets.append("confidence=?")
+            params.append(confidence)
+        if evidence_ids is not None:
+            sets.append("evidence_ids=?")
+            params.append(json.dumps(evidence_ids))
+        if not sets:
+            return False
+        params.append(insight_id)
+        cur = self.conn.execute(f"UPDATE insights SET {', '.join(sets)} WHERE id=?", params)
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def delete_insight(self, insight_id: int) -> bool:
+        """按 id 删除一条洞察。返回是否命中。反思环节 DOWNVOTE 跌破删除线/容量淘汰用。"""
+        cur = self.conn.execute("DELETE FROM insights WHERE id=?", (insight_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

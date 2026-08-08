@@ -2,12 +2,14 @@
 
 把跨域知识 + 算子合成 + 注入接成一个可被 orchestrator 在【停滞时】触发的步骤:
   停滞 → 诊断瓶颈 → 跨域检索互补机制集 → LLM 融合 + Aider 写算子 → 验证 →
-  注入算子库 → 产出一个用新算子的 genotype 交给进化评估 → 记录融合经验到 memory。
+  注入算子库 → 产出一个用新算子的 genotype 交给进化评估 → 创造履历记 B1 履历本。
 
 设计 (契合两层自治, 用户拍板的职责分离):
   - 创造是 Tier-2 低频(仅停滞触发), Tier-1 进化高频。
   - 合成算子进【算子库+archive】(给进化), 不进机制库(机制库静态只读)。
-  - 融合经验(work/不work) → memory insights, 不混进机制卡。
+  - 融合经验(work/不work) → B1 履历本(全量结构化记录, 下轮 prompt 回读), 不混进机制卡。
+    memory insights 表不再由本模块写流水账 (信息是履历本子集且无人读取, 双写已停),
+    今后只由反思环节写入 (_record_insight 保留给该环节, 见方法注释)。
   - 所有外部依赖(检索 store/embedder、synthesizer、registry、memory)注入 → 无 LLM/GPU 可 mock 全测。
 
 诚实: 真实 MAE 评测合成算子由 orchestrator 的既有 eval_fn 完成(本模块只负责"造+注入+
@@ -16,7 +18,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import random
 import re
 from dataclasses import dataclass, field
@@ -134,7 +138,8 @@ class CreationLoop:
     def __init__(self, store, embedder, synthesizer: OperatorSynthesizer,
                  registry: OperatorRegistry, memory=None, config: CreationConfig | None = None,
                  llm=None, archive=None, refiner: OperatorRefiner | None = None,
-                 proxy_fn=None, temperature: float = 0.8):
+                 proxy_fn=None, temperature: float = 0.8, state_path: str | None = None,
+                 reflection=None):
         self.store = store
         self.embedder = embedder
         self.synthesizer = synthesizer
@@ -143,6 +148,8 @@ class CreationLoop:
         self.cfg = config or CreationConfig()
         self.llm = llm                       # OpenAICompatLLM (注入); None 时 _diagnose 退规则版
         self.archive = archive               # CreationArchive (B1 履历本); None=不记录, 行为不变
+        # 反思巩固环节 (ReflectionLoop, 可选注入): None → 不反思也不注入经验, 行为与接入前一致
+        self.reflection = reflection
         # B3 proxy 粗筛: proxy_fn(genotype) -> float (短训 val MAE), 设备/数据绑定由外部注入;
         # None 或 cfg.use_proxy=False → 全部 seed 走大预算, 行为与 B3 之前完全一致
         self.proxy_fn = proxy_fn
@@ -163,9 +170,36 @@ class CreationLoop:
         self._history: list[dict] = []
         # B4 温度自适应 (LLMatic curiosity): 全灭升温探索 / 被 adopted 降温利用, clamp [0.5, 1.0]
         self._temperature = min(1.0, max(0.5, temperature))
+        # B4 方向状态持久化: _history + _temperature 落盘, 重启回放不归零。路径显式注入优先;
+        # 缺省与 B1 履历本同目录 (direction_state.json, 同生命周期, scope 隔离自然继承);
+        # 无履历本且不显式给路径 → 不持久化 (行为同改动前)。
+        if state_path is not None:
+            self._state_path = state_path
+        elif archive is not None:
+            self._state_path = os.path.join(os.path.dirname(os.path.abspath(archive.path)),
+                                            "direction_state.json")
+        else:
+            self._state_path = None
+        self._restore_direction_state()      # 文件存在则回放; 坏文件/不存在 → 空启动
+
+    def _prompt_insights(self, dataset: str) -> list[dict] | None:
+        """反思经验注入口 (合成与诊断对称): memory 非 None 且 insights 非空 → 取 top-N。
+
+        需接入 reflection (ReflectionLoop) 才生效 —— insights 表只由反思环节写入,
+        未接反思时表恒空, 返回 None → 下游 prompt 与现状逐字节一致 (回归铁律)。
+        读库异常 → None (经验注入是增益, 不中止创造闭环)。
+        """
+        if self.memory is None or self.reflection is None:
+            return None
+        try:
+            insights = self.memory.list_insights_by_confidence(
+                dataset, limit=self.reflection.cfg.prompt_top_n)
+        except Exception:
+            return None
+        return insights or None
 
     def _diagnose(self, best_genotype: Genotype | None, sota_gap: float | None,
-                  best_trace: dict | None) -> tuple[str, list[str] | None]:
+                  best_trace: dict | None, dataset: str = "PeMS04") -> tuple[str, list[str] | None]:
         """诊断瓶颈, 返回 (bottleneck 字符串, override_preconditions 或 None)。
 
         LLM 优先 (有 llm + 有 trace + 开关开): 训练信号 → 摘要 → LLM 诊断 → 受控前提词 (绕过关键词匹配)。
@@ -179,7 +213,8 @@ class CreationLoop:
                 )
 
                 summary = summarize_trace(best_trace, best_genotype, sota_gap)
-                diag = diagnose_bottleneck_llm(summary, self._history, self._round_idx, self.llm)
+                diag = diagnose_bottleneck_llm(summary, self._history, self._round_idx, self.llm,
+                                               insights=self._prompt_insights(dataset))
                 if diag is not None and diag.preconditions:
                     return diag.bottleneck, diag.preconditions
             except Exception:
@@ -195,8 +230,9 @@ class CreationLoop:
         (训练信号驱动多样化瓶颈诊断); 否则退回规则版 diagnose_bottleneck。见 creation/diagnosis.py。
         best_hps: 最优架构的最优超参。作为创造 seed 的 warm-start (继承父超参省冷启动)。
         """
-        # 1) 诊断瓶颈 (LLM 优先, 规则兜底)
-        bottleneck, override_precs = self._diagnose(best_genotype, sota_gap, best_trace)
+        # 1) 诊断瓶颈 (LLM 优先, 规则兜底; 反思经验注入诊断 prompt, 见 _prompt_insights)
+        bottleneck, override_precs = self._diagnose(best_genotype, sota_gap, best_trace,
+                                                    dataset=dataset)
         # OPRO 轨迹: 记本轮诊断方向 + 当前水位 (result_mae 用 best_trace 的 best_mae, 缺则用 gap 推)
         cur_mae = None
         if best_trace is not None and best_trace.get("best_mae") not in (None, float("inf")):
@@ -206,6 +242,7 @@ class CreationLoop:
                               "preconditions": override_precs or [], "result_mae": cur_mae,
                               "score": 0.0})   # B4 方向信用分初始 0 (结局回授累加)
         self._round_idx += 1
+        self._persist_direction_state()      # 轨迹 append 即落盘 (重启不归零)
 
         # 2) 跨域检索互补机制集 (override_precs 非空则直接用 LLM 给的前提词做 FAC 召回, 绕过关键词匹配)
         res = find_cross_domain_analogy(
@@ -228,16 +265,20 @@ class CreationLoop:
             ctx = self.archive.exemplar_context()
             if ctx["successes"] or ctx["failures"]:
                 exemplars = ctx
+        # 反思经验注入 (与诊断对称): memory 有反思产出的 insights → plan prompt 末尾经验块;
+        # 无 → None, prompt 与现状逐字节一致
+        insights = self._prompt_insights(dataset)
         # B5: 默认假设独立采样 (组合文法轮转 + 温度阶梯 + 双模型路由);
         # independent_sampling=False → 单次调用产 N 的旧路径 (行为同 B5 前)
         if self.cfg.independent_sampling:
             results = self.synthesizer.synthesize_independent(
                 req, n_hypotheses=self.cfg.n_hypotheses, needs_adj=False,
-                exemplars=exemplars, temperature=self._temperature)
+                exemplars=exemplars, temperature=self._temperature, insights=insights)
         else:
             results = self.synthesizer.synthesize_many(req, n_hypotheses=self.cfg.n_hypotheses,
                                                        needs_adj=False, exemplars=exemplars,
-                                                       temperature=self._temperature)
+                                                       temperature=self._temperature,
+                                                       insights=insights)
         successes = [r for r in results if r.success and r.operator is not None]
 
         # B1: 失败假设也进履历本 (失败教训是下一轮 prompt 的反例素材)
@@ -250,9 +291,9 @@ class CreationLoop:
             # B4: 全部假设挂门 (无 seed 产出, 结局立即可知) → 本轮方向记 −1 + 升温探索
             self.update_direction_outcome(round_idx, -1.0)
             self._temperature = min(1.0, self._temperature + 0.05)
+            self._persist_direction_state()  # 升温在 update_direction_outcome 落盘之后, 补落一次
             err = results[0].last_error if results else "无结果"
             insight = f"融合 {mech_names} 解决'{bottleneck}': {len(results)} 个假设均未过验证"
-            self._record_insight(insight, dataset, mech_names, success=False)
             return CreationOutcome(False, bottleneck=bottleneck, retrieved_mechanisms=mech_names,
                                    n_hypotheses=len(results), n_success=0,
                                    reason=err[:200], insight=insight)
@@ -278,7 +319,6 @@ class CreationLoop:
         compositions = [r.plan.composition for r in successes]
         insight = (f"融合 {mech_names} 解决'{bottleneck}': {len(results)} 假设中 "
                    f"{len(successes)} 个成功 → 注入 {op_names}(组合 {compositions}), 待评测")
-        self._record_insight(insight, dataset, mech_names, success=True)
 
         return CreationOutcome(
             True, operator_names=op_names, seed_genotypes=seeds,
@@ -305,6 +345,7 @@ class CreationLoop:
                 h["score"] = h.get("score", 0.0) + score_delta
                 if score_delta > 0:
                     self._temperature = max(0.5, self._temperature - 0.05)
+                self._persist_direction_state()   # 改分/调温即落盘 (重启不归零)
                 return
 
     # ------------------------------------------------------------------
@@ -350,7 +391,6 @@ class CreationLoop:
             self._record_refinement(family, mode, result, round_idx, mechanisms=mechanisms)
             err = (result.last_error or "精炼失败")[:200]
             insight = f"精炼 {family} ({mode}) 未过验证: {err}"
-            self._record_insight(insight, dataset, mechanisms, success=False)
             return CreationOutcome(False, bottleneck=f"refine:{family}", n_hypotheses=1,
                                    n_success=0, reason=err, insight=insight)
 
@@ -366,7 +406,6 @@ class CreationLoop:
                                 proxy_mae=proxy_maes[0], proxy_error=self._last_proxy_errors[0])
         insight = (f"精炼 {family} ({mode}): {parent_reg} → {reg_name}, 待评测 "
                    f"(族 best MAE={best.get('real_mae')})")
-        self._record_insight(insight, dataset, mechanisms, success=True)
         return CreationOutcome(True, operator_names=[reg_name], seed_genotypes=[seed],
                                bottleneck=f"refine:{family}", n_hypotheses=1, n_success=1,
                                reason="精炼并注入成功", insight=insight)
@@ -559,6 +598,12 @@ class CreationLoop:
             pass                     # 档案写失败不中止创造闭环
 
     def _record_insight(self, text: str, dataset: str, mechs: list[str], success: bool) -> None:
+        """写一条 memory insight。【当前无人调用 —— 保留给后续反思环节 (reflection) 使用】
+
+        流水账双写已停: 每轮创造的成败记录是 B1 履历本 (creation_archive, 含全量结构化
+        字段且被 prompt 回读) 的子集, insights 表又无人读取, 故 maybe_create/maybe_refine
+        不再调用本方法。insights 表今后只由反思环节写入 (经分析的洞察, 非轮次流水)。
+        """
         if self.memory is None:
             return
         from datetime import datetime, timezone
@@ -569,3 +614,49 @@ class CreationLoop:
             condition=f"fusion:{'+'.join(mechs)}",
             confidence=0.6 if success else 0.3,
         )
+
+    # ------------------------------------------------------------------
+    # B4 方向状态持久化 (OPRO 轨迹 + 温度, 重启回放不归零)
+    # ------------------------------------------------------------------
+
+    def _persist_direction_state(self) -> None:
+        """把完整 _history + _temperature 原子落盘 (同目录临时文件 + os.replace, 防半文件)。
+
+        时机: maybe_create 每轮 append 轨迹后 / update_direction_outcome 改分调温后
+        (含轮末升温补落)。与 B1 履历本同目录同生命周期 (scope 隔离自然继承, 不跨 scope 泄漏)。
+        落盘失败不中止创造闭环 (持久化是增益, 非必需)。
+        """
+        if self._state_path is None:
+            return
+        try:
+            payload = {"temperature": self._temperature, "history": self._history}
+            tmp = self._state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, self._state_path)
+        except Exception:
+            pass                     # 状态落盘失败不中止闭环
+
+    def _restore_direction_state(self) -> None:
+        """启动回放 direction_state.json (容错: 坏文件/缺字段 → 空启动, 不崩)。
+
+        回放 _history 与 _temperature (clamp [0.5, 1.0] 与构造一致); 轮次计数续到
+        轨迹最大 round + 1, 防重启后 _round_idx 归零与旧轮次撞号 (回授找不到会静默丢分)。
+        """
+        if self._state_path is None or not os.path.exists(self._state_path):
+            return
+        try:
+            with open(self._state_path, encoding="utf-8") as f:
+                data = json.load(f)
+            history = data.get("history")
+            if isinstance(history, list):
+                self._history = [h for h in history if isinstance(h, dict)]
+                rounds = [h["round"] for h in self._history if isinstance(h.get("round"), int)]
+                if rounds:
+                    self._round_idx = max(rounds) + 1
+            temp = data.get("temperature")
+            if isinstance(temp, (int, float)) and not isinstance(temp, bool) \
+                    and math.isfinite(temp):
+                self._temperature = min(1.0, max(0.5, float(temp)))
+        except Exception:
+            self._history = []       # 坏文件 = 空启动 (温度/轮次保持构造值)

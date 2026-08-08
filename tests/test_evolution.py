@@ -379,3 +379,20 @@ def test_reseed_enqueues_survivors():
     # 再 reseed 同样的 → 去重, 不重复入队
     added2 = evo.reseed(rng_geno)
     assert added2 == 0
+
+
+def test_ask_attaches_parent_sig_to_tournament_child():
+    """谱系接线: 锦标赛变异子代挂非字段属性 _parent_sig = 父代 genotype 签名。
+
+    bootstrap 种子无父代不挂; _parent_sig 不进 to_dict/signature (graveyard 查重口径不变)。
+    """
+    evo = AgingEvolution(population_size=3, tournament_size=2, seed=0)
+    seeds = [evo.ask() for _ in range(3)]
+    # bootstrap 派发的是种子 (无父代 / 父代是外部基线) → 不挂
+    assert all(getattr(s, "_parent_sig", None) is None for s in seeds)
+    for i, s in enumerate(seeds):
+        evo.tell(s, fitness=20.0 - i)
+    child = evo.ask()   # 锦标赛选父 → 变异 → 挂父代签名
+    parent_sigs = {m.genotype.signature() for m in evo.population}
+    assert getattr(child, "_parent_sig", None) in parent_sigs
+    assert "_parent_sig" not in str(child.to_dict())

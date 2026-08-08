@@ -350,6 +350,10 @@ class AgingEvolution:
         for _ in range(100):  # 重采上限, 防止极端情况死循环
             parent = self._tournament()
             child = random_mutation(parent.genotype, self.rng, builtin_weight=self._builtin_weight)
+            # 谱系: 挂非字段属性 _parent_sig (父代 genotype 签名), orchestrator 落库时据此
+            # 查父 trial id 补 lineage 边。与 _seed_meta 同模式: 不进 to_dict/signature,
+            # 随 pickle 跨进程往返, copy() 不携带 (下次变异产出的副本需重新挂, 无父代泄漏)。
+            child._parent_sig = parent.genotype.signature()
             sig = child.signature()
             if sig in self._pending:
                 continue  # 正在评估中, 换一个
@@ -363,6 +367,7 @@ class AgingEvolution:
         # 兜底: 实在采不出新的, 返回一个父代的强制变异 (允许重复)
         parent = self._tournament()
         child = random_mutation(parent.genotype, self.rng, builtin_weight=self._builtin_weight)
+        child._parent_sig = parent.genotype.signature()   # 谱系: 同上 (非字段属性, copy 不携带)
         self._pending[child.signature()] = child
         return child
 

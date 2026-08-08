@@ -213,6 +213,26 @@ def test_lineage_explicit_with_mutation(store):
     assert children[0]["mutation_op"] == "depth"
 
 
+def test_latest_trial_id_by_genotype_sig(store):
+    """谱系查询: 按 genotype 级签名 (Genotype.signature() 口径, 不含 hp) 取最近 KEEP/CRASH。
+
+    落库签名含 hp (compute_signature(genotype, hp)), 本查询只认 genotype 内容:
+    同 genotype 不同 hp 多条 → 取最近; DISCARD/PRUNED 不算; 未见过 → None。
+    """
+    from darwin_st.search.genotype import Genotype, STBlock
+    g = Genotype(blocks=[STBlock("gcn", "tcn")], hidden=64)
+    store.record_trial(_trial(val_mae=20.0, genotype=g.to_dict(), hp={"lr": 1e-3}))
+    pid2 = store.record_trial(_trial(val_mae=19.0, genotype=g.to_dict(), hp={"lr": 1e-2}))
+    assert store.latest_trial_id_by_genotype_sig(g.signature()) == pid2     # 取最近一条
+    g2 = Genotype(blocks=[STBlock("gat", "gru")], hidden=128)
+    cid = store.record_trial(_trial(status="CRASH", val_mae=None, genotype=g2.to_dict()))
+    assert store.latest_trial_id_by_genotype_sig(g2.signature()) == cid     # CRASH 算
+    g3 = Genotype(blocks=[STBlock("diffusion", "attn")], hidden=192)
+    store.record_trial(_trial(status="DISCARD", genotype=g3.to_dict()))
+    assert store.latest_trial_id_by_genotype_sig(g3.signature()) is None    # DISCARD 不算
+    assert store.latest_trial_id_by_genotype_sig("0" * 40) is None          # 未见过 → None
+
+
 def test_get_stats(store):
     store.record_trial(_trial(status="KEEP", val_mae=20.0))
     store.record_trial(_trial(status="DISCARD", genotype={"depth": 3}))

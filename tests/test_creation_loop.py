@@ -2,12 +2,14 @@
 
 核心契约:
   - diagnose_bottleneck: 从最优架构诊断瓶颈
-  - maybe_create: 诊断→跨域检索→合成→注入→产出待评 genotype→记 insight
-  - 合成失败 → 记失败 insight, 不崩
+  - maybe_create: 诊断→跨域检索→合成→注入→产出待评 genotype (insight 文本随 outcome 返回)
+  - 合成失败 → 优雅返回不崩 (失败教训进 B1 履历本; 不再双写 memory insights 表)
   - 注入的算子能被产出的 genotype 引用 + builder 编译
 """
 
 from __future__ import annotations
+
+import json
 
 import pytest
 import torch
@@ -15,6 +17,7 @@ import torch
 from darwin_st.creation import (
     CreationConfig,
     CreationLoop,
+    CreationArchive,
     MockLLM,
     OperatorRegistry,
     OperatorSynthesizer,
@@ -239,28 +242,28 @@ def test_maybe_create_seed_genotype_compiles(store):
     assert out.shape == (2, 12, 5)
 
 
-def test_maybe_create_records_insight(store):
-    """成功创造写 insight 到 memory(融合经验, 不进机制库)。"""
+def test_maybe_create_no_longer_writes_insight(store):
+    """双写停止: 成功创造【不再】写 memory insights 表 (流水账是 B1 履历本子集且无人读取;
+    insights 表今后只由反思环节写入)。insight 文本仍随 outcome 返回 (供调用方/日志)。"""
     mem = MemoryStore(":memory:")
     loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE], memory=mem)
-    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0, dataset="PeMS04")
-    insights = mem.get_insights("PeMS04")
-    assert len(insights) >= 1
-    assert "融合" in insights[0]["insight_text"]
+    outcome = loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0,
+                                dataset="PeMS04")
+    assert outcome.success and "融合" in outcome.insight   # 文本仍随 outcome 返回
+    assert mem.get_insights("PeMS04") == []                # 但不再落 insights 表
     mem.close()
 
 
 def test_maybe_create_synth_failure_records_and_no_crash(store):
-    """合成失败 → 记失败 insight, 优雅返回(不崩, 不中止优化)。"""
+    """合成失败 → 优雅返回(不崩, 不中止优化); 失败教训进 B1 履历本, 同样不写 insights 表。"""
     mem = MemoryStore(":memory:")
     # 计划 OK 但代码一直坏(丢节点维)
     bad_code = '```python\nimport torch.nn as nn\nclass FusedCreationOp(nn.Module):\n    def __init__(self,channels,num_nodes,**kw):\n        super().__init__(); self.l=nn.Linear(channels,channels)\n    def forward(self,x,adj=None): return self.l(x).mean(dim=2)\n```'
     loop = _loop(store, [_GOOD_PLAN_ARRAY, bad_code, bad_code], memory=mem)
     outcome = loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
     assert not outcome.success
-    assert outcome.insight  # 记了失败经验
-    insights = mem.get_insights("PeMS04")
-    assert any("未过验证" in i["insight_text"] for i in insights)
+    assert outcome.insight  # 失败经验文本仍随 outcome 返回
+    assert mem.get_insights("PeMS04") == []   # 停双写: 失败流水账也不落 insights 表
     mem.close()
 
 
@@ -374,6 +377,88 @@ def test_maybe_create_passes_adaptive_temperature_to_synthesizer(store):
                         config=CreationConfig(independent_sampling=False))
     loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
     assert temps and all(t == pytest.approx(0.66) for t in temps)
+
+
+# ---------------------------------------------------------------------------
+# B4 方向状态持久化 (direction_state.json: OPRO 轨迹 + 温度, 重启回放不归零)
+# ---------------------------------------------------------------------------
+
+
+def _arch_loop(store, llm_responses, archive, **kw):
+    """带 B1 履历本的 loop (state_path 缺省 → 派生为履历本同目录 direction_state.json)。"""
+    resp = iter(llm_responses)
+    llm = MockLLM(lambda msgs: next(resp))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2))
+    return CreationLoop(store, store.embedder, synth, OperatorRegistry(),
+                        config=CreationConfig(independent_sampling=False),
+                        archive=archive, **kw)
+
+
+def test_direction_state_roundtrip_restart(store, tmp_path):
+    """写读往返: 轨迹+温度落盘, 重启 (新建 loop 同 archive) 全保真回放, 轮次计数续上。"""
+    arch = CreationArchive(str(tmp_path / "creation_archive.jsonl"))
+    loop = _arch_loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE], arch)
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0,
+                      best_trace=_trace_dict())
+    loop.update_direction_outcome(0, 1.0)          # adopted: score +1, 温度 0.8→0.75
+    assert (tmp_path / "direction_state.json").exists()
+    # 重启: 同 archive → 同目录 direction_state.json 自动回放
+    loop2 = _arch_loop(store, [], arch)
+    assert loop2._history == loop._history         # score/result_mae/preconditions 全保真
+    assert loop2._temperature == pytest.approx(0.75)
+    assert loop2._round_idx == 1                   # 轮次续上不归零 (防与旧轮次撞号)
+
+
+def test_direction_state_persisted_on_append_and_update(store, tmp_path):
+    """落盘时机: maybe_create append 轨迹后即落盘; update_direction_outcome 改分调温后再落。"""
+    arch = CreationArchive(str(tmp_path / "a.jsonl"))
+    loop = _arch_loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE], arch)
+    state_file = tmp_path / "direction_state.json"
+    assert not state_file.exists()                 # 构造只回放, 不落盘
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert len(data["history"]) == 1 and data["history"][0]["score"] == 0.0
+    assert data["temperature"] == pytest.approx(0.8)
+    loop.update_direction_outcome(0, 1.0)
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert data["history"][0]["score"] == pytest.approx(1.0)
+    assert data["temperature"] == pytest.approx(0.75)
+
+
+def test_direction_state_bad_file_tolerated(store, tmp_path):
+    """坏文件容错: direction_state.json 内容损坏 → 空启动 (不崩)。"""
+    arch = CreationArchive(str(tmp_path / "a.jsonl"))
+    (tmp_path / "direction_state.json").write_text("{not json!!", encoding="utf-8")
+    loop = _arch_loop(store, [], arch)
+    assert loop._history == [] and loop._round_idx == 0
+    assert loop._temperature == pytest.approx(0.8)
+
+
+def test_direction_state_missing_file_empty_start(store, tmp_path):
+    """文件不存在 → 空启动, 且构造不创建文件 (首次 append 才落盘)。"""
+    arch = CreationArchive(str(tmp_path / "a.jsonl"))
+    loop = _arch_loop(store, [], arch)
+    assert loop._history == []
+    assert not (tmp_path / "direction_state.json").exists()
+
+
+def test_direction_state_explicit_path_without_archive(store, tmp_path):
+    """state_path 显式注入: 无 archive 也持久化到指定路径。"""
+    p = tmp_path / "custom_state.json"
+    loop = _arch_loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE], archive=None, state_path=str(p))
+    assert loop._state_path == str(p)
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert len(data["history"]) == 1
+
+
+def test_direction_state_disabled_without_archive(store):
+    """无 archive 且未显式给 state_path → 不持久化 (_state_path=None), 落盘调用静默 no-op。"""
+    loop = _loop(store, [_GOOD_PLAN_ARRAY, _GOOD_CODE])
+    assert loop._state_path is None
+    loop._persist_direction_state()                # no-op, 不崩
+    loop.maybe_create(Genotype(blocks=[STBlock("gcn", "tcn")]), sota_gap=3.0)
+    assert loop._state_path is None
 
 
 # ---------------------------------------------------------------------------

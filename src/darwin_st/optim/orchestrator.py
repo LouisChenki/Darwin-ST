@@ -323,6 +323,7 @@ class Orchestrator:
                 from darwin_st.search.evolution import random_mutation
                 g = random_mutation(elite.genotype, self.evo.rng,
                                     builtin_weight=self.evo._builtin_weight)
+                g._parent_sig = elite.genotype.signature()   # 谱系: 父代=被选精英 (同 evo.ask 口径)
         if g is None:
             g = self.evo.ask()
         # 自适应 HPO trials: 只盖进化 genotype (无 _seed_meta), 按实时 gap 定调参预算。
@@ -357,6 +358,15 @@ class Orchestrator:
                 # (否则 island_reset 只重置停滞计数, 对实际选择是 no-op)。
                 if cleared:
                     self.evo.reseed([e.genotype for e in self.archive.elites()])
+        # 反思巩固 (Reflection Consolidation): 创造检查同级, 攒够新履历才真反思 (低频)。
+        # 异常吞掉不中止进化 (反思是低频增益, 非必需; 自定义 loop 可无 reflection 属性)。
+        if self.creation_loop is not None:
+            try:
+                reflection = getattr(self.creation_loop, "reflection", None)
+                if reflection is not None:
+                    reflection.maybe_reflect()
+            except Exception:
+                pass
         if self.on_round is not None:
             self.on_round(self.state)
 
@@ -456,6 +466,16 @@ class Orchestrator:
         # 此前恒 {} → memory.nearest_experiments 检索无料。CRASH 也记 (失败架构的 BD 也是经验)。
         bd = behavior_descriptor(res.genotype, num_params)
         val_mape = res.extra.get("val_mape", float("inf"))
+        # 谱系接线: 子代提议时挂的父代 genotype 签名 (_parent_sig, 见 _next_genotype/evo.ask)
+        # → 查父代最近 KEEP/CRASH trial id 作 parent_id, record_trial 自动补 lineage 边。
+        # 查不到 (父代是外部种子/未落库) 安全落 NULL; 查询异常不中止落库 (谱系是增益非必需)。
+        parent_id = None
+        parent_sig = getattr(res.genotype, "_parent_sig", None)
+        if parent_sig:
+            try:
+                parent_id = self.memory.latest_trial_id_by_genotype_sig(parent_sig)
+            except Exception:
+                parent_id = None
         trial = Trial(
             run_tag=self.cfg.run_tag, dataset=self.cfg.dataset,
             space_version=self.scope.space_version,
@@ -468,6 +488,7 @@ class Orchestrator:
             behavior_descriptor=bd,
             num_params=num_params or None,
             wall_seconds=res.wall_seconds or None,
+            parent_id=parent_id,
         )
         return self.memory.record_trial(trial)
 

@@ -56,7 +56,11 @@ src/darwin_st/
               B2: operator lineages — register_variant/update_real_mae/best_in_family),
               refiner.py (B2 micro-evolution: refine mode small/param/struct + FunSearch best-shot),
               creation_loop.py (diagnose bottleneck → retrieve → synthesize_many → inject →
-              seed genotypes for evolution; B2: maybe_refine reuses good operator families first).
+              seed genotypes for evolution; B2: maybe_refine reuses good operator families first),
+              reflection.py (Reflection Consolidation: every N new archive records, LLM distills
+              conditional lessons into memory insights via ADD/EDIT/UPVOTE/DOWNVOTE ops with
+              Hermes capacity cap; top-confidence lessons re-injected into plan/diagnosis prompts —
+              empty insights ⇒ prompts byte-identical to before).
 ```
 
 **The full creation closed loop** (validated on server, see SERVER_VALIDATION.md §P2.5-g): orchestrator stagnates → `CreationLoop.maybe_create` diagnoses a bottleneck → `find_cross_domain_analogy` returns a *complementary set* of cross-domain mechanisms → `synthesize_many` generates N fusion hypotheses, Aider writes each in a sandbox, the validation harness gates them → surviving operators are injected into `SPATIAL_OPS` and seed genotypes enter evolution → **real masked-MAE training is the final arbiter** (most fusions die, good ones survive). Synthesized operators register as `synth_`-prefixed spatial ops.
@@ -85,4 +89,4 @@ Work happens on `feat/p0-evaluation-foundation` (not the default `prediction` br
 
 ## Entry-point scripts (`scripts/`)
 
-`run_autoresearch.py` (P2 optimization only), `run_creation_loop.py` (full Tier-2 creation loop), `synthesize_operator.py` (single cross-domain synthesis), `build_knowledge_graph.py` (ingest seeds → Neo4j + retrieval check), `baseline_smoke.py` (one-genotype training smoke test). All are env-var configured.
+`run_autoresearch.py` (P2 optimization only), `run_creation_loop.py` (full Tier-2 creation loop), `synthesize_operator.py` (single cross-domain synthesis), `reflect_consolidate.py` (offline reflection bootstrap: historical archive → insights), `build_knowledge_graph.py` (ingest seeds → Neo4j + retrieval check), `baseline_smoke.py` (one-genotype training smoke test). All are env-var configured.

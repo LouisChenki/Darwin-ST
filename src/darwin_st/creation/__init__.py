@@ -29,6 +29,15 @@ from darwin_st.creation.creation_loop import (
     diagnose_bottleneck,
 )
 from darwin_st.creation.creation_archive import CreationArchive, CreationRecord
+from darwin_st.creation.reflection import (
+    ReflectionConfig,
+    ReflectionLoop,
+    build_reflection_prompt,
+    parse_reflection_ops,
+    validate_ops,
+    apply_ops,
+    render_insights_block,
+)
 from darwin_st.creation.synthesizer import (
     SynthesisConfig,
     SynthesisResult,
@@ -66,6 +75,13 @@ __all__ = [
     "diagnose_bottleneck",
     "CreationArchive",
     "CreationRecord",
+    "ReflectionConfig",
+    "ReflectionLoop",
+    "build_reflection_prompt",
+    "parse_reflection_ops",
+    "validate_ops",
+    "apply_ops",
+    "render_insights_block",
     "SynthesisConfig",
     "SynthesisResult",
     "OperatorSynthesizer",
