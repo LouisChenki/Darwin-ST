@@ -10,6 +10,11 @@
 防 reward hacking: LLM 只写算子体, 看不到测试/评测; 沙箱 exec 受限命名空间;
 验证 harness 是执行接地的硬门; 真实 masked-MAE 才是最终裁判。
 
+B7 扩展 —— 辅助任务合成 (synthesize_aux_task): 同一套 plan-then-code 哲学, 创造对象从
+"架构算子"换成"自监督辅助损失模块" (STD-MAE 路线; 契约见 contracts.AuxTaskPlan/AuxTaskOperator,
+防泄漏硬门见 validation.validate_aux_operator)。plan 是 AuxTaskPlan 设计表 (掩码模式/重建目标/
+损失/解码器), code 是 aux_loss(h, x) 模块 —— 签名无 y, 从接口上杜绝看答案。
+
 LLM 可插拔(MockLLM 本地测 / OpenAICompatLLM DeepSeek 服务器跑)。
 """
 
@@ -21,12 +26,14 @@ from dataclasses import dataclass, field
 
 import torch.nn as nn
 
-from darwin_st.creation.contracts import COMPOSITION_OPS, FusionPlan, FusionRequest, SynthesizedOperator
+from darwin_st.creation.contracts import (COMPOSITION_OPS, AuxTaskOperator, AuxTaskPlan,
+                                          FusionPlan, FusionRequest, SynthesizedOperator)
 from darwin_st.creation.llm import LLMClient
-from darwin_st.creation.validation import ValidationConfig, validate_operator
+from darwin_st.creation.validation import ValidationConfig, validate_aux_operator, validate_operator
 
-__all__ = ["SynthesisConfig", "SynthesisResult", "OperatorSynthesizer",
+__all__ = ["SynthesisConfig", "SynthesisResult", "AuxSynthesisResult", "OperatorSynthesizer",
            "build_plan_prompt", "build_plan_many_prompt", "build_code_prompt",
+           "build_aux_plan_prompt", "build_aux_code_prompt",
            "extract_code", "extract_json", "extract_json_array", "exec_operator_code"]
 
 
@@ -44,6 +51,17 @@ class SynthesisResult:
     attempts: int = 0
     last_error: str = ""
     plan: FusionPlan | None = None
+
+
+@dataclass
+class AuxSynthesisResult:
+    """B7 辅助任务合成结果 (与 SynthesisResult 同构, operator 为 AuxTaskOperator)。"""
+
+    success: bool
+    operator: AuxTaskOperator | None = None
+    attempts: int = 0
+    last_error: str = ""
+    plan: AuxTaskPlan | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +109,47 @@ _SYS_CODE = """你是 PyTorch 算子实现专家。根据给定的融合计划, 
 - 参数量适中(不要造百万级巨型层)。
 - 优先用 additive_residual: 内部留一个 nn.Parameter(torch.zeros(1)) 作为残差缩放 α,
   输出 = 主路径 + α*新分支, 这样初始安全。
+
+只输出一段 Python 代码(用 ```python ``` 包裹), 包含必要的 import(torch, torch.nn as nn)和这一个类。不要其它解释。"""
+
+
+# B7 辅助任务 plan prompt: AuxTaskPlan 设计表 schema + 文献调研的设计硬约束 (写进 prompt 接地)
+_SYS_AUX_PLAN = """你是时空预测模型的自监督辅助任务设计专家。给定一个性能瓶颈和一组来自【不同领域】的机制,
+你的任务是设计一个【辅助训练任务】(自监督辅助损失) 来塑造主干表征、解决瓶颈。
+辅助任务与主任务联合训练 (总损失 = 主损失 + λ·辅助损失), 只通过梯度塑造表征, 不改变架构。
+
+关键原则:
+- 按每个机制【为何有效(causal_behavior)】来设计, 不是表面堆叠。
+- 掩码率默认 0.25 (STD-MAE 实证最优), 无强理由不要偏离; 合法区间 [0.05, 0.5], 超界被拒。
+- 时空解耦的掩码优于时空混合: 优先 sensor (空间维整节点掩码) 或 temporal_patch (时间维整段掩码),
+  random 仅在确有理由时用; 非掩码类辅助任务 (如对比/正则) 用 mask_pattern=none (此时 mask_ratio 忽略)。
+- 解码器要轻: 优先 linear, 其次 mlp; light_transformer 仅在确有理由时用 (参数预算有限)。
+- 防泄漏是硬约束: 模块签名是 aux_loss(h, x), 【没有 y】—— 只能看主干隐藏表征 h 和原始输入 x,
+  禁止以任何形式利用标签/未来信息 (源码静态扫描 + 时间打乱对抗门双重把关)。
+
+只输出一个 JSON(不要其它文字), 字段:
+{"task_name": "合法python标识符(建议 aux_ 前缀)", "rationale": "为何这个辅助任务能解瓶颈(因果论证)",
+ "mask_pattern": "sensor/temporal_patch/random/none 四选一", "mask_ratio": 0.25,
+ "recon_target": "raw_input/hidden 二选一", "loss_form": "masked_mae/mse/huber 三选一",
+ "decoder_form": "linear/mlp/light_transformer 三选一",
+ "source_mechanisms": ["机制名..."], "expected_effect": "预期解决什么"}"""
+
+_SYS_AUX_CODE = """你是 PyTorch 辅助任务模块实现专家。根据给定的辅助任务设计表, 实现一个 nn.Module 模块。
+
+【硬性契约 - 必须遵守】:
+- 类名 = 设计表里的 task_name。
+- __init__(self, channels, num_nodes, seq_in=12, seq_out=12, **kw): channels=主干隐藏维C,
+  num_nodes=节点数N; 除 channels/num_nodes 外所有参数必须有默认值 (验证只传这两个)。
+- aux_loss(self, h, x) -> 标量损失张量:
+    h: [B, T, N, C] 主干隐藏表征 (带梯度, 辅助任务必须通过它塑造表征);
+    x: [B, T_in, N, C_in] 原始输入 (归一化尺度)。
+  【签名里没有 y】—— 从接口上杜绝看答案。禁止以任何形式引用标签/未来信息: 源码出现
+  y/label/target/future 等标识符 (含注释与变量名) 会被静态扫描门直接拒绝。
+- 必须可微: 不要用 detach/.item()/round/argmax/原地操作; h 必须收到梯度 (内部 detach h 会被拒)。
+- 损失不能恒零/恒常数 (平凡任务骗正则项会被拒); 前向不能出 nan/inf。
+- 不要任何 IO/网络调用 (open/torch.load/requests 等会被拒)。
+- 解码器要轻 (linear/mlp 优先), 参数量适中, 不要造巨型层。
+- 掩码在 aux_loss 内部按 mask_ratio 用 torch.rand_like 生成 (可微路径不要经过掩码索引的梯度阻断)。
 
 只输出一段 Python 代码(用 ```python ``` 包裹), 包含必要的 import(torch, torch.nn as nn)和这一个类。不要其它解释。"""
 
@@ -197,6 +256,46 @@ def build_code_prompt(req: FusionRequest, plan: FusionPlan, prev_error: str = ""
     if prev_error:
         parts.append(f"\n⚠️ 上一版代码验证失败, 错误如下, 请修正:\n{prev_error[:1200]}")
     return [{"role": "system", "content": _SYS_CODE}, {"role": "user", "content": "\n".join(parts)}]
+
+
+def build_aux_plan_prompt(req: FusionRequest, exemplars: dict | None = None,
+                          insights: list[dict] | None = None) -> list[dict]:
+    """B7 辅助任务 plan prompt: AuxTaskPlan 设计表 schema + 设计硬约束 (掩码率/时空解耦/轻解码器/防泄漏)。
+
+    exemplars/insights 注入方式与 build_plan_prompt 一致 (同一 _format_exemplars/_format_insights):
+    None/空 → 不注入, prompt 无履历/经验段 (回归铁律同算子通道)。
+    """
+    ctx = req.to_prompt_context()
+    import json
+    user = "瓶颈与跨域机制集:\n" + json.dumps(ctx, ensure_ascii=False, indent=2)
+    # B1 履历回读 (同 build_plan_prompt): exemplars=None 时不注入 (回归保证)。
+    if exemplars and (exemplars.get("successes") or exemplars.get("failures")):
+        user += _format_exemplars(exemplars)
+    # 反思经验注入 (顺序: 机制上下文 → exemplars → 经验块); None/空 → 不注入。
+    user += _format_insights(insights)
+    return [{"role": "system", "content": _SYS_AUX_PLAN}, {"role": "user", "content": user}]
+
+
+def build_aux_code_prompt(req: FusionRequest, plan: AuxTaskPlan, prev_error: str = "") -> list[dict]:
+    """B7 辅助任务 code prompt: aux_loss(h,x) 硬契约 + 设计表摘要 + 机制 math_structure + 上轮错误反馈。
+
+    结构仿 build_code_prompt; prev_error 非空时附上轮验证失败原因 (bounded 重试的纠错信号)。
+    """
+    import json
+    parts = [
+        "辅助任务设计表:\n" + json.dumps({
+            "task_name": plan.task_name, "mask_pattern": plan.mask_pattern,
+            "mask_ratio": plan.mask_ratio, "recon_target": plan.recon_target,
+            "loss_form": plan.loss_form, "decoder_form": plan.decoder_form,
+            "rationale": plan.rationale, "source_mechanisms": plan.source_mechanisms,
+        }, ensure_ascii=False, indent=2),
+        "\n相关机制的数学结构(实现灵感):",
+        json.dumps([{"name": m.name, "math_structure": m.math_structure} for m in req.mechanisms],
+                   ensure_ascii=False, indent=2),
+    ]
+    if prev_error:
+        parts.append(f"\n⚠️ 上一版代码验证失败, 错误如下, 请修正:\n{prev_error[:1200]}")
+    return [{"role": "system", "content": _SYS_AUX_CODE}, {"role": "user", "content": "\n".join(parts)}]
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +441,102 @@ class OperatorSynthesizer:
         return SynthesisResult(False, attempts=self.cfg.max_retries,
                                last_error=f"重试 {self.cfg.max_retries} 次仍未过验证: {prev_error}",
                                plan=plan)
+
+    # ------------------------------------------------------------------
+    # B7: 辅助任务合成 (plan-then-code 同哲学, 创造对象 = 自监督辅助损失模块)
+    # ------------------------------------------------------------------
+
+    def _build_aux_aider_instruction(self, req: FusionRequest, plan: AuxTaskPlan,
+                                     prev_error: str) -> str:
+        """给 aider 的自然语言指令 (辅助任务版: aux_loss(h,x) 契约 + 设计表 + 上轮错误)。"""
+        import json
+        maths = json.dumps([{"name": m.name, "math": m.math_structure} for m in req.mechanisms],
+                           ensure_ascii=False)
+        instr = (
+            f"在该文件写一个 PyTorch nn.Module 辅助任务模块, 类名必须是 {plan.task_name}。\n"
+            f"契约(必须遵守): __init__(self, channels, num_nodes, seq_in=12, seq_out=12, **kw) "
+            f"(除 channels/num_nodes 外参数必须有默认值); "
+            f"aux_loss(self, h, x) 返回标量损失张量 —— h 是 [B,T,N,C] 主干隐藏表征(带梯度), "
+            f"x 是 [B,T_in,N,C_in] 原始输入; 签名里没有 y, 禁止引用标签/未来信息 "
+            f"(源码出现 y/label/target/future 等标识符会被静态扫描拒绝, 含注释与变量名)。\n"
+            f"必须可微(不用 detach/.item()/round/argmax/原地操作), h 必须收到梯度(内部 detach h 会被拒); "
+            f"损失不能恒零/恒常数; 不要 IO/网络调用; 解码器要轻(linear/mlp 优先), 参数量适中。\n"
+            f"设计表: mask_pattern={plan.mask_pattern}, mask_ratio={plan.mask_ratio}, "
+            f"recon_target={plan.recon_target}, loss_form={plan.loss_form}, "
+            f"decoder_form={plan.decoder_form}; 设计理由={plan.rationale}。\n"
+            f"相关机制数学结构(灵感): {maths}\n"
+            f"包含必要 import(torch, torch.nn as nn)。只写这一个类。"
+        )
+        if prev_error:
+            instr += f"\n上一版验证失败, 请修正: {prev_error[:600]}"
+        return instr
+
+    def _aux_plan_from_dict(self, plan_d: dict) -> AuxTaskPlan:
+        plan = AuxTaskPlan(
+            task_name=plan_d["task_name"], rationale=plan_d.get("rationale", ""),
+            mask_pattern=plan_d.get("mask_pattern", "random"),
+            mask_ratio=float(plan_d.get("mask_ratio", 0.25)),
+            recon_target=plan_d.get("recon_target", "raw_input"),
+            loss_form=plan_d.get("loss_form", "masked_mae"),
+            decoder_form=plan_d.get("decoder_form", "linear"),
+            source_mechanisms=plan_d.get("source_mechanisms", []),
+            expected_effect=plan_d.get("expected_effect", ""),
+        )
+        plan.validate()
+        return plan
+
+    def synthesize_aux_task(self, req: FusionRequest, needs_adj: bool = False,
+                            exemplars: dict | None = None,
+                            insights: list[dict] | None = None,
+                            temperature: float | None = None) -> AuxSynthesisResult:
+        """B7 辅助任务合成: plan(设计表) → code(模块) → exec → validate_aux_operator 防泄漏门, bounded 重试。
+
+        双路与 synthesize 一致: code_backend 给定走 aider 指令, 否则 LLM 直生 + 正则抽取;
+        plan 阶段始终用 self.llm; 重试上限同 cfg.max_retries; temperature=None → cfg.temperature。
+        exemplars/insights 注入 plan prompt; None → 不注入 (prompt 逐字节兼容)。
+        needs_adj 仅与 synthesize 签名对称预留 —— aux_loss(h, x) 契约无邻接, 当前不参与验证。
+        """
+        temp = self.cfg.temperature if temperature is None else temperature
+        try:
+            plan_text = self.llm.chat(build_aux_plan_prompt(req, exemplars=exemplars,
+                                                            insights=insights),
+                                      temperature=temp)
+            plan = self._aux_plan_from_dict(extract_json(plan_text))
+        except Exception as e:
+            return AuxSynthesisResult(False, attempts=0,
+                                      last_error=f"计划阶段失败: {type(e).__name__}: {e}")
+
+        prev_error = ""
+        for attempt in range(1, self.cfg.max_retries + 1):
+            try:
+                if self.code_backend is not None:
+                    instr = self._build_aux_aider_instruction(req, plan, prev_error)
+                    code, err = self.code_backend.write_operator(instr)
+                    if code is None:
+                        prev_error = f"代码后端失败: {err}"
+                        continue
+                else:
+                    code_text = self.llm.chat(build_aux_code_prompt(req, plan, prev_error),
+                                              temperature=temp)
+                    code = extract_code(code_text)
+                cls = exec_operator_code(code, plan.task_name)
+            except Exception as e:
+                prev_error = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-600:]}"
+                continue
+
+            def factory(channels, num_nodes):
+                return cls(channels=channels, num_nodes=num_nodes)
+
+            rep = validate_aux_operator(factory, source_code=code)
+            if rep.passed:
+                op = AuxTaskOperator(name=plan.task_name, code=code, plan=plan,
+                                     validated=True, validation_gate="all")
+                return AuxSynthesisResult(True, operator=op, attempts=attempt, plan=plan)
+            prev_error = f"验证未过, 门={rep.gate}: {rep.reason}"
+
+        return AuxSynthesisResult(False, attempts=self.cfg.max_retries,
+                                  last_error=f"重试 {self.cfg.max_retries} 次仍未过验证: {prev_error}",
+                                  plan=plan)
 
     def synthesize(self, req: FusionRequest, needs_adj: bool = False,
                    temperature: float | None = None, *,

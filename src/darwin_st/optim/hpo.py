@@ -66,6 +66,7 @@ def suggest_hps(trial: optuna.Trial, genotype: Genotype, cfg: HPOConfig) -> dict
     条件超参: num_heads 仅当架构含【头数可配】的注意力算子时才存在 ——
     attn / st_graph_attn / series_decomp_attn (accepts_num_heads 按构造函数签名判定;
     gat/dynamic_gat 头数写死不可配, 不采 —— 采了也是没人消费的死参数)。
+    aux_lambda 仅当 genotype.aux_op 非 None (挂了辅助任务) 时存在 (B7, 同模式)。
     配合 TPESampler(group=True) 正确建模。
     """
     hps = {
@@ -88,6 +89,11 @@ def suggest_hps(trial: optuna.Trial, genotype: Genotype, cfg: HPOConfig) -> dict
     )
     if uses_attn:
         hps["num_heads"] = trial.suggest_categorical("num_heads", [1, 2, 4, 8])
+    # 条件超参 (B7): 架构挂了辅助任务 (genotype.aux_op 非 None) 才采辅助损失权重
+    # aux_lambda —— log-uniform [1e-3, 1e-1] (STD-MAE 量级); 无 aux 不采 (采了也是
+    # 没人消费的死参数, 同 num_heads 的条件维度模式; 消费方 train_one hps.get("aux_lambda", 0.1))。
+    if genotype.aux_op is not None:
+        hps["aux_lambda"] = trial.suggest_float("aux_lambda", 1e-3, 1e-1, log=True)
     return hps
 
 

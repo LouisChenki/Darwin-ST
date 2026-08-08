@@ -8,6 +8,11 @@
 
 组合算子受 4 算子文法约束 (sequential/parallel/additive_residual/gated_routed),
 防 Frankenstein 拼接。
+
+B7 扩展 —— 辅助训练任务契约 (创造对象从"架构算子"扩展到"自监督辅助损失",
+STD-MAE 时空解耦掩码重建路线, 文献实证同协议 -0.94 MAE):
+  - AuxTaskPlan:     LLM → harness 第一步, 辅助任务设计表 (掩码模式/重建目标/损失/解码器)
+  - AuxTaskOperator: LLM → harness 第二步, 辅助任务模块代码 + 元信息 (模块硬契约见其 docstring)
 """
 
 from __future__ import annotations
@@ -16,7 +21,11 @@ from dataclasses import dataclass, field
 
 from darwin_st.knowledge.ontology import Mechanism
 
-__all__ = ["COMPOSITION_OPS", "FusionRequest", "FusionPlan", "SynthesizedOperator"]
+__all__ = [
+    "COMPOSITION_OPS", "FusionRequest", "FusionPlan", "SynthesizedOperator",
+    "AUX_MASK_PATTERNS", "AUX_RECON_TARGETS", "AUX_LOSS_FORMS", "AUX_DECODER_FORMS",
+    "AuxTaskPlan", "AuxTaskOperator",
+]
 
 # 4 算子组合文法 (Modular DL survey) —— 约束 LLM 怎么组合
 COMPOSITION_OPS = {
@@ -108,3 +117,73 @@ class SynthesizedOperator:
     category: str = "spatiotemporal"       # 算子类别 spatial/temporal/spatiotemporal (融合算子默认时空一体)
     validation_gate: str = ""              # 验证停在哪个门 (或 "all")
     real_mae: float | None = None          # 真实评测 MAE (注入算子库后)
+
+
+# ---------------------------------------------------------------------------
+# B7: 辅助训练任务 (Auxiliary Training Task) —— 自监督辅助损失的设计表 + 模块契约
+# ---------------------------------------------------------------------------
+
+# 辅助任务设计文法 (约束 LLM 的设计空间, 同 COMPOSITION_OPS 的角色)
+AUX_MASK_PATTERNS = {"sensor", "temporal_patch", "random", "none"}  # none = 非掩码类辅助任务
+AUX_RECON_TARGETS = {"raw_input", "hidden"}
+AUX_LOSS_FORMS = {"masked_mae", "mse", "huber"}
+AUX_DECODER_FORMS = {"linear", "mlp", "light_transformer"}
+
+
+@dataclass
+class AuxTaskPlan:
+    """LLM → harness: 辅助任务设计表 (plan-then-code 的 plan)。
+
+    强制 LLM 先想清楚再写代码: 遮什么、重建什么、用什么损失与解码器、依据哪个机制卡。
+    harness 校验计划合法后才让其生成模块代码。
+    """
+
+    task_name: str                         # 合法 Python 标识符, 建议 aux_ 前缀
+    rationale: str                         # 因果论证: 为何这个辅助任务能解当前瓶颈
+    mask_pattern: str                      # ∈ AUX_MASK_PATTERNS
+    mask_ratio: float                      # [0.05, 0.5] (STD-MAE 实证 0.25 最优; 超界 validate 拒绝)
+    recon_target: str                      # ∈ AUX_RECON_TARGETS
+    loss_form: str                         # ∈ AUX_LOSS_FORMS
+    decoder_form: str                      # ∈ AUX_DECODER_FORMS
+    source_mechanisms: list[str]           # 依据的机制卡名 (≥1)
+    expected_effect: str                   # 预期解决什么瓶颈
+
+    def validate(self) -> None:
+        if self.mask_pattern not in AUX_MASK_PATTERNS:
+            raise ValueError(f"mask_pattern '{self.mask_pattern}' 不在文法 {sorted(AUX_MASK_PATTERNS)}")
+        if self.recon_target not in AUX_RECON_TARGETS:
+            raise ValueError(f"recon_target '{self.recon_target}' 不在文法 {sorted(AUX_RECON_TARGETS)}")
+        if self.loss_form not in AUX_LOSS_FORMS:
+            raise ValueError(f"loss_form '{self.loss_form}' 不在文法 {sorted(AUX_LOSS_FORMS)}")
+        if self.decoder_form not in AUX_DECODER_FORMS:
+            raise ValueError(f"decoder_form '{self.decoder_form}' 不在文法 {sorted(AUX_DECODER_FORMS)}")
+        if self.mask_pattern != "none" and not (0.05 <= self.mask_ratio <= 0.5):
+            raise ValueError(f"mask_ratio {self.mask_ratio} 超界 [0.05, 0.5] "
+                             f"(STD-MAE 实证 0.25 最优; mask_pattern=none 时忽略)")
+        if not self.source_mechanisms:
+            raise ValueError("辅助任务至少需 1 个依据机制")
+        if not self.task_name.isidentifier():
+            raise ValueError(f"task_name '{self.task_name}' 须是合法 Python 标识符")
+
+
+@dataclass
+class AuxTaskOperator:
+    """LLM → harness 第二步: 辅助任务模块代码 + 元信息 (经防泄漏验证门后注册)。
+
+    模块代码硬契约 (合成 prompt 与 validation.validate_aux_operator 共用):
+
+        class <TaskName>(nn.Module):
+            def __init__(self, channels, num_nodes, seq_in=12, seq_out=12, **kw): ...
+                # 验证门只传 channels/num_nodes 玩具尺寸, 其余参数必须有默认值
+            def aux_loss(self, h, x):
+                # h: [B, T, N, C]      主干隐藏表征 (模型中间层输出, 带梯度)
+                # x: [B, T_in, N, C_in] 原始输入 (归一化尺度, 无梯度需求)
+                # 返回标量损失张量。**签名里没有 y** —— 从接口上杜绝看答案。
+    """
+
+    name: str
+    code: str                              # nn.Module 源码 (类名 = plan.task_name)
+    plan: AuxTaskPlan
+    validated: bool = False                # 是否已过防泄漏验证门
+    validation_gate: str = ""              # 验证停在哪个门 (或 "all")
+    real_mae: float | None = None          # 实测主任务 MAE (回填钩子, 与 SynthesizedOperator 一致)

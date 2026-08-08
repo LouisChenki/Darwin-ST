@@ -8,6 +8,8 @@ genotype 是「离散、可序列化、可变异」的架构表示 (phenotype=bu
   - blocks: 若干 ST-block, 每块 = {spatial_op, temporal_op, fusion}
   - depth/hidden: 全局深度与隐藏维
   - adj_mode: 邻接归一化模式 (sym/rw/none, 仅对需要外部图的空间算子)
+  - aux_op: B7 辅助任务槽位 (单槽, 注册名或 None) —— 防空间爆炸的关键设计:
+    辅助任务不是每块一个, 而是全模型至多挂一个自监督辅助损失 (STD-MAE 路线)
   - protected: 创新点保护区 —— Agent 在 Tier2 写入的创新算子名列表, **进化禁止删除**
 
 铁律 (见 docs/P2_ALGORITHM_DESIGN.md 架构铁律):
@@ -103,7 +105,18 @@ class EmbeddingConfig:
 
 @dataclass
 class Genotype:
-    """完整架构基因型。"""
+    """完整架构基因型。
+
+    aux_op (B7): 辅助任务槽位 —— None (默认) 或 AUX_OPS 注册名 (aux_ 前缀)。
+    只校验"None 或合法标识符"; 注册与否由 build_model 挂载时查 (genotype 层
+    不依赖运行时注册表, 保序列化/签名纯数据语义)。
+    **签名语义注意**: to_dict 对 aux_op=None 走 omit-None (同 joint_op) —— 无 aux 的
+    genotype 签名字节与引入本字段前完全一致 (零换代); 一旦 aux_op 非 None, genotype
+    签名即变 → 记忆/查重把"同架构带不带 aux"当不同 trial 对待 (不串)。注意
+    space_version (operators.builtin_op_signature: 内置算子名+schema 标记的哈希) **不受
+    本字段影响** —— aux 是训练期辅助损失而非架构搜索空间代际变更, 有无 aux 的架构留在
+    同代比较 (消融对比正是研究所需), 这是有意设计而非遗漏。
+    """
 
     blocks: list[STBlock]
     hidden: int = 64
@@ -112,6 +125,8 @@ class Genotype:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     # 创新点保护区: 这些空间/时序算子名在变异中不可被删除 (可改超参)
     protected: list[str] = field(default_factory=list)
+    # B7 辅助任务 (单槽): None = 无辅助损失 (现状不变); 非 None = AUX_OPS 注册名
+    aux_op: str | None = None
 
     @property
     def depth(self) -> int:
@@ -124,6 +139,9 @@ class Genotype:
             raise ValueError(f"hidden 必须为正: {self.hidden}")
         if self.adj_mode not in VALID_ADJ_MODE:
             raise ValueError(f"未知 adj_mode: {self.adj_mode} (可选 {sorted(VALID_ADJ_MODE)})")
+        # aux_op: None 或合法标识符 (注册与否由 build_model 挂载时查, 此处不依赖注册表)
+        if self.aux_op is not None and not self.aux_op.isidentifier():
+            raise ValueError(f"aux_op '{self.aux_op}' 须为 None 或合法 Python 标识符")
         self.embedding.validate()
         for b in self.blocks:
             b.validate()
@@ -140,13 +158,19 @@ class Genotype:
 
     # -- 序列化 --
     def to_dict(self) -> dict:
-        return {
+        d = {
             "blocks": [_block_to_dict(b) for b in self.blocks],   # omit-None joint_op 保旧签名
             "hidden": self.hidden,
             "adj_mode": self.adj_mode,
             "embedding": asdict(self.embedding),
             "protected": list(self.protected),
         }
+        # omit-None aux_op (B7): 无辅助任务的 genotype 签名字节与引入 aux_op 前一致 (零换代);
+        # 非 None → genotype 签名变 (带/不带 aux 是不同 trial)。space_version
+        # (builtin_op_signature) 有意不受本字段影响, 见类 docstring
+        if self.aux_op is not None:
+            d["aux_op"] = self.aux_op
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Genotype":
@@ -160,6 +184,7 @@ class Genotype:
             adj_mode=d.get("adj_mode", "sym"),
             embedding=embedding,
             protected=list(d.get("protected", [])),
+            aux_op=d.get("aux_op"),              # 兼容旧 dict (无 aux_op 键) → None
         )
 
     def signature(self) -> str:
@@ -195,6 +220,8 @@ def mutate(geno: Genotype, op: str, rng_index: int = 0, **params) -> Genotype:
       - "remove_block":  删第 i 块 (保护区块拒删)
       - "change_hidden": 改隐藏维
       - "change_adj_mode": 改邻接归一化模式
+      - "aux_toggle":    B7 辅助任务开关: None→挂 new_op (AUX_OPS 注册名); 已挂→置 None
+      - "aux_swap":      B7 换一个辅助任务 (须已挂, new_op 为新注册名)
 
     变异铁律: 触及保护区算子的块, 其对应算子不可被 swap/remove。
     rng_index/params 由调用方 (进化层) 提供具体选择, 本函数保持确定性。
@@ -263,6 +290,19 @@ def mutate(geno: Genotype, op: str, rng_index: int = 0, **params) -> Genotype:
             setattr(g.embedding, f"use_{which}", bool(params["enable"]))
         if "dim" in params:
             setattr(g.embedding, f"{which}_dim", int(params["dim"]))
+
+    elif op == "aux_toggle":
+        # B7 辅助任务开关 (单槽): 未挂 → 挂 new_op; 已挂 → 置 None (与 toggle_joint 同模式)
+        if g.aux_op is not None:
+            g.aux_op = None                          # 关闭辅助任务
+        else:
+            g.aux_op = params["new_op"]              # 挂载 (注册名合法性由 build_model 查)
+
+    elif op == "aux_swap":
+        # B7 换辅助任务: 须已挂 (未挂用 aux_toggle 开启)
+        if g.aux_op is None:
+            raise ValueError("未挂辅助任务, 无可换 (先 aux_toggle 开启)")
+        g.aux_op = params["new_op"]
 
     else:
         raise ValueError(f"未知变异算子: {op}")

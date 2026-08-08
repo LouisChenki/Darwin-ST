@@ -4,6 +4,10 @@
   停滞 → 诊断瓶颈 → 跨域检索互补机制集 → LLM 融合 + Aider 写算子 → 验证 →
   注入算子库 → 产出一个用新算子的 genotype 交给进化评估 → 创造履历记 B1 履历本。
 
+B7 通道路由: 检索命中自监督/掩码族机制 (AUX_MECHANISM_FAMILIES, 见 _should_create_aux)
+且 enable_aux_creation → 辅助任务通道 (synthesize_aux_task → register_aux → seed 挂
+aux_op 槽, 架构不动); 未命中或开关关闭 → 原算子通道 (行为同 B7 前)。
+
 设计 (契合两层自治, 用户拍板的职责分离):
   - 创造是 Tier-2 低频(仅停滞触发), Tier-1 进化高频。
   - 合成算子进【算子库+archive】(给进化), 不进机制库(机制库静态只读)。
@@ -33,7 +37,7 @@ from darwin_st.knowledge.retrieval import find_cross_domain_analogy
 from darwin_st.search.genotype import Genotype, STBlock
 
 __all__ = ["CreationConfig", "CreationOutcome", "CreationLoop", "diagnose_bottleneck",
-           "parse_failure_gate"]
+           "parse_failure_gate", "AUX_MECHANISM_FAMILIES"]
 
 
 @dataclass
@@ -56,6 +60,9 @@ class CreationConfig:
     # B5 假设独立采样 (FunSearch/AlphaEvolve): True → synthesize_independent (N 次独立调用,
     # 组合文法轮转 + 温度阶梯 + 双模型路由); False → synthesize_many (单次调用产 N, 旧行为)
     independent_sampling: bool = True
+    # B7 辅助任务创造通道: True (默认) 且检索命中自监督/掩码族机制 (AUX_MECHANISM_FAMILIES)
+    # → 走辅助任务通道 (造自监督辅助损失模块, 挂 genotype aux_op 槽); False → 全部走算子通道 (行为同 B7 前)
+    enable_aux_creation: bool = True
 
 
 @dataclass
@@ -130,6 +137,29 @@ def parse_failure_gate(last_error: str) -> str:
     if "计划" in last_error:
         return "plan"
     return "unknown"
+
+
+# B7 自监督/掩码族机制卡名集合 (辅助任务通道路由判据)。
+# 这类机制的因果行为天然是"设计一个自监督预训练/正则辅助任务" (STD-MAE 路线),
+# 融合成架构算子反而语义错位 —— 命中即走辅助任务通道 (造 aux 损失模块, 非架构算子)。
+# 可扩展: 新机制卡入库时把卡名 (knowledge/data/mechanism_cards.json 的 name 字段) 加入
+# 本集合即可路由到 aux 通道, 无需改路由代码。
+AUX_MECHANISM_FAMILIES = frozenset({
+    "masked_autoencoding",                # 掩码自编码 (MAE 系, 掩码重建路线源头)
+    "decoupled_st_masked_pretraining",    # 时空解耦掩码预训练 (STD-MAE 本体)
+    "multi_strategy_patch_pretraining",   # 多策略 patch 掩码预训练
+    "correlation_adaptive_augmentation",  # 相关自适应增强 (自监督增强系)
+    "contrastive_learning",               # 对比学习 (自监督族)
+})
+
+
+def _should_create_aux(mechanisms) -> bool:
+    """B7 通道路由判定: 检索到的机制卡名命中自监督/掩码族 (AUX_MECHANISM_FAMILIES) → True。
+
+    互补集中任一机制命中即走辅助任务通道 (辅助任务是比架构融合更自然的创造对象);
+    enable_aux_creation 开关的联合判定在 maybe_create 调用处做, 本函数纯看机制。
+    """
+    return any(m.name in AUX_MECHANISM_FAMILIES for m in mechanisms)
 
 
 class CreationLoop:
@@ -268,6 +298,12 @@ class CreationLoop:
         # 反思经验注入 (与诊断对称): memory 有反思产出的 insights → plan prompt 末尾经验块;
         # 无 → None, prompt 与现状逐字节一致
         insights = self._prompt_insights(dataset)
+        # B7 通道路由: 检索命中自监督/掩码族机制且开关开 → 辅助任务通道 (造自监督辅助损失模块,
+        # 挂 genotype aux_op 槽); 未命中或开关关闭 → 下方原算子通道 (行为同 B7 前)
+        if self.cfg.enable_aux_creation and _should_create_aux(res.mechanisms):
+            return self._maybe_create_aux(req, best_genotype, mech_names, round_idx,
+                                          best_hps=best_hps, exemplars=exemplars,
+                                          insights=insights)
         # B5: 默认假设独立采样 (组合文法轮转 + 温度阶梯 + 双模型路由);
         # independent_sampling=False → 单次调用产 N 的旧路径 (行为同 B5 前)
         if self.cfg.independent_sampling:
@@ -325,6 +361,112 @@ class CreationLoop:
             bottleneck=bottleneck, retrieved_mechanisms=mech_names,
             n_hypotheses=len(results), n_success=len(successes),
             reason="合成并注入成功", insight=insight)
+
+    # ------------------------------------------------------------------
+    # B7 辅助任务创造通道 (自监督辅助损失的 合成→注册→seed; 路由判据见 _should_create_aux)
+    # ------------------------------------------------------------------
+
+    def _maybe_create_aux(self, req: FusionRequest, best_genotype: Genotype | None,
+                          mech_names: list[str], round_idx: int,
+                          best_hps: dict | None = None, exemplars: dict | None = None,
+                          insights: list[dict] | None = None) -> CreationOutcome:
+        """辅助任务通道: synthesize_aux_task → register_aux → seed 挂 aux_op 槽 → 履历。
+
+        单假设 (设计空间已被 AuxTaskPlan 文法约束, 多样性靠多轮触发而非单轮多假设)。
+        失败纪律与算子通道一致: 不中止闭环 + 履历记失败 + 方向信用分 −1 + 升温探索。
+        """
+        result = self.synthesizer.synthesize_aux_task(
+            req, exemplars=exemplars, insights=insights, temperature=self._temperature)
+        if not (result.success and result.operator is not None):
+            if self.archive is not None:
+                self._record_aux_to_archive(req, result, round_idx)
+            # B4 同纪律: 挂门 (无 seed 产出, 结局立即可知) → 本轮方向记 −1 + 升温
+            self.update_direction_outcome(round_idx, -1.0)
+            self._temperature = min(1.0, self._temperature + 0.05)
+            self._persist_direction_state()  # 升温在 update_direction_outcome 落盘之后, 补落一次
+            err = result.last_error or "无结果"
+            insight = f"辅助任务 {mech_names} 解决'{req.bottleneck}': 未过防泄漏验证门"
+            return CreationOutcome(False, bottleneck=req.bottleneck,
+                                   retrieved_mechanisms=mech_names, n_hypotheses=1, n_success=0,
+                                   reason=err[:200], insight=insight)
+
+        reg_name = self.registry.register_aux(result.operator)
+        seed = self._make_seed_aux_genotype(best_genotype, reg_name, best_hps)
+        seed._seed_meta["creation_round"] = round_idx   # B4: 结局回授归属的诊断轮次
+        # B3: 与算子通道共用同一套预算分配 (单候选 ≤ top_k 时不调 proxy, 直接大预算)
+        proxy_maes = self._assign_seed_budgets([seed])
+        if self.archive is not None:
+            self._record_aux_to_archive(req, result, round_idx, reg_name=reg_name,
+                                        seed_signature=seed.signature(),
+                                        proxy_mae=proxy_maes[0],
+                                        proxy_error=self._last_proxy_errors[0])
+        pattern = result.plan.mask_pattern if result.plan else "?"
+        insight = (f"辅助任务 {mech_names} 解决'{req.bottleneck}': 合成 {reg_name} "
+                   f"(掩码模式 {pattern}) → 挂 aux_op 槽, 待评测")
+        return CreationOutcome(True, operator_names=[reg_name], seed_genotypes=[seed],
+                               bottleneck=req.bottleneck, retrieved_mechanisms=mech_names,
+                               n_hypotheses=1, n_success=1,
+                               reason="辅助任务合成并注入成功", insight=insight)
+
+    def _make_seed_aux_genotype(self, best: Genotype | None, reg_name: str,
+                                best_hps: dict | None = None) -> Genotype:
+        """辅助通道 seed: 不改架构, 只挂 aux_op 槽 (best.copy(); 无 best 冷启动用默认骨架)。
+
+        _seed_meta 机制与 _make_seed_genotype 一致 (warm_start_hps + seed_hpo_trials 大预算 +
+        is_creation_seed + operator_name=aux 注册名), orchestrator 履历回填/方向回授零改动复用。
+        """
+        if best is not None:
+            g = best.copy()
+        else:
+            # 冷启动默认骨架 (同 run_creation_loop 弱基线; 参照 _make_seed_genotype 的 best=None 分支)
+            g = Genotype(blocks=[STBlock(spatial_op="gcn", temporal_op="tcn")], hidden=64)
+        g.aux_op = reg_name
+        g.validate()
+        g._seed_meta = {"warm_start_hps": best_hps or None,
+                        "hpo_trials": self.cfg.seed_hpo_trials,
+                        "is_creation_seed": True,
+                        "operator_name": reg_name}   # B1: orchestrator 据此回写履历本/registry
+        return g
+
+    def _record_aux_to_archive(self, req: FusionRequest, r, round_idx: int,
+                               reg_name: str | None = None, seed_signature: str | None = None,
+                               proxy_mae: float | None = None,
+                               proxy_error: str | None = None) -> None:
+        """辅助通道履历 (B1): composition 记 aux:<mask_pattern>, operator_name=注册名, mechanisms 照记。
+
+        成功: gate="all" + 模块代码 + 设计表字段 + 注册名 + seed 签名; 失败: gate=失败门
+        (parse_failure_gate 与算子通道复用同一解析) + error + plan(若有)。
+        档案 IO 失败不中止创造闭环 (履历是增益, 非必需)。
+        """
+        if self.archive is None:
+            return
+        from datetime import datetime, timezone
+
+        from darwin_st.creation.creation_archive import CreationRecord
+
+        plan = r.plan
+        if r.success and r.operator is not None:
+            gate, error, code = "all", None, r.operator.code
+            op_name = reg_name or r.operator.name
+        else:
+            gate = parse_failure_gate(r.last_error)
+            error = r.last_error or None
+            code = ""
+            op_name = plan.task_name if plan else ""
+        rec = CreationRecord(
+            round_idx=round_idx, created_at=datetime.now(timezone.utc).isoformat(),
+            bottleneck=req.bottleneck, preconditions=list(req.target_preconditions),
+            mechanisms=[m.name for m in req.mechanisms],
+            operator_name=op_name,
+            composition=f"aux:{plan.mask_pattern}" if plan else "aux",
+            rationale=plan.rationale if plan else "",
+            code=code, gate=gate, error=error, seed_signature=seed_signature,
+            proxy_mae=proxy_mae,          # B3: proxy 粗筛分 (未走 proxy 路径为 None)
+            proxy_error=proxy_error)      # B3: proxy 失败原因 (异常摘要/"inf"; 成功为 None)
+        try:
+            self.archive.record(rec)
+        except Exception:
+            pass                     # 档案写失败不中止闭环
 
     # ------------------------------------------------------------------
     # B4 方向信用分 + 温度自适应 (LLMatic curiosity 机制)

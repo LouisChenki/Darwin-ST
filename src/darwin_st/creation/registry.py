@@ -20,6 +20,15 @@ Tier-2 闭环的关键: 合成并验证过的融合算子, 注册进 operators.p
   - load_persisted() 兼容旧目录: 无 lineage 文件时每个算子隐式成单版本族。
 
 注意(用户拍板): 合成算子进【算子库】给进化用, **不进机制库**(机制库静态只读)。
+
+B7 扩展 —— 辅助训练任务注册 (register_aux):
+  - 创造对象从"架构算子"扩展到"自监督辅助损失模块" (STD-MAE 路线, 契约见 contracts.AuxTaskOperator)。
+  - register_aux(): 要求 op.validated=True (过 validate_aux_operator 防泄漏门); 注册名保证
+    aux_ 前缀 (op.name 已带则沿用, 未带则补); 注入 operators.AUX_OPS (独立注册表,
+    与 synth_ 算子的 SPATIAL_OPS 共存互不干扰)。
+  - 持久化: 同一 persist_dir 下 aux_<name>.py + aux_<name>.json (存 plan 设计表 + real_mae 钩子);
+    load_persisted() 按文件名前缀分派 (aux_ → AUX_OPS, synth_ → SPATIAL_OPS, lineage_ → 家谱),
+    进程后端 worker 经现有 synth_persist_dir 机制自动拿到 aux 算子 (零新链路)。
 """
 
 from __future__ import annotations
@@ -28,17 +37,20 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 import torch.nn as nn
 
-from darwin_st.creation.contracts import SynthesizedOperator
+from darwin_st.creation.contracts import AuxTaskOperator, SynthesizedOperator
 from darwin_st.creation.synthesizer import exec_operator_code
 from darwin_st.search import operators as ops_mod
-from darwin_st.search.operators import SYNTH_PREFIX  # 单一真源在 operators.py, 此处 re-export 保兼容
+from darwin_st.search.operators import (  # 单一真源在 operators.py, 此处 re-export 保兼容
+    AUX_PREFIX,
+    SYNTH_PREFIX,
+)
 
-__all__ = ["OperatorRegistry", "SYNTH_PREFIX", "family_of", "version_of"]
+__all__ = ["OperatorRegistry", "SYNTH_PREFIX", "AUX_PREFIX", "family_of", "version_of"]
 
 _VERSION_RE = re.compile(r"_v(\d+)$")
 
@@ -64,12 +76,23 @@ class _RegisteredOp:
     source_mechanisms: list[str] = field(default_factory=list)  # plan 的源机制 (精炼沿用用)
 
 
+@dataclass
+class _RegisteredAux:
+    """B7 辅助任务注册条目 (内存态; 持久层为 aux_<name>.py + aux_<name>.json)。"""
+
+    name: str            # 注册名 (aux_ 前缀)
+    class_name: str      # 代码里的类名 (= plan.task_name)
+    code: str
+    plan: dict = field(default_factory=dict)     # AuxTaskPlan asdict (设计表元数据)
+
+
 class OperatorRegistry:
     """合成算子的注册表 + 持久化 + 算子家谱 (B2)。注入到 search.operators.SPATIAL_OPS。"""
 
     def __init__(self, persist_dir: str | None = None):
         self.persist_dir = persist_dir
         self._registered: dict[str, _RegisteredOp] = {}
+        self._registered_aux: dict[str, _RegisteredAux] = {}   # B7 辅助任务 (独立表)
         self._lineages: dict[str, list[dict]] = {}   # family -> [version 条目, 按版本序]
         if persist_dir:
             os.makedirs(persist_dir, exist_ok=True)
@@ -140,6 +163,51 @@ class OperatorRegistry:
 
     def is_registered(self, reg_name: str) -> bool:
         return reg_name in self._registered
+
+    # ------------------------------------------------------------------
+    # B7: 辅助训练任务注册 (AUX_OPS 注入 + 持久化)
+    # ------------------------------------------------------------------
+
+    def register_aux(self, op: AuxTaskOperator) -> str:
+        """把过验证门的辅助任务模块注入 AUX_OPS, 返回注册名 (aux_ 前缀)。
+
+        要求 op.validated=True (过 validate_aux_operator 防泄漏门) —— 未验证拒绝注入。
+        注册名: op.name 已带 aux_ 前缀则沿用, 未带则补前缀 (aux_ 前缀惯例,
+        genotype.aux_op/build_aux_op 按此名查找)。持久化 aux_<name>.py + aux_<name>.json。
+        """
+        if not op.validated:
+            raise ValueError(f"辅助任务 {op.name} 未过防泄漏验证门, 拒绝注入")
+        reg_name = op.name if op.name.startswith(AUX_PREFIX) else AUX_PREFIX + op.name
+        cls = exec_operator_code(op.code, op.name)
+        if not (isinstance(cls, type) and issubclass(cls, nn.Module)):
+            raise ValueError(f"{op.name} 不是 nn.Module")
+
+        # 注入 AUX_OPS (独立注册表, 与 SPATIAL_OPS 的 synth_ 算子共存; 存类本身,
+        # 与 SPATIAL_OPS 同风格 —— 实例化契约 channels/num_nodes/seq_in/seq_out 由 build_aux_op 走)
+        ops_mod.AUX_OPS[reg_name] = cls
+        self._registered_aux[reg_name] = _RegisteredAux(
+            reg_name, op.name, op.code, plan=asdict(op.plan))
+
+        if self.persist_dir:
+            self._persist_aux(reg_name, op)
+        return reg_name
+
+    def registered_aux_names(self) -> list[str]:
+        """已注册的辅助任务名 (本 registry 内存态; 全局可挂名单以 AUX_OPS 为准)。"""
+        return list(self._registered_aux)
+
+    def is_registered_aux(self, reg_name: str) -> bool:
+        return reg_name in self._registered_aux
+
+    def _persist_aux(self, reg_name: str, op: AuxTaskOperator) -> None:
+        base = os.path.join(self.persist_dir, reg_name)
+        with open(base + ".py", "w") as f:
+            f.write(op.code)
+        with open(base + ".json", "w") as f:
+            json.dump({"reg_name": reg_name, "class_name": op.name,
+                       "kind": "aux",                    # 类型标记 (防御: 前缀之外的第二重判别)
+                       "plan": asdict(op.plan),
+                       "real_mae": op.real_mae}, f, ensure_ascii=False, indent=2)
 
     # ------------------------------------------------------------------
     # 算子家谱 (B2)
@@ -239,8 +307,10 @@ class OperatorRegistry:
                        "real_mae": op.real_mae}, f, ensure_ascii=False, indent=2)
 
     def load_persisted(self) -> list[str]:
-        """从 persist_dir 重新加载并注册所有持久化的算子 + 家谱。返回注册名列表。
+        """从 persist_dir 重新加载并注册所有持久化的算子 + 家谱 + B7 辅助任务。返回注册名列表。
 
+        按文件名前缀分派 (与 synth_ 算子共存): aux_*.json → AUX_OPS; 其余算子 json → SPATIAL_OPS;
+        lineage_*.json 走家谱段 (跳过)。坏的持久文件跳过不崩。
         兼容旧目录 (B2 前): 无 lineage_*.json 时, 每个持久算子隐式成单版本族
         (real_mae 从算子 json 的钩子字段读回)。
         """
@@ -260,6 +330,17 @@ class OperatorRegistry:
             with open(code_path) as f:
                 code = f.read()
             reg_name = meta["reg_name"]
+            # B7 辅助任务: aux_ 前缀 (或 meta kind=aux) → 注入 AUX_OPS, 不走 synth 链路
+            if reg_name.startswith(AUX_PREFIX) or meta.get("kind") == "aux":
+                try:
+                    cls = exec_operator_code(code, meta["class_name"])
+                    ops_mod.AUX_OPS[reg_name] = cls
+                    self._registered_aux[reg_name] = _RegisteredAux(
+                        reg_name, meta["class_name"], code, plan=dict(meta.get("plan", {})))
+                    loaded.append(reg_name)
+                except Exception:
+                    continue  # 坏的持久 aux 跳过, 不崩
+                continue
             try:
                 cls = exec_operator_code(code, meta["class_name"])
                 ops_mod.SPATIAL_OPS[reg_name] = _make_factory(cls)
@@ -293,6 +374,8 @@ class OperatorRegistry:
 
         # 隐式族: 已注册但不在任何 lineage 里的算子 (旧目录单版本族成立)
         for reg_name in loaded:
+            if reg_name in self._registered_aux:
+                continue                # B7 辅助任务不进算子家谱 (独立表, 无版本族语义)
             fam = family_of(reg_name)
             have = {v["reg_name"] for v in self._lineages.get(fam, [])}
             if reg_name not in have:

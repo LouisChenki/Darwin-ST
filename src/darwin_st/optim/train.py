@@ -89,6 +89,12 @@ def train_one(
     max_train_batches: 非 None 时每 epoch 训练 batch 数上限 (提前 break 内层 batch 循环) ——
     B3 proxy 短训粗筛的廉价抓手: 不动数据管道, 只让每个 epoch 变短。None (默认) = 全量, 行为不变。
 
+    B7 辅助任务 (model.aux_module 非 None 时启用, 由 genotype.aux_op 经 build_model 挂载):
+    训练损失 = 主损失 (mae/huber, 逻辑不动) + λ·aux_loss(h, x), λ = hps.get("aux_lambda", 0.1);
+    h 为 forward_features 主干表征 (带梯度, aux 借此塑造表征), x 为原始输入归一化尺度
+    (契约签名无 y, 接口防泄漏)。aux 前向 nan/inf → 视同主损失 NaN 熔断路径 (trace.aux_nan_hit
+    注明 aux 触发)。**无 aux 时训练路径逐点不变** (零开销, 有测试守)。
+
     权重存档 (checkpoint_path 非 None 才启用, 默认行为完全不变): 每当 val-MAE 刷新
     best-checkpoint, 把 state_dict 搬到 CPU 调 maybe_save_best 原子落盘 (sidecar 比较
     保证同一路径权重只升不降; 写盘几 MB, 相对一次全量 val evaluate 可忽略)。
@@ -117,6 +123,12 @@ def train_one(
         num_heads=hps.get("num_heads"),
     ).to(device)
 
+    # B7 辅助任务: model.aux_module 非 None (genotype.aux_op 已注册并挂载) 时启用辅助损失。
+    # λ 从 hps["aux_lambda"] 读 (默认 0.1, STD-MAE 量级); 无 aux 时强制 0.0 不消费该 hp
+    # (HPO 无 aux 也不采它, 双向不死参数)。aux 参数随 model.parameters() 自动进 Adam。
+    aux_module = model.aux_module
+    aux_lambda = float(hps.get("aux_lambda", 0.1)) if aux_module is not None else 0.0
+
     batch_size = int(hps.get("batch_size", 64))
     lr = float(hps.get("lr", 1e-3))
     wd = float(hps.get("weight_decay", 1e-4))
@@ -144,7 +156,9 @@ def train_one(
         sc = P.load_scaler(data_dir)
         scaler_mean, scaler_std = sc.mean, sc.std
 
-    trace = TrainTrace(max_epochs=max_epochs, lr_schedule=sched_kind, lr=lr, loss=loss_kind)
+    trace = TrainTrace(max_epochs=max_epochs, lr_schedule=sched_kind, lr=lr, loss=loss_kind,
+                       aux_lambda=aux_lambda,
+                       aux_op=(genotype.aux_op or "") if aux_module is not None else "")
     best_mae = float("inf")
     epochs_since_improve = 0                # 收敛早停计数: 连续多少 epoch 无 >min_delta(相对) 改进
     start = time.time()
@@ -153,14 +167,24 @@ def train_one(
         loss_sum, n_batches = 0.0, 0           # epoch 内训练 loss 累加 (epoch 末求均值)
         gn_sum, gn_max = 0.0, 0.0              # epoch 内梯度范数累加 + 最大 (clip 前)
         for batch in train_loader:
+            # 主前向: 有 aux 时拆 forward_features/head (aux 要吃主干表征 h; head∘features 与
+            # 整段 forward 逐点一致); 无 aux 走原 forward 调用 (路径逐字节不变, 零开销)
             if len(batch) == 4:                          # (x, tod, dow, y) STID 身份嵌入
                 x, tod, dow, y = batch
                 x, tod, dow, y = x.to(device), tod.to(device), dow.to(device), y.to(device)
-                pred = model(x, tod_idx=tod, dow_idx=dow)
+                if aux_module is not None:
+                    h = model.forward_features(x, tod_idx=tod, dow_idx=dow)
+                    pred = model.head(h)
+                else:
+                    pred = model(x, tod_idx=tod, dow_idx=dow)
             else:                                        # (x, y) 回退
                 x, y = batch
                 x, y = x.to(device), y.to(device)
-                pred = model(x)
+                if aux_module is not None:
+                    h = model.forward_features(x)
+                    pred = model.head(h)
+                else:
+                    pred = model(x)
             opt.zero_grad()
             if loss_kind == "huber":
                 # 真实尺度 masked Huber: pred/y 先逆变换回真实尺度 (标量 mean/std, 元素级,
@@ -177,6 +201,18 @@ def train_one(
                 trace.n_epochs_run = epoch
                 trace.best_mae = best_mae
                 return (best_mae if best_mae < float("inf") else float("inf")), trace
+            if aux_module is not None:
+                # B7 辅助损失附加在主损失之后 (主损失 mae/huber 逻辑不动): loss += λ·aux。
+                # aux_loss(h, x): h 主干表征带梯度 (aux 借此塑造表征), x 原始输入归一化尺度
+                # (契约签名无 y, 从接口上杜绝看答案)。
+                aux = aux_module.aux_loss(h, x)
+                if torch.isnan(aux) or torch.isinf(aux):   # aux NaN 熔断: 视同主损失 NaN 路径,
+                    trace.nan_hit = True                   # 并用 aux_nan_hit 注明是 aux 触发
+                    trace.aux_nan_hit = True
+                    trace.n_epochs_run = epoch
+                    trace.best_mae = best_mae
+                    return (best_mae if best_mae < float("inf") else float("inf")), trace
+                loss = loss + aux_lambda * aux
             loss.backward()
             # clip_grad_norm_ 返回 **clip 前**的梯度总范数 (零额外计算) —— 之前丢弃, 现采集供梯度诊断
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)

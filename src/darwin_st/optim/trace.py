@@ -45,3 +45,7 @@ class TrainTrace:
     lr_schedule: str = "none"       # 该 trial 用的调度 (none/cosine/plateau)
     lr: float = 0.0                 # 该 trial lr (辅助梯度诊断)
     loss: str = "mae"               # 该 trial 训练损失类型 (mae=归一化尺度 masked MAE / huber=真实尺度 masked Huber)
+    # B7 辅助任务记录 (无 aux 时保持默认值, 向后兼容旧 trace dict 缺键)
+    aux_lambda: float = 0.0         # 辅助损失权重 λ (0.0 = 无辅助任务)
+    aux_op: str = ""                # 挂载的辅助任务注册名 ("" = 无辅助任务)
+    aux_nan_hit: bool = False       # aux 前向 nan/inf 触发熔断 (注明是 aux 而非主损失触发)

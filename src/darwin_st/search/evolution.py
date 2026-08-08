@@ -38,7 +38,7 @@ from darwin_st.search.genotype import (
     mutate,
     random_genotype,
 )
-from darwin_st.search.operators import SPATIOTEMPORAL_OPS, SYNTH_PREFIX, op_category
+from darwin_st.search.operators import AUX_OPS, SPATIOTEMPORAL_OPS, SYNTH_PREFIX, op_category
 
 __all__ = ["Member", "AgingEvolution", "random_mutation", "seed_genotypes"]
 
@@ -147,6 +147,11 @@ def random_mutation(geno: Genotype, rng: random.Random, max_attempts: int = 50,
         ("add_block", 3),
         ("remove_block", 1),
     ]
+    # B7 辅助任务变异 (单槽 aux_op): 保守小权重 1 (= remove_block 档) —— aux 是实验性新维度,
+    # 低频探索防辅助损失冲刷主任务搜索信号。**无已注册 aux 时该变异不可选** (不加进 choices,
+    # 采样天然跳过, 不崩); AUX_OPS 由 registry.register_aux 运行时注入, 每次变异重查 (新注册即生效)。
+    if AUX_OPS:
+        choices.append(("aux_toggle", 1))
     ops = [c for c, _ in choices]
     weights = [w for _, w in choices]
 
@@ -242,6 +247,18 @@ def _apply_random(geno: Genotype, op: str, rng: random.Random,
             cur = getattr(geno.embedding, f"use_{which}")
             return mutate(geno, "toggle_embedding", which=which, enable=not cur)
         return mutate(geno, "toggle_embedding", which=which, dim=rng.choice(_EMB_DIM_CHOICES))
+
+    if op == "aux_toggle":
+        # B7 辅助任务三态: 未挂→挂一个随机已注册 aux; 已挂→一半概率关掉, 一半换另一个
+        pool = sorted(AUX_OPS)
+        if not pool:
+            raise ValueError("无已注册辅助任务 (加权采样已跳过本变异, 此为兜底防御)")
+        if geno.aux_op is None:
+            return mutate(geno, "aux_toggle", new_op=rng.choice(pool))        # 开启
+        others = [a for a in pool if a != geno.aux_op]
+        if others and rng.random() < 0.5:
+            return mutate(geno, "aux_swap", new_op=rng.choice(others))        # 换一个
+        return mutate(geno, "aux_toggle")                                     # 关闭 (→None)
 
     raise ValueError(f"未知变异类型: {op}")
 

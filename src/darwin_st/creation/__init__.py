@@ -6,16 +6,29 @@
 """
 
 from darwin_st.creation.fusion import ZeroInitResidualFusion, GatedFusion
-from darwin_st.creation.validation import ValidationConfig, ValidationReport, validate_operator
+from darwin_st.creation.validation import (
+    ValidationConfig,
+    ValidationReport,
+    validate_operator,
+    AuxValidationConfig,
+    AuxValidationReport,
+    validate_aux_operator,
+)
 from darwin_st.creation.contracts import (
     COMPOSITION_OPS,
     FusionRequest,
     FusionPlan,
     SynthesizedOperator,
+    AUX_MASK_PATTERNS,
+    AUX_RECON_TARGETS,
+    AUX_LOSS_FORMS,
+    AUX_DECODER_FORMS,
+    AuxTaskPlan,
+    AuxTaskOperator,
 )
 from darwin_st.creation.llm import LLMClient, MockLLM, OpenAICompatLLM
 from darwin_st.creation.aider_backend import AiderConfig, AiderBackend
-from darwin_st.creation.registry import OperatorRegistry, SYNTH_PREFIX, family_of, version_of
+from darwin_st.creation.registry import AUX_PREFIX, OperatorRegistry, SYNTH_PREFIX, family_of, version_of
 from darwin_st.creation.refiner import (
     RefineConfig,
     OperatorRefiner,
@@ -23,6 +36,7 @@ from darwin_st.creation.refiner import (
     REFINE_MODE_WEIGHTS,
 )
 from darwin_st.creation.creation_loop import (
+    AUX_MECHANISM_FAMILIES,
     CreationConfig,
     CreationOutcome,
     CreationLoop,
@@ -39,6 +53,7 @@ from darwin_st.creation.reflection import (
     render_insights_block,
 )
 from darwin_st.creation.synthesizer import (
+    AuxSynthesisResult,
     SynthesisConfig,
     SynthesisResult,
     OperatorSynthesizer,
@@ -52,10 +67,19 @@ __all__ = [
     "ValidationConfig",
     "ValidationReport",
     "validate_operator",
+    "AuxValidationConfig",
+    "AuxValidationReport",
+    "validate_aux_operator",
     "COMPOSITION_OPS",
     "FusionRequest",
     "FusionPlan",
     "SynthesizedOperator",
+    "AUX_MASK_PATTERNS",
+    "AUX_RECON_TARGETS",
+    "AUX_LOSS_FORMS",
+    "AUX_DECODER_FORMS",
+    "AuxTaskPlan",
+    "AuxTaskOperator",
     "LLMClient",
     "MockLLM",
     "OpenAICompatLLM",
@@ -63,6 +87,7 @@ __all__ = [
     "AiderBackend",
     "OperatorRegistry",
     "SYNTH_PREFIX",
+    "AUX_PREFIX",
     "family_of",
     "version_of",
     "RefineConfig",
@@ -73,6 +98,7 @@ __all__ = [
     "CreationOutcome",
     "CreationLoop",
     "diagnose_bottleneck",
+    "AUX_MECHANISM_FAMILIES",
     "CreationArchive",
     "CreationRecord",
     "ReflectionConfig",
@@ -84,6 +110,7 @@ __all__ = [
     "render_insights_block",
     "SynthesisConfig",
     "SynthesisResult",
+    "AuxSynthesisResult",
     "OperatorSynthesizer",
     "extract_code",
     "exec_operator_code",

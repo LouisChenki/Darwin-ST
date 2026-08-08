@@ -53,7 +53,9 @@ src/darwin_st/
               the reward-hacking defense), synthesizer.py (plan-then-code, synthesize_many = N
               hypotheses at once), aider_backend.py (writes operators via Aider in a git sandbox),
               registry.py (injects synthesized ops into SPATIAL_OPS — search space "grows";
-              B2: operator lineages — register_variant/update_real_mae/best_in_family),
+              B2: operator lineages — register_variant/update_real_mae/best_in_family;
+              B7: register_aux injects validated aux-task modules into AUX_OPS, persisted as
+              aux_<name>.py/.json alongside synth ops and reloaded by the same load_persisted),
               refiner.py (B2 micro-evolution: refine mode small/param/struct + FunSearch best-shot),
               creation_loop.py (diagnose bottleneck → retrieve → synthesize_many → inject →
               seed genotypes for evolution; B2: maybe_refine reuses good operator families first),

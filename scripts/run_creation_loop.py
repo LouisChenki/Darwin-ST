@@ -15,7 +15,9 @@
           DEEPSEEK_FAST_MODEL(B5 双模型路由的便宜快模型, 默认 deepseek-v4-flash;
           置空 → 不单建 fast_llm, 全部假设走强模型) /
           REFLECT(反思巩固开关, 默认1) / REFLECT_EVERY(每 N 条新履历反思一批, 默认20) /
-          INSIGHTS_CAPACITY(insights 表容量上限, 默认50)
+          INSIGHTS_CAPACITY(insights 表容量上限, 默认50) /
+          AUX_CREATION(B7 辅助任务创造通道开关, 默认1: 检索命中自监督/掩码族机制时
+          造自监督辅助损失模块挂 aux_op 槽, 而非架构算子; 0 → 全部走原算子通道)
 """
 
 from __future__ import annotations
@@ -177,7 +179,9 @@ def main():
     n_hypo = _env_int("N_HYPOTHESES", 4)
     seed_hpo_trials = _env_int("SEED_HPO_TRIALS", 20)   # 创造 seed 专项大 HPO (AlphaEvolve 式深评)
     ccfg = CreationConfig(n_hypotheses=n_hypo, seed_hpo_trials=seed_hpo_trials,
-                          use_proxy=os.environ.get("USE_PROXY", "1") == "1")
+                          use_proxy=os.environ.get("USE_PROXY", "1") == "1",
+                          # B7 辅助任务创造通道 (默认开): 命中自监督/掩码族机制 → 造 aux 损失而非架构算子
+                          enable_aux_creation=os.environ.get("AUX_CREATION", "1") == "1")
 
     # B3 评估中间档 (proxy 粗筛): 合成 seed 先在主进程短训打分, 前 proxy_top_k 才给深评大 HPO,
     # 其余小预算浅评 —— 单轮创造 GPU 成本减半以上。只绑主进程一个设备 (PROXY_DEVICE 默认 cuda:0);

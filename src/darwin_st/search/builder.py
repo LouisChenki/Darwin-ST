@@ -8,6 +8,11 @@
     → 堆叠 ST-block (每块: 空间算子 + 时序算子, 按 fusion 接线)
     → 直接多步线性头 (一次出全部 T_out 步)          [B,T_out,N]
 
+B7 扩展: forward 拆为 forward_features (主干表征 h, [B,T_in,N,hidden]) + head (h→pred),
+forward = head(forward_features(...)) —— 无 aux 时输出与拆分前**逐点一致** (行为不变铁律)。
+辅助任务模块 (genotype.aux_op 非 None 时挂 model.aux_module) 吃 forward_features 产出的 h
+计算自监督辅助损失 (train_one 侧 λ 加权叠加)。
+
 设计要点:
   - 张量全程 [B,T,N,F], 节点维 N 不丢 (架构铁律, 见 docs/P2_ALGORITHM_DESIGN.md)。
   - 解码器固定为直接多步 (非迭代), 研究表明严格更优。
@@ -24,7 +29,9 @@ import torch.nn as nn
 from darwin_st.data.adjacency import random_walk_normalize, symmetric_normalize
 from darwin_st.search.embeddings import STEmbedding
 from darwin_st.search.genotype import Genotype, STBlock
-from darwin_st.search.operators import accepts_num_heads, build_op, build_spatial_op, build_temporal_op
+from darwin_st.search.operators import (
+    accepts_num_heads, build_aux_op, build_op, build_spatial_op, build_temporal_op,
+)
 
 __all__ = ["STBlockModule", "STModel", "build_model", "count_params"]
 
@@ -96,7 +103,13 @@ class STBlockModule(nn.Module):
 class STModel(nn.Module):
     """由 genotype 编译出的完整时空预测模型。
 
-    forward(x, tod_idx=None, dow_idx=None): x [B,T_in,N,C] → [B,T_out,N]。
+    forward(x, tod_idx=None, dow_idx=None): x [B,T_in,N,C] → [B,T_out,N],
+    恒等于 head(forward_features(...)) (B7 拆分):
+      - forward_features: 主干 (嵌入 + block 堆叠 + 头前 dropout) → h [B,T_in,N,hidden]
+      - head:             h → [B,T_out,N] 直接多步预测
+    aux_module: 可选辅助任务模块 (B7, genotype.aux_op 非 None 时按名从 AUX_OPS 实例化;
+    None = 无辅助任务, 默认)。它消费 forward_features 的 h 与原始输入 x 算 aux_loss,
+    不进 forward 主路径 → 主任务前向/评测行为零变化。
 
     dropout: HPO 调的正则强度, 只设在【block 堆叠后、输出头前】一处 (最小侵入;
     嵌入处不加 —— 身份嵌入是最高杠杆组件, 丢它伤精度)。默认 0.0 → nn.Dropout(0.0)
@@ -132,7 +145,16 @@ class STModel(nn.Module):
 
         # 直接多步预测头: 把 T_in 步的 hidden 展平到时间, 一次输出 T_out 步
         # [B,N,T_in*hidden] -> [B,N,T_out]
-        self.head = nn.Linear(seq_len_in * hidden, seq_len_out)
+        self.out_proj = nn.Linear(seq_len_in * hidden, seq_len_out)
+
+        # B7 辅助任务模块: genotype.aux_op 非 None → 从 AUX_OPS 查名实例化挂载
+        # (channels=hidden 主干表征维, num_nodes 节点数, seq_in/seq_out 按数据规格);
+        # 未注册 → build_aux_op 抛 ValueError (带已注册名清单)。None = 无辅助任务 (默认)。
+        self.aux_module: nn.Module | None = None
+        if genotype.aux_op is not None:
+            self.aux_module = build_aux_op(genotype.aux_op, channels=hidden,
+                                           num_nodes=num_nodes,
+                                           seq_in=seq_len_in, seq_out=seq_len_out)
 
         # 邻接矩阵 (按 adj_mode 归一化) 作为 buffer; 无图则为 None
         self._register_adj(adj, genotype.adj_mode, num_nodes)
@@ -149,8 +171,9 @@ class STModel(nn.Module):
         # adj_mode == "none": 原始加权图不归一化
         self.register_buffer("adj", torch.from_numpy(a).float(), persistent=False)
 
-    def forward(self, x: torch.Tensor, tod_idx: torch.Tensor | None = None,
-                dow_idx: torch.Tensor | None = None) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor, tod_idx: torch.Tensor | None = None,
+                         dow_idx: torch.Tensor | None = None) -> torch.Tensor:
+        """主干表征: x [B,T_in,N,C] → h [B,T_in,N,hidden] (B7: 供 aux_loss 消费, 带梯度)。"""
         B, T_in, N, _ = x.shape
         assert N == self.num_nodes, f"节点数不符: {N} vs {self.num_nodes}"
 
@@ -159,11 +182,20 @@ class STModel(nn.Module):
         for block in self.blocks:
             h = block(h, adj)                                  # [B,T_in,N,hidden]
         h = self.dropout(h)                                    # 头前正则 (p=0 恒等)
+        return h
 
-        # 直接多步头: [B,T_in,N,hidden] -> [B,N,T_in*hidden] -> [B,N,T_out] -> [B,T_out,N]
+    def head(self, h: torch.Tensor) -> torch.Tensor:
+        """直接多步预测头: h [B,T_in,N,hidden] → [B,T_out,N] (张量变换与拆分前逐字节一致)。"""
+        B, T_in, N, _ = h.shape
+        # [B,T_in,N,hidden] -> [B,N,T_in*hidden] -> [B,N,T_out] -> [B,T_out,N]
         h = h.permute(0, 2, 1, 3).reshape(B, N, -1)           # 张量变换: 时间×特征 展平
-        out = self.head(h)                                     # [B,N,T_out]
+        out = self.out_proj(h)                                 # [B,N,T_out]
         return out.permute(0, 2, 1)                            # [B,T_out,N]
+
+    def forward(self, x: torch.Tensor, tod_idx: torch.Tensor | None = None,
+                dow_idx: torch.Tensor | None = None) -> torch.Tensor:
+        # forward = head(forward_features(...)): 与拆分前**逐点一致** (行为不变铁律, 有测试守)
+        return self.head(self.forward_features(x, tod_idx=tod_idx, dow_idx=dow_idx))
 
 
 def build_model(
@@ -175,6 +207,10 @@ def build_model(
 
     dropout/num_heads 是 HPO 超参的接线口 (train_one 从 hps 读出传入); 默认 0.0/None
     时与旧行为完全一致 (正则恒等, 各算子用自带默认头数)。
+
+    B7: genotype.aux_op 非 None 时按名从 AUX_OPS 实例化辅助任务模块挂 model.aux_module
+    (channels=hidden / num_nodes / seq_in / seq_out 按 genotype 与数据规格; 具体挂载在
+    STModel.__init__)。未注册 → ValueError (报"辅助任务未注册"及当前已注册名清单)。
     """
     return STModel(genotype, num_nodes, in_channels, seq_len_in, seq_len_out, adj,
                    dropout=dropout, num_heads=num_heads)

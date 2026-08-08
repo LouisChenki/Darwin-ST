@@ -28,6 +28,8 @@ __all__ = [
     "SPATIAL_OPS",
     "TEMPORAL_OPS",
     "SPATIOTEMPORAL_OPS",
+    "AUX_OPS",
+    "AUX_PREFIX",
     "OP_CATEGORY",
     "SYNTH_PREFIX",
     "op_category",
@@ -36,6 +38,7 @@ __all__ = [
     "build_op",
     "build_spatial_op",
     "build_temporal_op",
+    "build_aux_op",
     "Identity",
     "ChebGCN",
     "GCNConv",
@@ -543,6 +546,18 @@ SPATIOTEMPORAL_OPS = {
     "stjoint_conv": STJointConv,     # Stage2: 时空交替深度融合
 }
 
+# B7: 辅助训练任务 (Aux Task) 注册表 —— 自监督辅助损失模块 (STD-MAE 路线)。
+# 与 SPATIAL_OPS 同风格 (名 → 类), 但**无内置项**: aux 模块只能由创造层
+# (registry.register_aux, 须过 validate_aux_operator 防泄漏门) 运行时注入。
+# 模块硬契约 (creation/contracts.py AuxTaskOperator):
+#   __init__(channels, num_nodes, seq_in=12, seq_out=12, **kw); aux_loss(h, x) -> 标量
+#   (h: [B,T,N,C] 主干隐藏表征带梯度; x: [B,T_in,N,C_in] 原始输入归一化尺度; 签名无 y)
+AUX_OPS: dict[str, type] = {}
+
+# 辅助任务注册名前缀 (aux_ 惯例; registry.register_aux 保证注入名带此前缀)。
+# 定义在此 (同 SYNTH_PREFIX 的理由): 让 genotype/builder 判名时不引入对 registry 的依赖。
+AUX_PREFIX = "aux_"
+
 # 算子类别 (spatial/temporal/spatiotemporal): 让 genotype/builder 正确放槽。
 # synth 算子的类别由 registry 在注入时登记 (默认 spatiotemporal), 见 op_category()。
 OP_CATEGORY: dict[str, str] = (
@@ -656,3 +671,19 @@ def build_spatial_op(name: str, dim: int, num_nodes: int | None = None, **kw) ->
 def build_temporal_op(name: str, dim: int, num_nodes: int | None = None, **kw) -> nn.Module:
     """按名实例化时序算子。放宽: 也接受时空一体算子坐时序槽 (类别兼容)。委托 build_op 统一处理。"""
     return build_op(name, dim, num_nodes=num_nodes, **kw)
+
+
+def build_aux_op(name: str, channels: int, num_nodes: int,
+                 seq_in: int = 12, seq_out: int = 12, **kw) -> nn.Module:
+    """按名从 AUX_OPS 实例化辅助任务模块 (B7)。
+
+    模块契约: __init__(channels, num_nodes, seq_in, seq_out, **kw), aux_loss(h, x) -> 标量。
+    查不到 (未注册 / 合成 aux 尚未经 registry.register_aux 注入) → ValueError 带清晰信息
+    (不用 KeyError: 与 build_op 区分, 调用方多为训练链路, 需要一眼看懂"辅助任务没注册")。
+    """
+    if name not in AUX_OPS:
+        raise ValueError(
+            f"辅助任务 '{name}' 未注册到 AUX_OPS (当前已注册: {sorted(AUX_OPS)}; "
+            f"合成 aux 算子须先过 validate_aux_operator 防泄漏门再经 registry.register_aux 注入)")
+    return AUX_OPS[name](channels=channels, num_nodes=num_nodes,
+                         seq_in=seq_in, seq_out=seq_out, **kw)
