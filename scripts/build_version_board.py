@@ -167,7 +167,7 @@ def main() -> None:
     with open(args.readme, "w", encoding="utf-8") as f:
         f.write(md)
 
-    best = rows[-1] if rows else None
+    best = min(rows, key=lambda r: (r.record.best_mae, r.record.date)) if rows else None
     print(f"✅ 版本榜构建完成: {len(rows)} 个版本 → {args.readme} + {args.out}")
     if best is not None:
         print(f"   当前最佳: {best.record.version} MAE={best.record.best_mae} "

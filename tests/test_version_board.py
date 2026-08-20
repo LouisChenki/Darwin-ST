@@ -106,7 +106,8 @@ def _rows():
         _rec("v0", 20.67, date="2026-06-25", title="纯 NAS + HPO",
              retrospective="docs/SERVER_VALIDATION.md"),
         _rec("v2", 18.349, date="2026-07-01", tag="v-sota-pems04-18.35",
-             retrospective="docs/SOTA_RETROSPECTIVE.md"),
+             retrospective="docs/SOTA_RETROSPECTIVE.md",
+             model_dir="models/PeMS04/05_mae18.35_f93f4598"),
         _rec("v3", 18.356, date="2026-08-07", tag="acceptable+18.356",
              retrospective="docs/TIER2_V1_RETROSPECTIVE.md",
              model_dir="models/PeMS04/06_mae18.36_6bcc97b9"),
@@ -141,8 +142,11 @@ def test_render_version_readme_md_key_elements():
     assert "## 方法版本榜 (PeMS04)" in md
     assert "![PeMS04 方法版本成绩演进](assets/pems04_version_trend.png)" in md
     assert "## 当前最佳" in md
-    assert "**v3**" in md and "18.356" in md and "**6** / 7" in md
-    assert "[models/PeMS04/06_mae18.36_6bcc97b9](models/PeMS04/06_mae18.36_6bcc97b9/)" in md
+    # 当前最佳 = 全版本 min(best_mae) (v2 18.349 < v3 18.356), 不假设"最新=最佳"
+    sec = md[md.index("## 当前最佳"):]
+    assert "**v2**" in sec and "18.349" in sec and "**5** / 7" in sec
+    assert "[models/PeMS04/05_mae18.35_f93f4598](models/PeMS04/05_mae18.35_f93f4598/)" in sec
+    assert "06_mae18.36_6bcc97b9" not in sec                  # 非最佳版本的模型卡不进"当前最佳"节
     assert "`acceptable+18.356`" in md
     assert "[PeMS04.md](PeMS04.md)" in md
     assert "[docs/](../docs/)" in md

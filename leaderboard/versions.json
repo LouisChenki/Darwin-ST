@@ -24,7 +24,8 @@
     "tag": "v-sota-pems04-18.35",
     "title": "Stage1 搜索空间升级（joint/cross/iterative fusion）+ 24h 长跑",
     "retrospective": "docs/SOTA_RETROSPECTIVE.md",
-    "dataset": "PeMS04"
+    "dataset": "PeMS04",
+    "model_dir": "models/PeMS04/05_mae18.35_f93f4598"
   },
   {
     "version": "v3",
@@ -35,5 +36,14 @@
     "retrospective": "docs/TIER2_V1_RETROSPECTIVE.md",
     "dataset": "PeMS04",
     "model_dir": "models/PeMS04/07_mae18.36_6bcc97b9"
+  },
+  {
+    "version": "v4",
+    "date": "2026-08-20",
+    "best_mae": 18.476,
+    "tag": "b7-v1-routing-failure-18.476",
+    "title": "B7 训练方式创造通道上线（aux 契约/七门验证/训练链路）— 收关定性：aux 路由失效(activation=0)+反思未触发，非机制负结果",
+    "retrospective": "docs/B7_V1_CLOSEOUT.md",
+    "dataset": "PeMS04"
   }
 ]

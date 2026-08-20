@@ -20,6 +20,9 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
+# 冻结的实验资产 (db/日志/算子快照, 体积大且为原始证据; git 只留小型摘要)
+frozen-runs/
+
 # Results file
 results.tsv
 

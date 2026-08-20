@@ -465,7 +465,10 @@ def render_version_board_md(
         )
     lines += ["",
               f"> 位次口径: 该版本最佳单独与已发表 baseline 混排 (不同版本互不占位); "
-              f"完整模型存档见 [{dataset}.md]({dataset}.md)。", ""]
+              f"完整模型存档见 [{dataset}.md]({dataset}.md)。", "",
+              "> ⚠️ **指标口径声明**: 本项目版本行 Best MAE 为**验证集 (val) MAE** "
+              "(split 6/2/2, masked metric, 12 horizons 平均); 已发表 baseline/SOTA 数值为**文献报告的 test MAE**。"
+              "两者口径不同, 混排位次仅供演进参照, 不构成严格可比的排名结论。", ""]
     return "\n".join(lines)
 
 
@@ -495,9 +498,10 @@ def render_version_readme_md(
         lines += ["## 成绩随版本演进", "",
                   f"![{dataset} 方法版本成绩演进]({trend_image})", ""]
 
-    # 当前最佳: rows 按日期升序, 最后一个版本即当前方法; 其 best 即项目当前最佳
+    # 当前最佳: 取全版本 min(best_mae) —— 版本不一定单调变强 (如 v4 路由失效收关),
+    # 不能假设"最新=最佳"。同分时取日期更早者 (先达到者占优)。
     if rows:
-        cur = rows[-1]
+        cur = min(rows, key=lambda r: (r.record.best_mae, r.record.date))
         lines += ["## 当前最佳", "",
                   f"- **{cur.record.version}** ({cur.record.date}): "
                   f"Best MAE **{_fmt_mae3(cur.record.best_mae)}**, "
