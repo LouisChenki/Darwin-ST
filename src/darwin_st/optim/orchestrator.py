@@ -39,6 +39,24 @@ def _finite(x: float) -> bool:
     return x == x and x not in (float("inf"), float("-inf"))
 
 
+def _outcome_kind(status: str, mae: float, fail_reason: str | None) -> str:
+    """child 评测结局分类 (动作账本 outcome 事件; 熔断多候选聚合契约):
+
+      resolved            — 有限 MAE (KEEP/DISCARD 都算: 有真实成绩可判改善与否);
+      operational_failure — 可归因于候选本身的失败: NaN/模型错误/候选自身 OOM (架构过大)
+                            /训练不可用 (计连败; 候选 OOM 是真实的架构信号, graveyard 同款语义);
+      neutral             — 基础设施中断/人工取消 (censored: 解 pending, 不罚族)。
+    枚举式判定, 不用自由文本猜测基础设施类 (OOM/CUDA 一律归候选, 不再归基建)。
+    """
+    if _finite(mae):
+        return "resolved"
+    fr = (fail_reason or "").lower()
+    if any(k in fr for k in ("interrupt", "中断", "cancel", "取消", "worker_gone",
+                             "keyboardinterrupt")):
+        return "neutral"
+    return "operational_failure"
+
+
 def _now_iso() -> str:
     """当前 UTC 时间 ISO8601 (memory 时间戳)。"""
     from datetime import datetime, timezone
@@ -387,6 +405,19 @@ class Orchestrator:
             print(f"[反思] 意外异常 (第 {n} 次): {sig}")
             self.state.history.append({"event": "reflection_failed", "error": sig, "count": n})
 
+    def _note_ledger_outcome_failed(self, e: Exception) -> None:
+        """动作账本 outcome 写失败: 不中止进化, 但限频可见 + history (防精炼永久 pending 无证据)。"""
+        sig = f"{type(e).__name__}: {str(e)[:120]}"
+        counts = getattr(self, "_ledger_outcome_fail_counts", None)
+        if counts is None:
+            counts = self._ledger_outcome_fail_counts = {}
+        counts[sig] = counts.get(sig, 0) + 1
+        n = counts[sig]
+        if n == 1 or n % 10 == 0:
+            print(f"[账本] outcome 写失败 (第 {n} 次): {sig}")
+            self.state.history.append({"event": "ledger_outcome_failed", "error": sig,
+                                       "count": n})
+
     def _on_stream_result(self, res: EvalResult) -> None:
         """流式回调: 消化一个结果 + 轮次 bookkeeping。"""
         self._digest(res)
@@ -443,6 +474,21 @@ class Orchestrator:
                                         adopted=(status == "KEEP"))
                 except Exception:
                     pass   # 履历回填失败不中止优化循环 (自主性铁律)
+
+        # 4b) v2 动作账本 outcome 事件: 精炼熔断的"观察时刻"语义 (异步回填防时间穿越) ——
+        #     breaker 在结果被观察到此点时打开, cooldown 只计此后完成的终态动作。
+        #     写失败不中止 Tier-1, 但必须限频可见 (否则精炼永久 pending 且无证据)。
+        if meta and meta.get("action_id") and self.creation_loop is not None:
+            led = getattr(self.creation_loop, "action_ledger", None)
+            if led is not None:
+                try:
+                    led.outcome(meta["action_id"], meta.get("action_seq") or 0,
+                                meta.get("operator_name", ""),
+                                res.mae if _finite(res.mae) else None,
+                                _outcome_kind(status, res.mae, fail_reason),
+                                max(led.next_seq() - 1, 0))
+                except Exception as e:
+                    self._note_ledger_outcome_failed(e)
 
         # 5) 算子家谱回填: 任何创造 seed (普通创造 v1 或 B2 精炼变体) 的实测 MAE 回写家谱
         #    (lineage + 算子 json)。普通创造的 v1 族也要回填 —— 否则 real_mae 恒 None,

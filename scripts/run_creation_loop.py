@@ -181,7 +181,11 @@ def main():
     ccfg = CreationConfig(n_hypotheses=n_hypo, seed_hpo_trials=seed_hpo_trials,
                           use_proxy=os.environ.get("USE_PROXY", "1") == "1",
                           # B7 辅助任务创造通道 (默认开): 命中自监督/掩码族机制 → 造 aux 损失而非架构算子
-                          enable_aux_creation=os.environ.get("AUX_CREATION", "1") == "1")
+                          enable_aux_creation=os.environ.get("AUX_CREATION", "1") == "1",
+                          # v2 精炼熔断 (默认 0=关, 行为同 v1; v2 服务器显式开)
+                          refine_breaker_failures=_env_int("REFINE_BREAKER_FAILURES", 0),
+                          refine_breaker_cooldown=_env_int("REFINE_BREAKER_COOLDOWN", 5),
+                          refine_min_rel_delta=float(os.environ.get("REFINE_MIN_REL_DELTA", "0.001")))
 
     # B3 评估中间档 (proxy 粗筛): 合成 seed 先在主进程短训打分, 前 proxy_top_k 才给深评大 HPO,
     # 其余小预算浅评 —— 单轮创造 GPU 成本减半以上。只绑主进程一个设备 (PROXY_DEVICE 默认 cuda:0);
@@ -224,6 +228,11 @@ def main():
             sys.exit(2)
         print(f"[配额] aux 覆盖配额开: 每 {aux_force_every} 个 non-aux 动作强制一次 aux "
               f"(可用 aux 卡 {len(avail)} 张)")
+    if ccfg.refine_breaker_failures > 0:
+        print(f"[熔断] 精炼熔断开: 连败 {ccfg.refine_breaker_failures} 次冷却 "
+              f"{ccfg.refine_breaker_cooldown} 动作, 改善阈值 {ccfg.refine_min_rel_delta:.1%}")
+    print(f"[动作账本] {ledger_path}")
+
     cloop = CreationLoop(store, embedder, synth, registry, memory=mem,
                          config=ccfg,
                          llm=llm, archive=CreationArchive(archive_path),

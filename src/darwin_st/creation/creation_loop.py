@@ -63,6 +63,11 @@ class CreationConfig:
     # B7 辅助任务创造通道: True (默认) 且检索命中自监督/掩码族机制 (AUX_MECHANISM_FAMILIES)
     # → 走辅助任务通道 (造自监督辅助损失模块, 挂 genotype aux_op 槽); False → 全部走算子通道 (行为同 B7 前)
     enable_aux_creation: bool = True
+    # v2 精炼熔断 (outcome-aware circuit breaker, 见 refine_breaker.py): failures=0 = 整体关闭
+    # (pending 阻断/冷却/半开/最久未精炼排序全部不启用, 行为同 v1); v2 显式 3/5/0.001。
+    refine_breaker_failures: int = 0     # 连续 N 次父代相对无改善开闸 (>0 启用)
+    refine_breaker_cooldown: int = 5     # 冷却期: 开闸后需完成的终态动作数 → 半开
+    refine_min_rel_delta: float = 0.001  # 父代相对操作性改善阈值 (暂定工程值, 非统计显著)
 
 
 @dataclass
@@ -606,27 +611,33 @@ class CreationLoop:
 
     def maybe_refine(self, round_idx: int = 0, best_genotype: Genotype | None = None,
                      best_hps: dict | None = None, current_best_mae: float | None = None,
-                     dataset: str = "PeMS04") -> CreationOutcome | None:
+                     dataset: str = "PeMS04", preselected=None) -> CreationOutcome | None:
         """从算子家谱挑有潜力的族, 让 LLM 小幅改进族内版本 (FunSearch/ELM 式微进化)。
 
         候选族规则 (保持简单; B4 再加信用分仲裁, 此处不做复杂策略):
           - 族 best_in_family 的 real_mae 有限且有代码 (无实测 MAE 无从判断潜力);
           - 且 (族 best 距当前 best ≤ cfg.refine_mae_window, 或族版本数 < cfg.refine_max_family_versions)。
             current_best_mae 缺省/无效时以各族 best 的最小值为参考 (最强族总会候选)。
-          - 多候选时取族 best MAE 最小者 (前沿优先)。
+          - v2 熔断开 (cfg.refine_breaker_failures>0 且有账本): 滤冷却/pending 族,
+            剩余按"最久未精炼优先"; 关 → 多候选取族 best MAE 最小者 (旧行为)。
+        preselected: orchestrator 预选 (family, best, versions) —— 账本 started 事件要先于
+          LLM 调用记录目标族/父版本/父 MAE, 故选择上移到调用方; None → 内部自选 (旧行为)。
         精炼方式: 族内 ≥2 个版本有实测 MAE → best_shot (FunSearch 双版本对比续写);
         否则按 40/30/30 加权随机 (small/param/struct, 随机源 seed 固定可复现) 精炼族 best 版。
         成功 → register_variant + 复用 _make_seed_genotype 产待评 genotype
-        (_seed_meta 加 is_refinement/family) + 写 B1 履历 (composition=refine:<mode>)。
+        (_seed_meta 加 is_refinement/family) + 写 B1 履历 (composition=refine:<mode>,
+        v2 起带 refine_family/parent_operator/parent_mae_at_proposal 提出时刻记录)。
         返回 None = 无候选族/无精炼器 (调用方回落 maybe_create); 精炼失败返回 success=False。
         """
         if self.refiner is None or self.registry is None:
             return None
-        pick = self._pick_refine_candidate(current_best_mae)
+        pick = preselected if preselected is not None \
+            else self._pick_refine_candidate(current_best_mae)
         if pick is None:
             return None
         family, best, versions = pick
         parent_reg = best["reg_name"]
+        parent_mae = best.get("real_mae")      # 提出时刻父版本实测 MAE (熔断判据锚点)
 
         scored = [v for v in versions if _finite(v.get("real_mae")) and v.get("code")]
         if len(scored) >= 2:
@@ -640,30 +651,52 @@ class CreationLoop:
 
         mechanisms = list(result.plan.source_mechanisms) if result.plan else []
         if not (result.success and result.operator is not None):
-            self._record_refinement(family, mode, result, round_idx, mechanisms=mechanisms)
+            self._record_refinement(family, mode, result, round_idx, mechanisms=mechanisms,
+                                    parent_operator=parent_reg, parent_mae=parent_mae)
             err = (result.last_error or "精炼失败")[:200]
             insight = f"精炼 {family} ({mode}) 未过验证: {err}"
             return CreationOutcome(False, bottleneck=f"refine:{family}", n_hypotheses=1,
-                                   n_success=0, reason=err, insight=insight)
+                                   n_success=0, reason=err, insight=insight,
+                                   action_type="operator_refine")
 
         reg_name = self.registry.register_variant(result.operator, parent_reg, round_idx=round_idx)
         seed = self._make_seed_genotype(best_genotype, reg_name, best_hps)
         seed._seed_meta["is_refinement"] = True   # orchestrator 据此回填 registry real_mae
         seed._seed_meta["family"] = family
         seed._seed_meta["creation_round"] = round_idx  # B4: 结局回授归属轮次
+        if self._action_ctx:                      # v2 账本关联 (orchestrator 回填 outcome 事件用)
+            seed._seed_meta["action_id"] = self._action_ctx.get("action_id")
+            seed._seed_meta["action_seq"] = self._action_ctx.get("action_seq")
         # B3: 与 maybe_create 共用同一套预算分配 (单候选 ≤ top_k 时不调 proxy, 直接大预算)
         proxy_maes = self._assign_seed_budgets([seed])
         self._record_refinement(family, mode, result, round_idx, reg_name=reg_name,
                                 seed_signature=seed.signature(), mechanisms=mechanisms,
-                                proxy_mae=proxy_maes[0], proxy_error=self._last_proxy_errors[0])
+                                proxy_mae=proxy_maes[0], proxy_error=self._last_proxy_errors[0],
+                                parent_operator=parent_reg, parent_mae=parent_mae)
         insight = (f"精炼 {family} ({mode}): {parent_reg} → {reg_name}, 待评测 "
                    f"(族 best MAE={best.get('real_mae')})")
         return CreationOutcome(True, operator_names=[reg_name], seed_genotypes=[seed],
                                bottleneck=f"refine:{family}", n_hypotheses=1, n_success=1,
-                               reason="精炼并注入成功", insight=insight)
+                               reason="精炼并注入成功", insight=insight,
+                               action_type="operator_refine")
+
+    def has_refine_candidate(self, current_best_mae: float | None) -> bool:
+        """preflight: 是否存在可精炼候选族 (纯读不改状态; v2 动作账本的启动前检查用)。"""
+        return self.preselect_refine_candidate(current_best_mae) is not None
+
+    def preselect_refine_candidate(self, current_best_mae: float | None):
+        """预选精炼候选族 (orchestrator 账本 started 需要先知道目标族/父版本)。"""
+        if self.refiner is None or self.registry is None:
+            return None
+        return self._pick_refine_candidate(current_best_mae)
 
     def _pick_refine_candidate(self, current_best_mae: float | None):
-        """候选族选择 (规则见 maybe_refine docstring)。返回 (family, best条目, versions) 或 None。"""
+        """候选族选择 (规则见 maybe_refine docstring)。返回 (family, best条目, versions) 或 None。
+
+        v2 熔断开 (refine_breaker_failures>0 且有动作账本): 滤掉冷却中/有 pending 的族,
+        剩余符合 MAE window 的候选按"最久未精炼优先"排序 (防贪心垄断); 关 → 旧行为
+        (族 best MAE 升序取第一)。
+        """
         scored = []
         for fam in self.registry.families():
             versions = self.registry.family_versions(fam)
@@ -682,6 +715,22 @@ class CreationLoop:
                  or abs(best["real_mae"] - ref) <= self.cfg.refine_mae_window]
         if not cands:
             return None
+        if self.cfg.refine_breaker_failures > 0 and self.action_ledger is not None:
+            from darwin_st.creation.refine_breaker import (
+                family_selectable,
+                replay_refine_breakers,
+            )
+            states = replay_refine_breakers(
+                self.action_ledger, failures=self.cfg.refine_breaker_failures,
+                cooldown=self.cfg.refine_breaker_cooldown,
+                min_rel_delta=self.cfg.refine_min_rel_delta)
+            cands = [c for c in cands if family_selectable(states, c[0])]
+            if not cands:
+                return None                    # 全族冷却/pending → None (回落从零创造)
+            # 最久未精炼优先 (未精炼过的族 seq=-1 最优先), 平手按族 best MAE
+            cands.sort(key=lambda t: (states.get(t[0], {}).get("last_refine_seq", -1)
+                                      if t[0] in states else -1, t[1]["real_mae"]))
+            return cands[0]
         cands.sort(key=lambda t: t[1]["real_mae"])           # 前沿优先: 族 best 最小者
         return cands[0]
 
@@ -689,8 +738,11 @@ class CreationLoop:
                            reg_name: str | None = None, seed_signature: str | None = None,
                            mechanisms: list[str] | None = None,
                            proxy_mae: float | None = None,
-                           proxy_error: str | None = None) -> None:
-        """精炼履历写 B1 履历本: composition 记 refine:<mode>, mechanisms 沿用父版 plan 源机制。"""
+                           proxy_error: str | None = None,
+                           parent_operator: str | None = None,
+                           parent_mae: float | None = None) -> None:
+        """精炼履历写 B1 履历本: composition 记 refine:<mode>, mechanisms 沿用父版 plan 源机制。
+        v2 起带提出时刻记录 (refine_family/parent_operator/parent_mae_at_proposal, 熔断判据锚点)。"""
         if self.archive is None:
             return
         from datetime import datetime, timezone
@@ -713,7 +765,10 @@ class CreationLoop:
             composition=f"refine:{mode}",
             rationale=plan.rationale if plan else "",
             code=code, gate=gate, error=error, seed_signature=seed_signature,
-            proxy_mae=proxy_mae, proxy_error=proxy_error)
+            proxy_mae=proxy_mae, proxy_error=proxy_error,
+            refine_family=family, parent_operator=parent_operator,
+            parent_mae_at_proposal=parent_mae,
+            **self._action_fields())      # v2 动作账本关联
         try:
             self.archive.record(rec)
         except Exception:

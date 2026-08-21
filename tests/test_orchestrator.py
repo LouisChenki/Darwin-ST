@@ -833,3 +833,14 @@ def test_reflection_failure_visible_and_rate_limited(capsys):
     assert len(fails) == 2 and fails[0]["count"] == 1 and fails[1]["count"] == 10
 
 
+def test_ledger_outcome_failure_visible_and_rate_limited(capsys):
+    """账本 outcome 写失败: 限频可见 + history (防精炼永久 pending 无证据)。"""
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=1, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    for _ in range(11):
+        orch._note_ledger_outcome_failed(OSError("只读文件系统"))
+    out = capsys.readouterr().out
+    assert out.count("outcome 写失败") == 2                 # 第 1 次 + 第 10 次
+    fails = [h for h in orch.state.history if h.get("event") == "ledger_outcome_failed"]
+    assert len(fails) == 2 and fails[0]["count"] == 1 and fails[1]["count"] == 10
