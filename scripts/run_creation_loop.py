@@ -236,7 +236,9 @@ def main():
     cloop = CreationLoop(store, embedder, synth, registry, memory=mem,
                          config=ccfg,
                          llm=llm, archive=CreationArchive(archive_path),
-                         proxy_fn=proxy_fn, action_ledger=action_ledger)
+                         proxy_fn=proxy_fn, action_ledger=action_ledger,
+                         # 方向状态同样绑定具体 archive (v1/v2 不串档)
+                         state_path=archive_path + ".direction_state.json")
 
     # 反思巩固 (Reflection Consolidation): 攒够 REFLECT_EVERY 条新履历触发一次 LLM 反思,
     # 蒸馏条件式教训进 insights 表 (Hermes 容量 INSIGHTS_CAPACITY 上限), 并回注合成/诊断 prompt。
@@ -246,7 +248,9 @@ def main():
         from darwin_st.creation.reflection import ReflectionConfig, ReflectionLoop
         rcfg = ReflectionConfig(reflect_every_records=_env_int("REFLECT_EVERY", 20),
                                 insights_capacity=_env_int("INSIGHTS_CAPACITY", 50))
-        cloop.reflection = ReflectionLoop(mem, _CA(archive_path), llm, rcfg)
+        cloop.reflection = ReflectionLoop(mem, _CA(archive_path), llm, rcfg,
+                                          direction_state_path=archive_path
+                                          + ".direction_state.json")
         print(f"[反思] 开: 每 {rcfg.reflect_every_records} 条新创造履历反思一批, "
               f"insights 容量 {rcfg.insights_capacity}")
 
