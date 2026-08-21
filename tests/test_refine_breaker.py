@@ -306,3 +306,44 @@ def test_outcome_kind_enum_classification():
     assert _outcome_kind("KEEP", 18.5, None) == "resolved"
     assert _outcome_kind("CRASH", float("nan"), "all_hpo_trials_failed") \
         == "operational_failure"
+
+
+def test_real_chain_refiner_llm_timeout_is_neutral(tmp_path):
+    """真实链路: OperatorRefiner 的 llm.chat 超时 → last_error 带 LLM_INFRA 标记
+    → _failure_stage_of=llm → terminal → refine_action_result=neutral (不误罚家族)。"""
+    from darwin_st.creation import CreationConfig, CreationLoop, MockLLM, OperatorSynthesizer
+    from darwin_st.creation.synthesizer import SynthesisConfig
+    from darwin_st.optim.orchestrator import Orchestrator
+
+    reg = OperatorRegistry()
+    reg.register(_mkop("FamA", real_mae=18.5))
+    llm = MockLLM(lambda msgs: (_ for _ in ()).throw(TimeoutError("API 超时")))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2))
+    loop = CreationLoop(None, None, synth, reg, config=CreationConfig())
+    outcome = loop.maybe_refine(round_idx=0, current_best_mae=18.5)
+    assert outcome is not None and not outcome.success
+    assert "LLM_INFRA: TimeoutError" in outcome.reason          # 结构化标记穿透包装文本
+    assert Orchestrator._failure_stage_of(outcome) == "llm"
+
+    # 走完账本: terminal(failed, llm) → 聚合 neutral
+    from darwin_st.creation.action_ledger import ActionLedger
+    led = ActionLedger(str(tmp_path / "l.jsonl"))
+    aid = led.start(0, "exp/t", requested_action_type="operator_refine",
+                    action_type="operator_refine", decision_reason="refine_first",
+                    target_refine_family="synth_FamA", parent_operator="synth_FamA",
+                    parent_mae_at_proposal=18.5)
+    led.finish(aid, 0, "failed", failure_stage="llm", candidate_count=0)
+    states = replay_refine_breakers(led, failures=3, cooldown=2)
+    assert states["synth_FamA"]["consecutive_failures"] == 0   # 不罚族
+    assert states["synth_FamA"]["state"] == "closed"
+
+
+def test_outcome_kind_broken_process_pool_is_neutral():
+    """scheduler 的 BrokenProcessPool (worker 池故障) → neutral; 候选 shape/NaN → operational。"""
+    from darwin_st.optim.orchestrator import _outcome_kind
+    assert _outcome_kind("CRASH", float("nan"),
+                         "BrokenProcessPool: A process in the pool was terminated abruptly") \
+        == "neutral"
+    assert _outcome_kind("CRASH", float("nan"), "shape mismatch: expected 307x12") \
+        == "operational_failure"
+    assert _outcome_kind("CRASH", float("nan"), "loss is nan") == "operational_failure"

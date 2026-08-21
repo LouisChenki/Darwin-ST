@@ -34,7 +34,13 @@ from darwin_st.creation.validation import ValidationConfig, validate_aux_operato
 __all__ = ["SynthesisConfig", "SynthesisResult", "AuxSynthesisResult", "OperatorSynthesizer",
            "build_plan_prompt", "build_plan_many_prompt", "build_code_prompt",
            "build_aux_plan_prompt", "build_aux_code_prompt",
-           "extract_code", "extract_json", "extract_json_array", "exec_operator_code"]
+           "extract_code", "extract_json", "extract_json_array", "exec_operator_code",
+           "LLM_INFRA_TAG"]
+
+# 结构化失败归因标记: llm.chat/代码后端异常时 prev_error 带此前缀 —— 下游
+# (orchestrator._failure_stage_of / refine_breaker) 据此把"LLM 基础设施失败"与
+# "候选可归因失败"分开, 不再解析自由文本猜基础设施类 (精炼熔断不因此误罚家族)。
+LLM_INFRA_TAG = "LLM_INFRA: "
 
 
 @dataclass
@@ -417,11 +423,15 @@ class OperatorSynthesizer:
                     instr = self._build_aider_instruction(req, plan, prev_error)
                     code, err = self.code_backend.write_operator(instr)
                     if code is None:
-                        prev_error = f"代码后端失败: {err}"
+                        prev_error = f"{LLM_INFRA_TAG}代码后端失败: {err}"
                         continue
                 else:
-                    code_text = use_llm.chat(build_code_prompt(req, plan, prev_error),
-                                             temperature=temp)
+                    try:
+                        code_text = use_llm.chat(build_code_prompt(req, plan, prev_error),
+                                                 temperature=temp)
+                    except Exception as e:     # LLM 服务异常 = 基础设施, 结构化标记
+                        prev_error = f"{LLM_INFRA_TAG}{type(e).__name__}: {str(e)[:200]}"
+                        continue
                     code = extract_code(code_text)
                 cls = exec_operator_code(code, plan.operator_name)
             except Exception as e:
@@ -513,11 +523,15 @@ class OperatorSynthesizer:
                     instr = self._build_aux_aider_instruction(req, plan, prev_error)
                     code, err = self.code_backend.write_operator(instr)
                     if code is None:
-                        prev_error = f"代码后端失败: {err}"
+                        prev_error = f"{LLM_INFRA_TAG}代码后端失败: {err}"
                         continue
                 else:
-                    code_text = self.llm.chat(build_aux_code_prompt(req, plan, prev_error),
-                                              temperature=temp)
+                    try:
+                        code_text = self.llm.chat(build_aux_code_prompt(req, plan, prev_error),
+                                                  temperature=temp)
+                    except Exception as e:     # LLM 服务异常 = 基础设施, 结构化标记
+                        prev_error = f"{LLM_INFRA_TAG}{type(e).__name__}: {str(e)[:200]}"
+                        continue
                     code = extract_code(code_text)
                 cls = exec_operator_code(code, plan.task_name)
             except Exception as e:

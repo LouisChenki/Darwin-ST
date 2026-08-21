@@ -24,7 +24,12 @@ from dataclasses import dataclass, field
 from darwin_st.creation.contracts import FusionPlan, SynthesizedOperator
 from darwin_st.creation.llm import LLMClient
 from darwin_st.creation.registry import SYNTH_PREFIX, family_of, version_of
-from darwin_st.creation.synthesizer import SynthesisResult, exec_operator_code, extract_code
+from darwin_st.creation.synthesizer import (
+    LLM_INFRA_TAG,
+    SynthesisResult,
+    exec_operator_code,
+    extract_code,
+)
 from darwin_st.creation.validation import ValidationConfig, validate_operator
 
 __all__ = ["RefineConfig", "OperatorRefiner", "REFINE_MODES", "REFINE_MODE_WEIGHTS",
@@ -206,10 +211,14 @@ class OperatorRefiner:
                     instr = "\n".join(m["content"] for m in prompt_fn(prev_error))
                     code, err = self.code_backend.write_operator(instr)
                     if code is None:
-                        prev_error = f"代码后端失败: {err}"
+                        prev_error = f"{LLM_INFRA_TAG}代码后端失败: {err}"
                         continue
                 else:
-                    text = self.llm.chat(prompt_fn(prev_error), temperature=self.cfg.temperature)
+                    try:
+                        text = self.llm.chat(prompt_fn(prev_error), temperature=self.cfg.temperature)
+                    except Exception as e:     # LLM 服务异常 = 基础设施, 结构化标记
+                        prev_error = f"{LLM_INFRA_TAG}{type(e).__name__}: {str(e)[:200]}"
+                        continue
                     code = extract_code(text)
                 cls = exec_operator_code(code, new_name)
             except Exception as e:

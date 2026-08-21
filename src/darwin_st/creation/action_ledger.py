@@ -129,12 +129,38 @@ def _now_iso() -> str:
 
 
 class ActionLedger:
-    """tier2_actions.jsonl 的单写者账本。小文件, 整体重放。"""
+    """tier2_actions.jsonl 的单写者账本。小文件, 整体重放。
+
+    启动时 _repair_tail 安全截断唯一撕裂尾行 (掉电半行): 否则读时虽能忽略它,
+    后续 append 会把它顶成中间坏行 →  replay 永久 fail-closed。
+    """
 
     def __init__(self, path: str):
         self.path = path
         parent = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent, exist_ok=True)
+        self._repair_tail()
+
+    def _repair_tail(self) -> None:
+        """截断不以换行结尾的撕裂尾行 (写盘只以整行+换行为单位, 无尾换行即半行)。"""
+        try:
+            if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
+                return
+            with open(self.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                base = max(0, size - 65536)
+                f.seek(base)
+                tail = f.read()
+            if tail.endswith(b"\n"):
+                return
+            last_nl = tail.rfind(b"\n")
+            new_size = (base + last_nl + 1) if last_nl >= 0 else 0
+            os.truncate(self.path, new_size)
+            print(f"[动作账本] ⚠️ 截断撕裂尾行 {size - new_size} 字节 (掉电半行): {self.path}")
+        except Exception as e:
+            print(f"[动作账本] ⚠️ 尾行修复失败 (replay 将 fail-closed): "
+                  f"{type(e).__name__}: {str(e)[:120]}")
 
     # ------------------------------------------------------------------
     # 写入 (单写者, 逐行 append + fsync)

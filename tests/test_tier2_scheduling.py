@@ -205,3 +205,17 @@ def test_used_insight_ids_cleared_between_actions(tmp_path):
     act = loop.action_ledger.replay()[-1]
     assert act.action_type == "operator_refine"
     assert act.used_insight_ids == []                         # 不串上一动作的 [7, 9]
+
+
+def test_ledger_broken_disables_tier2_keeps_tier1(tmp_path, capsys):
+    """账本 fail-closed: aux_due 重放抛错 → 关 Tier-2 + 告警留痕, _try_creation 返回 False 不炸。"""
+    loop = _FakeLoop(tmp_path)
+    with open(loop.action_ledger.path, "w") as f:           # 中间坏行 → 结构校验 fail closed
+        f.write('{"event":"started","action_id":"a","action_seq":0}\n')
+        f.write("这不是json\n")
+        f.write('{"event":"started","action_id":"b","action_seq":1}\n')
+    orch = _orch(tmp_path, loop, aux_force_every=5)
+    assert orch._try_creation() is False
+    assert orch.creation_loop is None                       # Tier-2 已关闭
+    assert any(h.get("event") == "tier2_disabled_ledger_broken" for h in orch.state.history)
+    assert "关闭 Tier-2" in capsys.readouterr().out

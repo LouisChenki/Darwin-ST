@@ -217,3 +217,22 @@ def test_schema_version_written_and_checked(tmp_path):
         f.write('{"schema_version":99,"event":"started","action_id":"a","action_seq":0}\n')
     with pytest.raises(ActionLedgerError, match="schema_version"):
         led.replay()
+
+
+def test_truncated_tail_repaired_on_reopen_and_continue(tmp_path):
+    """掉电撕裂尾行: 重建账本 → 安全截断 → 继续写 → 完整 replay, next_seq 不重号。"""
+    led = _mk(tmp_path)
+    _action(led, 0, status="succeeded")
+    with open(led.path, "a") as f:                        # 模拟掉电: 半行 started
+        f.write('{"schema_version":1,"event":"started","action_id":"exp/t#a1","acti')
+    led2 = ActionLedger(led.path)                         # 重建 (触发尾行修复)
+    assert len(led2.replay()) == 1                        # 半行被截掉, 旧动作完整
+    aid = led2.start(1, "exp/t", requested_action_type="operator_create",
+                     action_type="operator_create", decision_reason="create_fallback")
+    led2.finish(aid, 1, "failed")
+    acts = led2.replay()                                  # 残缺行没有变成中间坏行
+    assert len(acts) == 2 and all(a.complete for a in acts)
+    assert led2.next_seq() == 2
+    with open(led.path, "rb") as f:                       # 文件以整行结尾
+        f.seek(-1, 2)
+        assert f.read() == b"\n"

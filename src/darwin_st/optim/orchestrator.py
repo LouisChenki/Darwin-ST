@@ -45,14 +45,16 @@ def _outcome_kind(status: str, mae: float, fail_reason: str | None) -> str:
       resolved            — 有限 MAE (KEEP/DISCARD 都算: 有真实成绩可判改善与否);
       operational_failure — 可归因于候选本身的失败: NaN/模型错误/候选自身 OOM (架构过大)
                             /训练不可用 (计连败; 候选 OOM 是真实的架构信号, graveyard 同款语义);
-      neutral             — 基础设施中断/人工取消 (censored: 解 pending, 不罚族)。
+      neutral             — 基础设施中断/人工取消 (censored: 解 pending, 不罚族),
+                            含 BrokenProcessPool 等 worker 池故障 (runtime infrastructure)。
     枚举式判定, 不用自由文本猜测基础设施类 (OOM/CUDA 一律归候选, 不再归基建)。
     """
     if _finite(mae):
         return "resolved"
     fr = (fail_reason or "").lower()
     if any(k in fr for k in ("interrupt", "中断", "cancel", "取消", "worker_gone",
-                             "keyboardinterrupt")):
+                             "keyboardinterrupt", "brokenprocesspool", "processpool",
+                             "terminated abruptly")):
         return "neutral"
     return "operational_failure"
 
@@ -596,10 +598,15 @@ class Orchestrator:
         if self.state.sota_mae is not None and self.state.best_mae < float("inf"):
             gap = self.state.best_mae - self.state.sota_mae
 
-        aux_due = (ledger is not None and self.cfg.aux_force_every > 0
-                   and callable(getattr(cl, "maybe_create_aux_direct", None))
-                   and ledger.aux_due(self.cfg.aux_force_every))
         try:
+            # aux 配额判定 (账本重放): 账本 fail-closed 只关 Tier-2 留痕, Tier-1 继续
+            try:
+                aux_due = (ledger is not None and self.cfg.aux_force_every > 0
+                           and callable(getattr(cl, "maybe_create_aux_direct", None))
+                           and ledger.aux_due(self.cfg.aux_force_every))
+            except Exception as e:
+                self._disable_tier2_on_ledger_error(e)
+                return False
             # 0) 强制 aux (配额到期): preflight 有卡才启动; 选卡先于 started (账本记录真实
             #    选卡, 轮转统计才闭环); 一旦启动, 成败都收尾
             if aux_due and cl.aux_cards_available():
@@ -663,9 +670,20 @@ class Orchestrator:
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            # 创造出错不中止优化
+            # 创造出错不中止优化; 账本结构损坏 (ActionLedgerError 及子类) 同样只关 Tier-2
+            from darwin_st.creation.action_ledger import ActionLedgerError
+            if isinstance(e, ActionLedgerError):
+                self._disable_tier2_on_ledger_error(e)
+                return False
             self.state.history.append({"event": "creation_failed", "error": str(e)[:120]})
             return False
+
+    def _disable_tier2_on_ledger_error(self, e: Exception) -> None:
+        """账本 fail-closed: 关闭本次运行的 Tier-2 创造 + 显式告警留痕, Tier-1 继续。"""
+        sig = f"{type(e).__name__}: {str(e)[:160]}"
+        print(f"[账本] ⚠️ 账本读取/校验失败, 本次运行关闭 Tier-2 创造 (Tier-1 继续): {sig}")
+        self.state.history.append({"event": "tier2_disabled_ledger_broken", "error": sig})
+        self.creation_loop = None
 
     def _run_tier2_action(self, cl, ledger, requested: str, action_type: str,
                           reason: str, fn, started_extra: dict | None = None):
@@ -715,8 +733,11 @@ class Orchestrator:
 
     @staticmethod
     def _failure_stage_of(outcome) -> str | None:
-        """从 outcome.reason 粗分失败阶段 (账本审计用): retrieval/plan/validate/synthesis。"""
+        """失败阶段归类 (账本审计 + 熔断归因): LLM 基础设施 / retrieval / plan / validate /
+        synthesis。LLM_INFRA 标记优先 (结构化归因, 不被"未过验证"包装文本误导)。"""
         r = getattr(outcome, "reason", "") or ""
+        if "LLM_INFRA:" in r:
+            return "llm"
         if "检索无结果" in r:
             return "retrieval"
         if "计划" in r:

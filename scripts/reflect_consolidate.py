@@ -85,7 +85,9 @@ def main() -> int:
         print(f"错误: {e}", file=sys.stderr)
         return 2
 
-    loop = ReflectionLoop(mem, archive, llm, cfg, cursor=0)  # 离线 bootstrap: 从头全量反思
+    loop = ReflectionLoop(mem, archive, llm, cfg, cursor=0,  # 离线 bootstrap: 从头全量反思
+                          # direction_state 与在线路径一致, 绑定具体 archive (不串档)
+                          direction_state_path=archive_path + ".direction_state.json")
 
     n_ok = n_fail = 0
     for i in range(max(args.rounds, 1)):
