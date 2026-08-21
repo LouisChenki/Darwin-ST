@@ -17,10 +17,21 @@
 
 纯函数核 (build/parse/validate/render) 无 LLM/DB 依赖可全测; ReflectionLoop 是薄编排壳,
 所有外部依赖 (store/archive/llm) 注入 → MockLLM 可端到端测。
+
+游标持久化 (fail-closed):
+  行数游标落盘在 <archive路径>.reflect_cursor.json (schema_version/archive_name/cursor),
+  反思全部成功后原子推进 (tmp+replace), 进程重启后续攒增量 (旧版内存快照重启即丢)。
+  恢复语义: 空 archive + 无 cursor → 初始化 0 并立即落盘; 非空 archive + 无 cursor →
+  fail-closed 等待显式 bootstrap (reflect_consolidate.py), 绝不自动快照; 文件损坏 /
+  schema 不支持 / cursor 越界 → 告警 + fail-closed, 不推进也不覆盖旧文件。
+  已知残余风险 (崩溃窗口): insights 已落库但 cursor 未落盘时进程死, 重启会重复应用同批
+  操作 —— ADD 有相似去重兜底, 但 UPVOTE/DOWNVOTE 非幂等 (confidence 可能被重复加减)。
+  写入紧邻使窗口极小, 本轮接受; 长期正解是 cursor 入 SQLite 与 apply_ops 同事务。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -41,6 +52,8 @@ __all__ = [
 ]
 
 VALID_OPS = ("ADD", "EDIT", "UPVOTE", "DOWNVOTE")
+
+CURSOR_SCHEMA_VERSION = 1      # 游标文件 schema (fail-closed 校验用)
 
 
 @dataclass
@@ -369,23 +382,28 @@ def apply_ops(store, accepted: list[dict], cfg: ReflectionConfig) -> dict:
     ADD=insert (conf_init); EDIT=更新文本/条件+并入 evidence_ids;
     UPVOTE=conf+conf_up 封顶 conf_cap (并入新 evidence_ids);
     DOWNVOTE=conf−conf_down, 跌破 conf_delete_below 即删行。
-    返回 {added, edited, upvoted, downvoted, deleted} 计数。
+    返回 {added, edited, upvoted, downvoted, deleted} 计数
+    (+ added_ids/acted_ids: 事件日志的 produced/touched 证据链)。
     """
-    stats = {"added": 0, "edited": 0, "upvoted": 0, "downvoted": 0, "deleted": 0}
+    stats = {"added": 0, "edited": 0, "upvoted": 0, "downvoted": 0, "deleted": 0,
+             "added_ids": [], "acted_ids": []}
     for op in accepted:
         action = op["op"]
         if action == "ADD":
-            store.add_insight(
+            new_id = store.add_insight(
                 insight_text=op["text"], created_at=_now_iso(),
                 dataset=None, condition=op.get("condition") or None,
                 evidence_ids=op["evidence_ids"],
                 confidence=op.get("confidence", _clip_conf(cfg.conf_init)))
             stats["added"] += 1
+            stats["added_ids"].append(new_id)
+            stats["acted_ids"].append(new_id)
             continue
 
         ins = _fetch_insight(store, op["insight_id"])
         if ins is None:                      # 并发被删 → 跳过 (不崩)
             continue
+        stats["acted_ids"].append(ins["id"])
         if action == "EDIT":
             store.update_insight(
                 ins["id"], text=op["text"], condition=op.get("condition") or ins["condition"],
@@ -466,7 +484,8 @@ class ReflectionLoop:
     llm:     LLMClient (MockLLM 可测); temperature 0.3 低随机;
     direction_history: 可选注入 (creation_loop._history); 未注入则读 direction_state.json
     (与履历本同目录, 二选一); 都没有 → 空轨迹。
-    cursor: 行数游标起点; None (默认) = 构造时快照当前履历总数, 只对增量反思 (在线语义);
+    cursor: 行数游标起点; None (默认) = 读持久化游标文件 (fail-closed 语义, 见模块
+    docstring —— 非空履历本+无游标文件时不自动快照, 等待显式 bootstrap);
     显式给 0 → 从头全量反思 (离线 bootstrap 用, 见 scripts/reflect_consolidate.py)。
     """
 
@@ -486,10 +505,108 @@ class ReflectionLoop:
                 os.path.dirname(os.path.abspath(archive.path)), "direction_state.json")
         else:
             self._direction_state_path = None
-        # 行数游标: None → 启动快照 (只对增量反思); 显式值 → 从该位置起
-        self._cursor = self._count_records() if cursor is None else cursor
+        self._cursor_blocked: str | None = None      # 非 None = fail-closed 阻塞原因
+        self._blocked_calls = 0
+        # 行数游标: None → 持久化文件解析 (fail-closed); 显式值 → 从该位置起
+        self._cursor = self._init_cursor() if cursor is None else cursor
 
     # ------------------------------------------------------------------
+    # 游标持久化 (fail-closed; 语义见模块 docstring)
+    # ------------------------------------------------------------------
+
+    def _cursor_path(self) -> str | None:
+        """游标文件绑定具体 archive (同目录不串档): <archive>.reflect_cursor.json。"""
+        return (self.archive.path + ".reflect_cursor.json") if self.archive is not None else None
+
+    def _events_path(self) -> str | None:
+        """反思事件日志 (append-only): 绑定具体 archive (<archive>.reflection_events.jsonl),
+        同目录多 archive 不串运行。"""
+        if self.archive is None:
+            return None
+        return self.archive.path + ".reflection_events.jsonl"
+
+    def _init_cursor(self) -> int:
+        total = self._count_records()
+        cpath = self._cursor_path()
+        if cpath is None:
+            return 0
+        if not os.path.exists(cpath):
+            if total == 0:
+                if self._write_cursor(0):        # 全新履历本: 立即落 0, 重启可续
+                    return 0
+                # 初始化写失败也算 fail-closed (否则与"游标丢失"无法区分)
+                self._cursor_blocked = "cursor_init_write_failed"
+                self.log_fn(f"[反思] ⚠️ 游标初始化落盘失败: fail-closed, 不处理任何履历")
+                return 0
+            self._cursor_blocked = "missing_cursor_nonempty_archive"
+            self.log_fn(f"[反思] ⚠️ 游标文件缺失且履历本非空 ({total} 行): fail-closed, "
+                        f"不自动快照; 请用 reflect_consolidate.py 显式 bootstrap")
+            return total                       # 占位: n_new=0, 不误处理历史
+        try:
+            with open(cpath, encoding="utf-8") as f:
+                data = json.load(f)
+            if (not isinstance(data, dict)
+                    or data.get("schema_version") != CURSOR_SCHEMA_VERSION
+                    or not isinstance(data.get("cursor"), int)
+                    or isinstance(data.get("cursor"), bool) or data["cursor"] < 0):
+                raise ValueError("schema_version/cursor 非法")
+            cur = data["cursor"]
+        except Exception as e:
+            self._cursor_blocked = "corrupt_cursor_file"
+            self.log_fn(f"[反思] ⚠️ 游标文件损坏 ({type(e).__name__}: {str(e)[:80]}): "
+                        f"fail-closed, 不推进不覆盖旧文件: {cpath}")
+            return total
+        if cur > total:
+            self._cursor_blocked = "cursor_beyond_archive"
+            self.log_fn(f"[反思] ⚠️ 游标 ({cur}) 超出履历本行数 ({total}): 履历本疑被替换/截断, "
+                        f"fail-closed 等待人工恢复, 旧游标文件保留")
+            return total
+        return cur
+
+    def _write_cursor(self, cursor: int) -> bool:
+        """原子落盘 (tmp+replace+fsync); 失败只告警, 旧文件不动。返回是否成功。"""
+        cpath = self._cursor_path()
+        if cpath is None:
+            return False
+        payload = {"schema_version": CURSOR_SCHEMA_VERSION,
+                   "archive_name": os.path.basename(self.archive.path),   # 仅诊断, 不做路径相等校验
+                   "cursor": cursor}
+        tmp = cpath + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, cpath)
+            return True
+        except Exception as e:
+            self.log_fn(f"[反思] ⚠️ 游标落盘失败 (旧文件未动): {type(e).__name__}: {str(e)[:120]}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False
+
+    def _log_event(self, event: dict) -> None:
+        """反思事件 append-only 落盘 (证据链, 不依赖可能截断的 state.history)。"""
+        epath = self._events_path()
+        if epath is None:
+            return
+        try:
+            with open(epath, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": _now_iso(), **event}, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            self.log_fn(f"[反思] ⚠️ 事件日志写入失败: {type(e).__name__}: {str(e)[:120]}")
+
+    def _prompt_template_hash(self) -> str:
+        """静态 prompt 模板 (system) 的短哈希 —— provenance 用, 不含动态记录。"""
+        return hashlib.sha256(_build_system(self.cfg).encode("utf-8")).hexdigest()[:16]
+
+    def _llm_model(self) -> str:
+        return str(getattr(self.llm, "model", None) or type(self.llm).__name__)
 
     def _count_records(self) -> int:
         try:
@@ -524,20 +641,32 @@ class ReflectionLoop:
         """攒够 cfg.reflect_every_records 条新履历 (或 force) 就反思一批, 否则返回 None。
 
         流程: 取增量记录 (带行号) → 墓地摘要 + 现有 insights + 方向轨迹 → prompt →
-        llm.chat(temperature=0.3) → parse → validate → apply_ops → 容量淘汰 → 游标推进。
+        llm.chat(temperature=0.3) → parse → validate → apply_ops → 容量淘汰 → 游标推进+落盘
+        → 事件日志 (reflection_events.jsonl, provenance 证据链)。
         LLM/解析异常返回 {"error": ...} 不抛出 (反思是低频增益, 绝不中止进化)。
         解析/LLM 失败时游标不推进, 下批重试 (记录不丢)。
+        fail-closed 阻塞 (游标缺失/损坏/越界) 时限频告警并返回 None。
         """
+        if self._cursor_blocked is not None:
+            self._blocked_calls += 1
+            if self._blocked_calls == 1 or self._blocked_calls % 10 == 0:
+                self.log_fn(f"[反思] fail-closed 阻塞中 ({self._cursor_blocked}), "
+                            f"本次跳过 (第 {self._blocked_calls} 次)")
+            return None
         total = self._count_records()
         n_new = total - self._cursor
         if not force and n_new < self.cfg.reflect_every_records:
+            if 0 < n_new:                    # 进度可见 (每轮最多一行): 攒了多少/游标在哪
+                self.log_fn(f"[反思] 进度: 新创造履历 {n_new}/{self.cfg.reflect_every_records} "
+                            f"(cursor={self._cursor}/{total})")
             return None
         if n_new <= 0:
             return None
 
         all_records = self._load_records()
+        cursor_start = self._cursor
         new_records = []
-        for idx, rec in enumerate(all_records[self._cursor:], start=self._cursor + 1):
+        for idx, rec in enumerate(all_records[cursor_start:], start=cursor_start + 1):
             d = dict(rec)
             d["row_id"] = idx                 # 行号 (1 起) = LLM 可引用的证据 id
             new_records.append(d)
@@ -560,6 +689,10 @@ class ReflectionLoop:
         except Exception as e:
             self.log_fn(f"[反思] LLM 调用异常, 本批跳过 (游标不动, 下批重试): "
                         f"{type(e).__name__}: {str(e)[:120]}")
+            self._log_event({"event": "reflection_batch",
+                             "source_cursor_start": cursor_start, "source_cursor_end": None,
+                             "model": self._llm_model(), "n_new_records": n_new,
+                             "error": f"llm: {type(e).__name__}: {str(e)[:200]}"})
             return {"error": f"llm: {type(e).__name__}: {str(e)[:200]}",
                     "n_new_records": n_new}
         try:
@@ -567,6 +700,10 @@ class ReflectionLoop:
         except Exception as e:
             self.log_fn(f"[反思] 输出解析失败, 本批跳过 (游标不动, 下批重试): "
                         f"{type(e).__name__}: {str(e)[:120]}")
+            self._log_event({"event": "reflection_batch",
+                             "source_cursor_start": cursor_start, "source_cursor_end": None,
+                             "model": self._llm_model(), "n_new_records": n_new,
+                             "error": f"parse: {type(e).__name__}: {str(e)[:200]}"})
             return {"error": f"parse: {type(e).__name__}: {str(e)[:200]}",
                     "n_new_records": n_new}
 
@@ -574,6 +711,17 @@ class ReflectionLoop:
         apply_stats = apply_ops(self.store, accepted, self.cfg)
         evicted = self._enforce_capacity()
         self._cursor = total                 # 成功批才推进游标
+        cursor_committed = self._write_cursor(total)   # 原子落盘 (失败只告警, 不毁旧文件)
+        self._log_event({"event": "reflection_batch",
+                         "source_cursor_start": cursor_start, "source_cursor_end": total,
+                         "cursor_committed": cursor_committed,
+                         "prompt_template_hash": self._prompt_template_hash(),
+                         "model": self._llm_model(), "n_new_records": n_new,
+                         "n_ops": len(ops), "n_accepted": len(accepted),
+                         "n_rejected": len(rejected),
+                         "produced_insight_ids": apply_stats["added_ids"],
+                         "acted_insight_ids": apply_stats["acted_ids"],
+                         "evicted": evicted})
 
         report = {
             "n_new_records": n_new,

@@ -817,3 +817,19 @@ def test_island_reset_reseeds_evolution():
         orch.evo.reseed([e.genotype for e in orch.archive.elites()])
     assert cleared > 0
     assert reseeded["n"] > 0   # 存活精英确实回灌
+
+
+def test_reflection_failure_visible_and_rate_limited(capsys):
+    """反思意外异常: 打印 + state.history 留痕, 同签名首报+每10次重报 (不再静默裸吞)。"""
+    cfg = OrchestratorConfig(dataset="PeMS04", population_size=4, tournament_size=2,
+                             max_rounds=1, target_mae=0.0)
+    orch = Orchestrator(cfg, _make_eval_fn(), devices=1)
+    e = RuntimeError("db 写锁")
+    for _ in range(11):
+        orch._note_reflection_failed(e)
+    out = capsys.readouterr().out
+    assert out.count("意外异常") == 2                       # 第 1 次 + 第 10 次 (每 10 次重报)
+    fails = [h for h in orch.state.history if h.get("event") == "reflection_failed"]
+    assert len(fails) == 2 and fails[0]["count"] == 1 and fails[1]["count"] == 10
+
+

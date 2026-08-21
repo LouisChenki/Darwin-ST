@@ -221,7 +221,7 @@ def main():
         rcfg = ReflectionConfig(reflect_every_records=_env_int("REFLECT_EVERY", 20),
                                 insights_capacity=_env_int("INSIGHTS_CAPACITY", 50))
         cloop.reflection = ReflectionLoop(mem, _CA(archive_path), llm, rcfg)
-        print(f"[反思] 开: 每 {rcfg.reflect_every_records} 条新履历反思一批, "
+        print(f"[反思] 开: 每 {rcfg.reflect_every_records} 条新创造履历反思一批, "
               f"insights 容量 {rcfg.insights_capacity}")
 
     # 权重存档 (默认关): CHECKPOINT_DIR 非空 → 训练中刷新纪录的模型权重落盘该目录,

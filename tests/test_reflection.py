@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -73,8 +74,8 @@ def _make_loop(tmp_path, responder=None, cfg=None, n_records=0, store=None, **kw
         arch.record(_rec(op=f"synth_{i}", rnd=i))
     store = store or MemoryStore(":memory:")
     llm = MockLLM(responder or (lambda m: "[]"))
-    loop = ReflectionLoop(store, arch, llm, cfg or ReflectionConfig(),
-                          log_fn=lambda *a: None, **kw)
+    kw.setdefault("log_fn", lambda *a: None)
+    loop = ReflectionLoop(store, arch, llm, cfg or ReflectionConfig(), **kw)
     return loop, arch, llm
 
 
@@ -315,15 +316,101 @@ def test_cursor_threshold_and_force(tmp_path):
     assert rep is not None and rep["n_new_records"] == 5
 
 
-def test_cursor_init_skips_backlog(tmp_path):
-    """在线语义: 构造时快照为游标, 历史积压不反思, 只对增量反思。"""
+def test_cursor_missing_nonempty_archive_fail_closed(tmp_path):
+    """fail-closed: 非空履历本 + 无游标文件 → 阻塞, 不自动快照 (防误跳历史)。"""
+    logs = []
     loop, arch, llm = _make_loop(tmp_path, cfg=ReflectionConfig(reflect_every_records=2),
-                                 n_records=10)
-    assert loop.maybe_reflect() is None                  # 10 条积压不算增量
-    arch.record(_rec(op="synth_new", rnd=99))
-    arch.record(_rec(op="synth_new2", rnd=100))
+                                 n_records=10, log_fn=lambda *a: logs.append(" ".join(map(str, a))))
+    assert loop._cursor_blocked == "missing_cursor_nonempty_archive"
+    for i in range(3):                       # 新增 3 条 (>= 阈值) 也不触发
+        arch.record(_rec(op=f"synth_new{i}", rnd=i))
+    assert loop.maybe_reflect() is None
+    assert llm.call_count == 0
+    assert any("fail-closed" in s for s in logs)
+
+
+def test_cursor_persisted_across_restart(tmp_path):
+    """重启续攒: 进程 A 未攒满退出, 进程 B 从持久化游标继续累计 (治 B7 v1 反思失效根因)。"""
+    cfg = ReflectionConfig(reflect_every_records=3)
+    loop_a, arch, llm_a = _make_loop(tmp_path, cfg=cfg)     # 空履历本 → 游标 0 落盘
+    assert json.loads(open(str(arch.path) + ".reflect_cursor.json").read())["cursor"] == 0
+    arch.record(_rec(op="synth_1", rnd=1))                  # A 存活期只攒了 2 条 (< 3)
+    arch.record(_rec(op="synth_2", rnd=2))
+    assert loop_a.maybe_reflect() is None
+    # 模拟重启: 同 archive 路径新实例 —— 游标从文件来 (0), 不是内存快照 (2)
+    loop_b, _, llm_b = _make_loop(tmp_path, cfg=cfg)
+    assert loop_b._cursor == 0 and loop_b._cursor_blocked is None
+    arch.record(_rec(op="synth_3", rnd=3))                  # B 再攒 1 条, 凑满 3
+    rep = loop_b.maybe_reflect()
+    assert rep is not None and rep["n_new_records"] == 3    # 增量跨进程累计 → 触发
+    assert json.loads(open(str(arch.path) + ".reflect_cursor.json").read())["cursor"] == 3
+
+
+def test_cursor_corrupt_fail_closed_preserves_file(tmp_path):
+    """游标文件损坏 → 阻塞 + 旧文件不被覆盖。"""
+    _, arch, _ = _make_loop(tmp_path, cfg=ReflectionConfig(reflect_every_records=1),
+                            n_records=2)
+    cpath = str(arch.path) + ".reflect_cursor.json"
+    with open(cpath, "w") as f:
+        f.write("{不是合法 json")
+    loop2, _, llm2 = _make_loop(tmp_path, cfg=ReflectionConfig(reflect_every_records=1))
+    assert loop2._cursor_blocked == "corrupt_cursor_file"
+    assert loop2.maybe_reflect() is None and llm2.call_count == 0
+    assert open(cpath).read() == "{不是合法 json"            # 旧文件原样保留
+
+
+def test_cursor_beyond_archive_fail_closed(tmp_path):
+    """游标 > 履历本行数 (疑被替换/截断) → 阻塞告警, 不静默停摆。"""
+    _, arch, _ = _make_loop(tmp_path, cfg=ReflectionConfig(reflect_every_records=1),
+                            n_records=2)
+    cpath = str(arch.path) + ".reflect_cursor.json"
+    with open(cpath, "w") as f:
+        json.dump({"schema_version": 1, "archive_name": "a.jsonl", "cursor": 99}, f)
+    loop2, _, _ = _make_loop(tmp_path, cfg=ReflectionConfig(reflect_every_records=1))
+    assert loop2._cursor_blocked == "cursor_beyond_archive"
+    assert loop2.maybe_reflect() is None
+
+
+def test_explicit_bootstrap_writes_cursor(tmp_path):
+    """显式 bootstrap (cursor=0, 离线 consolidation 路径): 成功后游标文件 = 履历本行数。"""
+    loop, arch, _ = _make_loop(tmp_path, cfg=ReflectionConfig(reflect_every_records=2),
+                               n_records=4, cursor=0)
     rep = loop.maybe_reflect()
-    assert rep is not None and rep["n_new_records"] == 2
+    assert rep is not None and rep["n_new_records"] == 4
+    data = json.loads(open(str(arch.path) + ".reflect_cursor.json").read())
+    assert data["cursor"] == 4 and data["schema_version"] == 1
+    assert data["archive_name"] == "a.jsonl"                # 仅诊断字段
+
+
+def test_noop_batch_advances_cursor_and_event(tmp_path):
+    """合法 NOOP (LLM 返回空操作): 批次正确推进 + 事件日志记录。"""
+    loop, arch, _ = _make_loop(tmp_path, cfg=ReflectionConfig(reflect_every_records=2),
+                               n_records=2, cursor=0)
+    rep = loop.maybe_reflect()
+    assert rep is not None and rep["n_ops"] == 0 and rep["accepted"] == 0
+    assert loop._cursor == 2
+    events = [json.loads(l) for l in
+              open(str(arch.path) + ".reflection_events.jsonl")]
+    ev = events[-1]
+    assert ev["source_cursor_start"] == 0 and ev["source_cursor_end"] == 2
+    assert ev["n_ops"] == 0 and ev["produced_insight_ids"] == []
+    assert ev["prompt_template_hash"] and ev["model"]
+    assert ev["cursor_committed"] is True
+
+
+def test_cursor_write_failure_preserves_old(tmp_path, monkeypatch):
+    """游标落盘失败: 旧文件不损坏, 不炸, 批次结果照常返回。"""
+    loop, arch, _ = _make_loop(tmp_path, cfg=ReflectionConfig(reflect_every_records=2),
+                               n_records=2, cursor=0)
+    cpath = str(arch.path) + ".reflect_cursor.json"
+    with open(cpath, "w") as f:
+        json.dump({"schema_version": 1, "archive_name": "a.jsonl", "cursor": 0}, f)
+    import darwin_st.creation.reflection as refl
+    monkeypatch.setattr(refl.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("盘满")))
+    rep = loop.maybe_reflect()                              # 不抛异常
+    assert rep is not None and "error" not in rep
+    assert json.loads(open(cpath).read())["cursor"] == 0    # 旧文件原样
+
 
 
 def test_end_to_end_mixed_accept_reject(tmp_path):
@@ -609,3 +696,16 @@ def test_build_user_caps_existing_insights():
     assert "另有 4 条旧教训从略" in user
     user2 = build_reflection_prompt([], "", ins[:2], [], cfg)[1]["content"]
     assert "从略" not in user2
+
+
+def test_cursor_init_write_failure_fail_closed(tmp_path, monkeypatch):
+    """空履历本游标初始化落盘失败 → fail-closed (与"游标丢失"可区分), 不静默继续。"""
+    import darwin_st.creation.reflection as refl
+    monkeypatch.setattr(refl.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("盘满")))
+    logs = []
+    loop, arch, llm = _make_loop(tmp_path, cfg=ReflectionConfig(reflect_every_records=1),
+                                 log_fn=lambda *a: logs.append(" ".join(map(str, a))))
+    assert loop._cursor_blocked == "cursor_init_write_failed"
+    arch.record(_rec(op="synth_x", rnd=0))
+    assert loop.maybe_reflect() is None and llm.call_count == 0
+    assert any("fail-closed" in s for s in logs)

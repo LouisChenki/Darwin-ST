@@ -359,16 +359,28 @@ class Orchestrator:
                 if cleared:
                     self.evo.reseed([e.genotype for e in self.archive.elites()])
         # 反思巩固 (Reflection Consolidation): 创造检查同级, 攒够新履历才真反思 (低频)。
-        # 异常吞掉不中止进化 (反思是低频增益, 非必需; 自定义 loop 可无 reflection 属性)。
+        # 异常吞掉不中止进化, 但必须可见: 打印 + state.history, 同签名限频 (首报+每10次重报)。
         if self.creation_loop is not None:
             try:
                 reflection = getattr(self.creation_loop, "reflection", None)
                 if reflection is not None:
                     reflection.maybe_reflect()
-            except Exception:
-                pass
+            except Exception as e:
+                self._note_reflection_failed(e)
         if self.on_round is not None:
             self.on_round(self.state)
+
+    def _note_reflection_failed(self, e: Exception) -> None:
+        """反思意外异常: 不中止进化, 但留痕 (服务器日志轮转后仍可统计故障率)。"""
+        sig = f"{type(e).__name__}: {str(e)[:120]}"
+        counts = getattr(self, "_reflection_fail_counts", None)
+        if counts is None:
+            counts = self._reflection_fail_counts = {}
+        counts[sig] = counts.get(sig, 0) + 1
+        n = counts[sig]
+        if n == 1 or n % 10 == 0:
+            print(f"[反思] 意外异常 (第 {n} 次): {sig}")
+            self.state.history.append({"event": "reflection_failed", "error": sig, "count": n})
 
     def _on_stream_result(self, res: EvalResult) -> None:
         """流式回调: 消化一个结果 + 轮次 bookkeeping。"""
