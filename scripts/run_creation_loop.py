@@ -207,10 +207,27 @@ def main():
               f"batches/epoch={ccfg.proxy_max_batches} top_k={ccfg.proxy_top_k} "
               f"小预算={ccfg.small_hpo_trials}")
 
+    # v2 Tier-2 动作账本 (<archive>.tier2_actions.jsonl, 绑定具体履历本防串档):
+    # started/terminal 两事件生命周期; AUX_FORCE_EVERY>0 开启 aux 覆盖配额 (默认 0=关,
+    # 行为同 v1)。启动预检: 配额开启时必须存在可用 aux 卡, 否则启动失败 (运行期
+    # unavailable 是异常退化路径, 不是常态调度)。
+    from darwin_st.creation.action_ledger import ActionLedger
+    ledger_path = archive_path + ".tier2_actions.jsonl"
+    action_ledger = ActionLedger(ledger_path)
+    aux_force_every = _env_int("AUX_FORCE_EVERY", 0)
+    if aux_force_every > 0:
+        from darwin_st.creation.creation_loop import AUX_MECHANISM_FAMILIES as _AUX_FAMS
+        avail = [n for n in _AUX_FAMS if store.get_mechanism(n) is not None]
+        if not avail:
+            print(f"错误: AUX_FORCE_EVERY={aux_force_every} 但机制库无可用 aux 卡 "
+                  f"(AUX_MECHANISM_FAMILIES {len(_AUX_FAMS)} 张全缺)", file=sys.stderr)
+            sys.exit(2)
+        print(f"[配额] aux 覆盖配额开: 每 {aux_force_every} 个 non-aux 动作强制一次 aux "
+              f"(可用 aux 卡 {len(avail)} 张)")
     cloop = CreationLoop(store, embedder, synth, registry, memory=mem,
                          config=ccfg,
                          llm=llm, archive=CreationArchive(archive_path),
-                         proxy_fn=proxy_fn)
+                         proxy_fn=proxy_fn, action_ledger=action_ledger)
 
     # 反思巩固 (Reflection Consolidation): 攒够 REFLECT_EVERY 条新履历触发一次 LLM 反思,
     # 蒸馏条件式教训进 insights 表 (Hermes 容量 INSIGHTS_CAPACITY 上限), 并回注合成/诊断 prompt。
@@ -276,7 +293,9 @@ def main():
                              hpo_trials_base=_env_int("HPO_TRIALS_BASE", 4),
                              hpo_trials_cap=_env_int("HPO_TRIALS_CAP", 12),
                              hpo_trials_k=float(os.environ.get("HPO_TRIALS_K", "2.0")),
-                             hpo_trials_eps=float(os.environ.get("HPO_TRIALS_EPS", "0.3")))
+                             hpo_trials_eps=float(os.environ.get("HPO_TRIALS_EPS", "0.3")),
+                             # v2 aux 覆盖配额 (默认 0=关, 行为同 v1; v2 服务器显式设 5)
+                             aux_force_every=aux_force_every)
 
     def on_round(state):
         b = state.best_mae

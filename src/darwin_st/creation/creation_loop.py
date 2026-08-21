@@ -78,6 +78,9 @@ class CreationOutcome:
     n_success: int = 0                     # 成功合成的数
     reason: str = ""
     insight: str = ""
+    # v2 动作账本: 实际执行的 action_type (operator_create/operator_refine/aux_create)
+    # —— maybe_create 内部可能自然路由到 aux 通道, 调用方以此为准记 terminal
+    action_type: str = ""
 
     # 向后兼容单算子访问
     @property
@@ -169,7 +172,7 @@ class CreationLoop:
                  registry: OperatorRegistry, memory=None, config: CreationConfig | None = None,
                  llm=None, archive=None, refiner: OperatorRefiner | None = None,
                  proxy_fn=None, temperature: float = 0.8, state_path: str | None = None,
-                 reflection=None):
+                 reflection=None, action_ledger=None):
         self.store = store
         self.embedder = embedder
         self.synthesizer = synthesizer
@@ -180,6 +183,14 @@ class CreationLoop:
         self.archive = archive               # CreationArchive (B1 履历本); None=不记录, 行为不变
         # 反思巩固环节 (ReflectionLoop, 可选注入): None → 不反思也不注入经验, 行为与接入前一致
         self.reflection = reflection
+        # v2 Tier-2 动作账本 (ActionLedger, 可选注入): None → 不写账本 (行为同 v1);
+        # 配额/熔断的重放数据源, 见 action_ledger.py 模块 docstring
+        self.action_ledger = action_ledger
+        # 当前动作上下文 (orchestrator 动作开始时 set_action_ctx 注入): 履历记录据此带
+        # action_id/action_seq/run_tag; None → 履历不带 (v1 行为)
+        self._action_ctx: dict | None = None
+        # 最近一次动作 prompt 实际注入的 insight id 列表 (账本 used_insight_ids 证据链)
+        self._last_used_insight_ids: list = []
         # B3 proxy 粗筛: proxy_fn(genotype) -> float (短训 val MAE), 设备/数据绑定由外部注入;
         # None 或 cfg.use_proxy=False → 全部 seed 走大预算, 行为与 B3 之前完全一致
         self.proxy_fn = proxy_fn
@@ -212,13 +223,102 @@ class CreationLoop:
             self._state_path = None
         self._restore_direction_state()      # 文件存在则回放; 坏文件/不存在 → 空启动
 
+    def set_action_ctx(self, action_id: str | None, action_seq: int | None,
+                       run_tag: str | None) -> None:
+        """orchestrator 动作开始时注入动作上下文 (履历记录带 action_id/seq/run_tag)。
+
+        副作用: 动作级 insight collector 初始化 —— 防上一动作使用的 insight 串记到
+        本动作 (refine 不注入 insight, 必须记空列表)。"""
+        self._last_used_insight_ids = []
+        self._action_ctx = {"action_id": action_id, "action_seq": action_seq,
+                            "run_tag": run_tag} if action_id is not None else None
+
+    def _action_fields(self) -> dict:
+        """履历记录的动作账本字段 (无上下文 → 全 None, 旧行为)。"""
+        ctx = self._action_ctx or {}
+        return {"action_id": ctx.get("action_id"), "action_seq": ctx.get("action_seq"),
+                "run_tag": ctx.get("run_tag")}
+
+    def aux_cards_available(self) -> bool:
+        """preflight: 机制库中是否存在可用 aux 卡 (AUX_MECHANISM_FAMILIES)。"""
+        try:
+            return any(self.store.get_mechanism(name) is not None
+                       for name in AUX_MECHANISM_FAMILIES)
+        except Exception:
+            return False
+
+    def pick_aux_mechanisms(self, bottleneck: str = "", max_pick: int = 2) -> list:
+        """强制 aux 的选卡: 历史尝试最少优先 (账本 selected_mechanism_ids 统计, 按动作去重),
+        平手按当前瓶颈与卡文本 (abstract_function+preconditions) 的词重叠二次排序。
+
+        返回机制卡对象列表 (无可用卡 → [])。"""
+        cards = []
+        for name in AUX_MECHANISM_FAMILIES:
+            m = self.store.get_mechanism(name)
+            if m is not None:
+                cards.append(m)
+        if not cards:
+            return []
+        counts = self.action_ledger.aux_mechanism_use_counts() if self.action_ledger else {}
+
+        def _rel(card) -> int:   # 瓶颈相关性: 词重叠数 (轻量 tie-break, 不引入嵌入打分)
+            if not bottleneck:
+                return 0
+            text = f"{card.abstract_function} {' '.join(card.preconditions)}"
+            bt = set(re.findall(r"[a-z0-9]+|[一-鿿]", bottleneck.lower()))
+            ct = set(re.findall(r"[a-z0-9]+|[一-鿿]", text.lower()))
+            return len(bt & ct)
+
+        cards.sort(key=lambda c: (counts.get(c.name, 0), -_rel(c), c.name))
+        return cards[:max_pick]
+
+    def maybe_create_aux_direct(self, best_genotype: Genotype | None,
+                                run_tag: str = "exp/auto", dataset: str = "PeMS04",
+                                best_trace: dict | None = None,
+                                best_hps: dict | None = None,
+                                mechanisms: list | None = None) -> CreationOutcome:
+        """强制 aux 通道 (配额驱动): 绕过检索, 直接从 AUX_MECHANISM_FAMILIES 选卡合成。
+
+        与自然路由 (_should_create_aux 命中) 共用 _maybe_create_aux 的合成/七门/proxy 链路;
+        区别仅在机制来源 (配额选卡而非检索命中) —— 履历/账本会记 route 来源, 不叙述为
+        "检索自然涌现"。mechanisms: orchestrator 预选 (账本 started 需先记录真实选卡,
+        轮转统计才闭环); None → 内部按最少尝试轮转自选。
+        """
+        bottleneck, _ = self._diagnose(best_genotype, None, best_trace, dataset=dataset)
+        cur_mae = None
+        if best_trace is not None and best_trace.get("best_mae") not in (None, float("inf")):
+            cur_mae = best_trace.get("best_mae")
+        round_idx = self._round_idx
+        self._history.append({"round": round_idx, "bottleneck": bottleneck,
+                              "preconditions": [], "result_mae": cur_mae, "score": 0.0})
+        self._round_idx += 1
+        self._persist_direction_state()
+
+        mechs = mechanisms if mechanisms is not None else self.pick_aux_mechanisms(bottleneck)
+        if not mechs:
+            return CreationOutcome(False, bottleneck=bottleneck,
+                                   reason="无可用 aux 机制卡", action_type="aux_create")
+        req = FusionRequest(
+            bottleneck=bottleneck, target_preconditions=[], mechanisms=mechs,
+            baseline_operator=(best_genotype.blocks[0].spatial_op if best_genotype else ""))
+        exemplars = None
+        if self.archive is not None:
+            ctx = self.archive.exemplar_context()
+            if ctx["successes"] or ctx["failures"]:
+                exemplars = ctx
+        insights = self._prompt_insights(dataset)
+        return self._maybe_create_aux(req, best_genotype, [m.name for m in mechs], round_idx,
+                                      best_hps=best_hps, exemplars=exemplars, insights=insights)
+
     def _prompt_insights(self, dataset: str) -> list[dict] | None:
         """反思经验注入口 (合成与诊断对称): memory 非 None 且 insights 非空 → 取 top-N。
 
         需接入 reflection (ReflectionLoop) 才生效 —— insights 表只由反思环节写入,
         未接反思时表恒空, 返回 None → 下游 prompt 与现状逐字节一致 (回归铁律)。
         读库异常 → None (经验注入是增益, 不中止创造闭环)。
+        副作用: 记录实际注入的 insight id (self._last_used_insight_ids, 账本证据链用)。
         """
+        self._last_used_insight_ids = []
         if self.memory is None or self.reflection is None:
             return None
         try:
@@ -226,6 +326,8 @@ class CreationLoop:
                 dataset, limit=self.reflection.cfg.prompt_top_n)
         except Exception:
             return None
+        if insights:
+            self._last_used_insight_ids = [i.get("id") for i in insights]
         return insights or None
 
     def _diagnose(self, best_genotype: Genotype | None, sota_gap: float | None,
@@ -332,7 +434,7 @@ class CreationLoop:
             insight = f"融合 {mech_names} 解决'{bottleneck}': {len(results)} 个假设均未过验证"
             return CreationOutcome(False, bottleneck=bottleneck, retrieved_mechanisms=mech_names,
                                    n_hypotheses=len(results), n_success=0,
-                                   reason=err[:200], insight=insight)
+                                   reason=err[:200], insight=insight, action_type="operator_create")
 
         # 4) 注入所有成功算子 + 各产出一个待评 genotype (+ B1 成功履历, 带注册名与 seed 签名)
         op_names, seeds = [], []
@@ -341,6 +443,9 @@ class CreationLoop:
             op_names.append(reg_name)
             seed = self._make_seed_genotype(best_genotype, reg_name, best_hps)
             seed._seed_meta["creation_round"] = round_idx  # B4: 结局回授归属的诊断轮次
+            if self._action_ctx:                  # v2 账本关联 (orchestrator 回填 outcome 事件用)
+                seed._seed_meta["action_id"] = self._action_ctx.get("action_id")
+                seed._seed_meta["action_seq"] = self._action_ctx.get("action_seq")
             seeds.append(seed)
 
         # B3 proxy 粗筛: 短训排序分预算 (前 top_k 深评, 其余浅评), proxy 分+失败原因进履历
@@ -360,7 +465,7 @@ class CreationLoop:
             True, operator_names=op_names, seed_genotypes=seeds,
             bottleneck=bottleneck, retrieved_mechanisms=mech_names,
             n_hypotheses=len(results), n_success=len(successes),
-            reason="合成并注入成功", insight=insight)
+            reason="合成并注入成功", insight=insight, action_type="operator_create")
 
     # ------------------------------------------------------------------
     # B7 辅助任务创造通道 (自监督辅助损失的 合成→注册→seed; 路由判据见 _should_create_aux)
@@ -388,11 +493,14 @@ class CreationLoop:
             insight = f"辅助任务 {mech_names} 解决'{req.bottleneck}': 未过防泄漏验证门"
             return CreationOutcome(False, bottleneck=req.bottleneck,
                                    retrieved_mechanisms=mech_names, n_hypotheses=1, n_success=0,
-                                   reason=err[:200], insight=insight)
+                                   reason=err[:200], insight=insight, action_type="aux_create")
 
         reg_name = self.registry.register_aux(result.operator)
         seed = self._make_seed_aux_genotype(best_genotype, reg_name, best_hps)
         seed._seed_meta["creation_round"] = round_idx   # B4: 结局回授归属的诊断轮次
+        if self._action_ctx:                      # v2 账本关联
+            seed._seed_meta["action_id"] = self._action_ctx.get("action_id")
+            seed._seed_meta["action_seq"] = self._action_ctx.get("action_seq")
         # B3: 与算子通道共用同一套预算分配 (单候选 ≤ top_k 时不调 proxy, 直接大预算)
         proxy_maes = self._assign_seed_budgets([seed])
         if self.archive is not None:
@@ -406,7 +514,8 @@ class CreationLoop:
         return CreationOutcome(True, operator_names=[reg_name], seed_genotypes=[seed],
                                bottleneck=req.bottleneck, retrieved_mechanisms=mech_names,
                                n_hypotheses=1, n_success=1,
-                               reason="辅助任务合成并注入成功", insight=insight)
+                               reason="辅助任务合成并注入成功", insight=insight,
+                               action_type="aux_create")
 
     def _make_seed_aux_genotype(self, best: Genotype | None, reg_name: str,
                                 best_hps: dict | None = None) -> Genotype:
@@ -462,7 +571,8 @@ class CreationLoop:
             rationale=plan.rationale if plan else "",
             code=code, gate=gate, error=error, seed_signature=seed_signature,
             proxy_mae=proxy_mae,          # B3: proxy 粗筛分 (未走 proxy 路径为 None)
-            proxy_error=proxy_error)      # B3: proxy 失败原因 (异常摘要/"inf"; 成功为 None)
+            proxy_error=proxy_error,      # B3: proxy 失败原因 (异常摘要/"inf"; 成功为 None)
+            **self._action_fields())      # v2 动作账本关联
         try:
             self.archive.record(rec)
         except Exception:
@@ -733,7 +843,8 @@ class CreationLoop:
             rationale=plan.rationale if plan else "",
             code=code, gate=gate, error=error, seed_signature=seed_signature,
             proxy_mae=proxy_mae,          # B3: proxy 粗筛分 (未走 proxy 路径为 None)
-            proxy_error=proxy_error)      # B3: proxy 失败原因 (异常摘要/"inf"; 成功为 None)
+            proxy_error=proxy_error,      # B3: proxy 失败原因 (异常摘要/"inf"; 成功为 None)
+            **self._action_fields())      # v2 动作账本关联 (无上下文 → None, 旧行为)
         try:
             self.archive.record(rec)
         except Exception:

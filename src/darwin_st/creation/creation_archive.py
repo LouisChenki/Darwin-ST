@@ -47,6 +47,14 @@ class CreationRecord:
     adopted: bool | None = None          # 回填: seed 评测结局 (KEEP=True)
     proxy_mae: float | None = None       # B3 proxy 粗筛短训分 (未走 proxy 路径/旧履历行为 None)
     proxy_error: str | None = None       # B3 proxy 失败原因 (异常摘要或 "inf"; 成功/未走 proxy 为 None)
+    # v2 动作账本关联 (可选; 旧履历行为 None —— 动作粒度统计自 v2 起可用, 不追溯换算)
+    action_id: str | None = None         # 所属 Tier-2 动作 (一次动作多假设共用一个 id)
+    action_seq: int | None = None        # 动作序号 (顺序权威, 见 action_ledger)
+    run_tag: str | None = None           # 产生该履历的运行 (v1/v2 共用 archive 时区分来源)
+    # v2 精炼提出时刻记录 (F3 熔断判据; 提出时刻的父版本信息, 防时间穿越)
+    refine_family: str | None = None     # 精炼目标族 (非精炼为 None)
+    parent_operator: str | None = None   # 父版本注册名
+    parent_mae_at_proposal: float | None = None  # 提出时刻父版本实测 MAE
 
 
 class CreationArchive:

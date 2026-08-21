@@ -118,6 +118,11 @@ class OrchestratorConfig:
     # B2 微进化节奏: 停滞触发创造时, 先尝试族内精炼 (maybe_refine), 无候选族 (返回 None)
     #   才回落从零创造 (maybe_create)。保持简单二档; B4 将加信用分仲裁, 此处不做复杂策略。
     refine_first: bool = True
+    # v2 aux 覆盖配额 (aux-coverage-constrained Tier-2 scheduling): >0 时, 每积累 N 个
+    #   non-aux 终态动作 (按动作账本重放) 强制一次 aux 创造 (绕过检索直接选卡);
+    #   默认 0 = 关闭 (行为同 v1)。env AUX_FORCE_EVERY。预检无可用 aux 卡 → 回落并记
+    #   aux_unavailable_fallback (不重置配额计数)。
+    aux_force_every: int = 0
     # 停滞重置的最小相对改进阈值 (修"微改进饿杀创造"): best 相对改进 ≥ 此值才重置停滞计数,
     #   更小的微改进照常计停滞。线上实证: best 在 18.949 平台时每隔 1-2 轮出现 0.001-0.003
     #   (相对 <0.02%) 的训练噪声级"改进"重置计数, patience=6 永远蓄不满, 创造迟迟不触发。
@@ -525,51 +530,170 @@ class Orchestrator:
         return self.state
 
     def _try_creation(self) -> bool:
-        """停滞时触发 Tier-2 创造: B2 起【精炼优先】——先族内微进化, 无候选再从零创造。
+        """停滞时触发 Tier-2 动作: v2 三段决策 aux 配额 → refine-first → 从零创造。
 
-        节奏 (见 OrchestratorConfig.refine_first, 默认开):
-          1. creation_loop.maybe_refine(): 有候选族 → 精炼算子家谱 → 待评 genotype 入队;
-             返回 None (无候选族/无精炼器) → 2。
-          2. creation_loop.maybe_create(): 原从零跨域创造。
-        失败/无创造层都不中止循环(自主性: 创造是低频增益, 非必需)。返回 True 表示有 seed 入队
-        (调用方据此进精修窗口); False 表示无创造层/无产出/出错(调用方走 island_reset)。
+        aux-coverage-constrained scheduling (见 OrchestratorConfig.aux_force_every):
+          0. aux_due (账本重放 non-aux 终态动作数 ≥ 配额) 且 preflight 有 aux 卡
+             → 强制 aux (绕过检索选卡), 成败均收尾, 不回落;
+             preflight 无卡 → 回落 refine/create, 记 aux_unavailable_fallback (不重置配额);
+          1. refine_first: 有候选族 (preflight) → 族内精炼;
+          2. 回落从零跨域创造。
+        动作账本 (creation_loop.action_ledger, None → 不写账本, 行为同 v1):
+        一次触发 = 一个动作 = started/terminal 两事件 (捕获中断记 interrupted 并重抛)。
+        失败/无创造层都不中止循环。返回 True 表示有 seed 入队; False 表示无产出/出错。
         """
         if self.creation_loop is None:
             return False
+        cl = self.creation_loop
+        ledger = getattr(cl, "action_ledger", None)
         gap = None
         if self.state.sota_mae is not None and self.state.best_mae < float("inf"):
             gap = self.state.best_mae - self.state.sota_mae
+
+        aux_due = (ledger is not None and self.cfg.aux_force_every > 0
+                   and callable(getattr(cl, "maybe_create_aux_direct", None))
+                   and ledger.aux_due(self.cfg.aux_force_every))
         try:
-            outcome = None
-            kind = "create"
+            # 0) 强制 aux (配额到期): preflight 有卡才启动; 选卡先于 started (账本记录真实
+            #    选卡, 轮转统计才闭环); 一旦启动, 成败都收尾
+            if aux_due and cl.aux_cards_available():
+                mechs = cl.pick_aux_mechanisms() if callable(
+                    getattr(cl, "pick_aux_mechanisms", None)) else None
+                if mechs:
+                    outcome = self._run_tier2_action(
+                        cl, ledger, requested="aux_create", action_type="aux_create",
+                        reason="forced_aux_quota",
+                        started_extra={"selected_mechanism_ids": [m.name for m in mechs]},
+                        fn=lambda: cl.maybe_create_aux_direct(
+                            self.state.best_genotype, run_tag=self.cfg.run_tag,
+                            dataset=self.cfg.dataset, best_trace=self.state.best_trace,
+                            best_hps=self.state.best_hps, mechanisms=mechs))
+                    return self._adopt_creation_outcome(outcome, kind_hint="aux")
+            # aux 配额到期但无卡 (或选卡为空) → 回落, requested 仍记 aux_create (配额不重置)
+            requested = "aux_create" if aux_due else None
+            reason = "aux_unavailable_fallback" if aux_due else None
+
+            # 1) refine-first (v2: preflight 有候选族才启动动作; v1 兼容: 无 preflight/无账本
+            #    走旧语义 —— maybe_refine 返回 None 再回落 create)
             if self.cfg.refine_first:
-                maybe_refine = getattr(self.creation_loop, "maybe_refine", None)
+                maybe_refine = getattr(cl, "maybe_refine", None)
+                preflight = getattr(cl, "preselect_refine_candidate", None)
                 if callable(maybe_refine):
-                    outcome = maybe_refine(round_idx=self.state.rounds,
-                                           best_genotype=self.state.best_genotype,
-                                           best_hps=self.state.best_hps,
-                                           current_best_mae=self.state.best_mae,
-                                           dataset=self.cfg.dataset)
-                    if outcome is not None:
-                        kind = "refine"
-            if outcome is None:
-                outcome = self.creation_loop.maybe_create(
+                    if ledger is not None and callable(preflight):
+                        pick = preflight(self.state.best_mae)
+                        if pick is not None:
+                            fam, best, _versions = pick
+                            outcome = self._run_tier2_action(
+                                cl, ledger, requested=requested or "operator_refine",
+                                action_type="operator_refine", reason=reason or "refine_first",
+                                started_extra={"target_refine_family": fam,
+                                               "parent_operator": best.get("reg_name"),
+                                               "parent_mae_at_proposal": best.get("real_mae")},
+                                fn=lambda: maybe_refine(round_idx=self.state.rounds,
+                                                        best_genotype=self.state.best_genotype,
+                                                        best_hps=self.state.best_hps,
+                                                        current_best_mae=self.state.best_mae,
+                                                        dataset=self.cfg.dataset,
+                                                        preselected=pick))
+                            return self._adopt_creation_outcome(outcome, kind_hint="refine")
+                    else:
+                        outcome = maybe_refine(round_idx=self.state.rounds,
+                                               best_genotype=self.state.best_genotype,
+                                               best_hps=self.state.best_hps,
+                                               current_best_mae=self.state.best_mae,
+                                               dataset=self.cfg.dataset)
+                        if outcome is not None:
+                            return self._adopt_creation_outcome(outcome, kind_hint="refine")
+
+            # 2) 从零跨域创造
+            outcome = self._run_tier2_action(
+                cl, ledger, requested=requested or "operator_create",
+                action_type="operator_create", reason=reason or "create_fallback",
+                fn=lambda: cl.maybe_create(
                     self.state.best_genotype, sota_gap=gap,
                     run_tag=self.cfg.run_tag, dataset=self.cfg.dataset,
-                    best_trace=self.state.best_trace, best_hps=self.state.best_hps)
-            if outcome.success and outcome.seed_genotypes:
-                self._pending_seed_genotypes.extend(outcome.seed_genotypes)
-                self.state.history.append({"event": "creation", "kind": kind,
-                                           "operators": outcome.operator_names,
-                                           "bottleneck": outcome.bottleneck,
-                                           "n_success": outcome.n_success})
-                # 进程后端: 新 synth 算子已 persist → 需 refresh_workers 让新 worker load_persisted。
-                # 流式下池常忙, 不能直接 shutdown (会 cancel 在飞丢结果) → 设标志, 由 run_stream 屏障
-                # 排空在飞后再 refresh (线程后端 no-op; 主进程 SPATIAL_OPS 已含新算子)。
-                self._pending_refresh = True
-                return True
-            return False
+                    best_trace=self.state.best_trace, best_hps=self.state.best_hps))
+            return self._adopt_creation_outcome(outcome)
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
             # 创造出错不中止优化
             self.state.history.append({"event": "creation_failed", "error": str(e)[:120]})
             return False
+
+    def _run_tier2_action(self, cl, ledger, requested: str, action_type: str,
+                          reason: str, fn, started_extra: dict | None = None):
+        """账本生命周期包裹一个 Tier-2 动作: started → fn() → terminal。
+
+        ledger=None → 直接执行 (v1 行为)。terminal_status: succeeded (有 seed 产出) /
+        failed (LLM/解析/验证未过) / interrupted (捕获中断, 重抛)。实际执行类型与意图
+        不同 (如 create 自然路由进 aux) → terminal 记 final_action_type/final_decision_reason。
+        started_extra: started 事件附加字段 (refine 的 target_refine_family/parent_operator/
+        parent_mae_at_proposal —— 提出时刻记录, 熔断判据锚点)。
+        """
+        if ledger is None:
+            return fn()
+        seq = ledger.next_seq()
+        aid = ledger.start(seq, self.cfg.run_tag, requested_action_type=requested,
+                           action_type=action_type, decision_reason=reason,
+                           **(started_extra or {}))
+        cl.set_action_ctx(aid, seq, self.cfg.run_tag)
+        try:
+            outcome = fn()
+        except KeyboardInterrupt:
+            ledger.finish(aid, seq, "interrupted", failure_stage="interrupt")
+            raise
+        except Exception as e:
+            ledger.finish(aid, seq, "failed",
+                          failure_stage=f"exception:{type(e).__name__}")
+            self.state.history.append({"event": "creation_failed", "action_id": aid,
+                                       "error": str(e)[:120]})
+            return None
+        finally:
+            cl.set_action_ctx(None, None, None)
+        if outcome is None:                  # 动作未真正执行 (如无候选族) → 记 unavailable
+            ledger.finish(aid, seq, "unavailable", failure_stage="no_candidate")
+            return None
+        ok = bool(outcome.success and outcome.seed_genotypes)
+        final_type = getattr(outcome, "action_type", "") or action_type
+        final_reason = None
+        if final_type != action_type:
+            final_reason = "natural_aux" if final_type == "aux_create" else final_type
+        ledger.finish(aid, seq, "succeeded" if ok else "failed",
+                      failure_stage=None if ok else self._failure_stage_of(outcome),
+                      candidate_count=len(outcome.seed_genotypes),
+                      used_insight_ids=getattr(cl, "_last_used_insight_ids", []),
+                      final_action_type=final_type if final_type != action_type else None,
+                      final_decision_reason=final_reason)
+        return outcome
+
+    @staticmethod
+    def _failure_stage_of(outcome) -> str | None:
+        """从 outcome.reason 粗分失败阶段 (账本审计用): retrieval/plan/validate/synthesis。"""
+        r = getattr(outcome, "reason", "") or ""
+        if "检索无结果" in r:
+            return "retrieval"
+        if "计划" in r:
+            return "plan"
+        if "验证" in r or "门" in r:
+            return "validate"
+        return "synthesis"
+
+    def _adopt_creation_outcome(self, outcome, kind_hint: str = "create") -> bool:
+        """动作产物入队 + history 留痕。True=有 seed (调用方进精修窗口)。
+
+        kind 保持 v1 取值 (create/refine) 以兼容下游统计; aux_create → "aux"。"""
+        if outcome is None or not (outcome.success and outcome.seed_genotypes):
+            return False
+        self._pending_seed_genotypes.extend(outcome.seed_genotypes)
+        _KIND = {"operator_create": "create", "operator_refine": "refine", "aux_create": "aux"}
+        kind = _KIND.get(getattr(outcome, "action_type", "") or "", kind_hint)
+        self.state.history.append({"event": "creation", "kind": kind,
+                                   "operators": outcome.operator_names,
+                                   "bottleneck": outcome.bottleneck,
+                                   "n_success": outcome.n_success})
+        # 进程后端: 新 synth 算子已 persist → 需 refresh_workers 让新 worker load_persisted。
+        # 流式下池常忙, 不能直接 shutdown (会 cancel 在飞丢结果) → 设标志, 由 run_stream 屏障
+        # 排空在飞后再 refresh (线程后端 no-op; 主进程 SPATIAL_OPS 已含新算子)。
+        self._pending_refresh = True
+        return True

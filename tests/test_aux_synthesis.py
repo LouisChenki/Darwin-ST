@@ -477,3 +477,88 @@ def test_route_aux_failure_discipline(monkeypatch, tmp_path):
     assert rec.composition == "aux:sensor"              # 失败也记设计表掩码模式
     assert rec.operator_name == "aux_sensor_mask"       # 无注册名 → 记 plan 的 task_name
     assert rec.error and "static_leak" in rec.error
+
+
+# ---------------------------------------------------------------------------
+# v2 强制 aux 通道 (配额驱动, 绕过检索; 见 action_ledger/orchestrator 三段调度)
+# ---------------------------------------------------------------------------
+
+
+def _store_with_aux_cards(names=("masked_autoencoding", "contrastive_learning")):
+    store = InMemoryGraphStore(HashEmbedder(dim=256))
+    by_name = {m.name: m for m in all_seed_mechanisms()}
+    for n in names:
+        store.add_mechanism(by_name[n])
+    return store
+
+
+def test_aux_cards_available_preflight():
+    """preflight: 库里有/无 aux 卡。"""
+    loop_ok = CreationLoop(_store_with_aux_cards(), None, None, OperatorRegistry())
+    assert loop_ok.aux_cards_available() is True
+    store_empty = InMemoryGraphStore(HashEmbedder(dim=256))
+    by_name = {m.name: m for m in all_seed_mechanisms()}
+    store_empty.add_mechanism(by_name["state_space_model"])     # 非 aux 卡
+    loop_no = CreationLoop(store_empty, None, None, OperatorRegistry())
+    assert loop_no.aux_cards_available() is False
+
+
+def test_pick_aux_mechanisms_least_tried_rotation(tmp_path):
+    """强制选卡: 历史尝试最少优先 (账本统计), 不重复砸同一张卡。"""
+    from darwin_st.creation.action_ledger import ActionLedger
+    store = _store_with_aux_cards()
+    ledger = ActionLedger(str(tmp_path / "tier2_actions.jsonl"))
+    loop = CreationLoop(store, None, None, OperatorRegistry(), action_ledger=ledger)
+    first = loop.pick_aux_mechanisms(max_pick=1)[0].name
+    # 记一次实际启动的 aux 动作 (选了 first)
+    aid = ledger.start(0, "exp/t", requested_action_type="aux_create",
+                       action_type="aux_create", decision_reason="forced_aux_quota",
+                       selected_mechanism_ids=[first])
+    ledger.finish(aid, 0, "failed")
+    second = loop.pick_aux_mechanisms(max_pick=1)[0].name
+    assert second != first                                      # 轮到尝试次数更少的卡
+
+
+def test_maybe_create_aux_direct_end_to_end(tmp_path):
+    """强制 aux 全链: 绕过检索直接合成 → 七门 → register_aux → seed 挂 aux_op → 履历带动作上下文。"""
+    from darwin_st.creation.action_ledger import ActionLedger
+    resp = iter([_AUX_PLAN, _AUX_GOOD_CODE])
+    llm = MockLLM(lambda msgs: next(resp))
+    synth = OperatorSynthesizer(llm, SynthesisConfig(max_retries=2))
+    reg = OperatorRegistry()
+    store = _store_with_aux_cards()
+    arch = CreationArchive(str(tmp_path / "a.jsonl"))
+    ledger = ActionLedger(str(tmp_path / "tier2_actions.jsonl"))
+    loop = CreationLoop(store, None, synth, reg, config=CreationConfig(),
+                        archive=arch, action_ledger=ledger)
+    loop.set_action_ctx("exp/t#a0", 0, "exp/t")
+    best = Genotype(blocks=[STBlock("gcn", "tcn")])
+    outcome = loop.maybe_create_aux_direct(best, run_tag="exp/t", best_hps={"lr": 1e-3})
+    assert outcome.success, outcome.reason
+    assert outcome.action_type == "aux_create"
+    assert outcome.operator_name.startswith("aux_")
+    assert outcome.seed_genotypes[0].aux_op == outcome.operator_name
+    recs = arch._load()
+    assert len(recs) == 1
+    assert recs[0].composition.startswith("aux:")                # aux:<mask_pattern>
+    assert recs[0].action_id == "exp/t#a0" and recs[0].action_seq == 0
+    assert recs[0].run_tag == "exp/t"
+
+
+def test_maybe_create_aux_direct_no_cards(tmp_path):
+    """无可用 aux 卡 → 失败 outcome (不抛异常; preflight 本该拦住, 这里是防御)。"""
+    store = InMemoryGraphStore(HashEmbedder(dim=256))           # 空库
+    loop = CreationLoop(store, None, None, OperatorRegistry())
+    outcome = loop.maybe_create_aux_direct(None)
+    assert not outcome.success and "无可用 aux 机制卡" in outcome.reason
+    assert outcome.action_type == "aux_create"
+
+
+def test_set_action_ctx_clears_insight_collector(tmp_path):
+    """set_action_ctx 初始化动作级 insight collector (防跨动作串值)。"""
+    loop = CreationLoop(InMemoryGraphStore(HashEmbedder(dim=256)), None, None,
+                        OperatorRegistry())
+    loop._last_used_insight_ids = [1, 2, 3]
+    loop.set_action_ctx("a0", 0, "exp/t")
+    assert loop._last_used_insight_ids == []
+    assert loop._action_ctx["action_id"] == "a0"
