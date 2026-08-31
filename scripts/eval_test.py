@@ -141,7 +141,16 @@ def main() -> int:
                             seq_len_in=profile.seq_len_in, seq_len_out=profile.seq_len_out,
                             adj=adj, dropout=float(hps.get("dropout", 0.0)),
                             num_heads=hps.get("num_heads")).to(device)
-        model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+        sd = torch.load(ckpt_path, map_location=device, weights_only=True)
+        try:
+            model.load_state_dict(sd)
+        except RuntimeError:
+            # 历史 checkpoint 兼容: tier2v1 及更早的预测头是 self.head (Linear);
+            # 现为 out_proj (head() 变为方法)。同一线性层, 纯改名 —— 键映射后等价加载
+            sd = {("out_proj." + k[5:] if k.startswith("head.") else k): v
+                  for k, v in sd.items()}
+            model.load_state_dict(sd)
+            print("[兼容] 旧 checkpoint 的 head.* 已映射为 out_proj.* 加载")
         batch_size = int(hps.get("batch_size", 64))
         met_val = P.evaluate(model, data_dir, "val", batch_size, device=device,
                              null_val=profile.null_val)
@@ -152,7 +161,7 @@ def main() -> int:
                "offset_test_minus_val": met_test["mae"] - met_val["mae"]}
         results.append(rec)
         print(f"[seed {seed}] val MAE={met_val['mae']:.4f} | test MAE={met_test['mae']:.4f} "
-              f"| RMSE={met_test['rmse']:.3f} | MAPE={met_test['mape']:.2f}% "
+              f"| RMSE={met_test['rmse']:.3f} | MAPE={met_test['mape'] * 100:.2f}% "
               f"| test−val={rec['offset_test_minus_val']:+.4f}")
 
     # ---- 4) 汇总 ----

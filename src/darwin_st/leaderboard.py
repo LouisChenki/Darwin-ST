@@ -371,6 +371,8 @@ class VersionRecord:
     - tag: 该版本的 git tag 或 commit (无则 None)。
     - retrospective: 对应 docs/ 复盘文档的仓库相对路径 (无则 None)。
     - model_dir: 该版本最佳模型在完整存档里的相对目录 (有存档则填, 供"当前最佳"链接)。
+    - best_test_mae / test_std / n_seeds: E1 口径对齐复评 (test 集, 多 seed 重训) 的结果;
+      有才填。位次计算优先用 test 口径 (与文献 test MAE 同炉可比), 无则退回 val。
     """
 
     version: str
@@ -381,6 +383,9 @@ class VersionRecord:
     title: str = ""
     retrospective: str | None = None
     model_dir: str | None = None
+    best_test_mae: float | None = None
+    test_std: float | None = None
+    n_seeds: int | None = None
 
 
 @dataclass
@@ -391,6 +396,7 @@ class VersionRow:
     rank: int                 # 该版本最佳在与 baseline 混排榜上的位次 (从 1)
     board_size: int           # 混排榜总行数 (baseline 数 + 1)
     vs_sota: float | None     # best_mae - sota_mae (正=落后 SOTA)
+    basis: str = "val"        # 位次口径: "test"=test 复评值混排 (同炉可比) / "val"=历史 val 值
 
 
 def parse_versions(data: list[dict]) -> list[VersionRecord]:
@@ -402,6 +408,9 @@ def parse_versions(data: list[dict]) -> list[VersionRecord]:
             best_mae=float(d["best_mae"]), dataset=str(d["dataset"]),
             tag=d.get("tag"), title=str(d.get("title", "")),
             retrospective=d.get("retrospective"), model_dir=d.get("model_dir"),
+            best_test_mae=(float(d["best_test_mae"]) if d.get("best_test_mae") is not None else None),
+            test_std=(float(d["test_std"]) if d.get("test_std") is not None else None),
+            n_seeds=(int(d["n_seeds"]) if d.get("n_seeds") is not None else None),
         ))
     return records
 
@@ -421,10 +430,14 @@ def build_version_rows(
     baseline_maes = [e["mae"] for e in baselines.values() if e.get("mae") is not None]
     rows = []
     for rec in sorted(versions, key=lambda r: (r.date, r.version)):
-        rank = 1 + sum(1 for m in baseline_maes if m <= rec.best_mae)
+        # 位次口径: 有 test 复评值的用 test (与文献 test MAE 同炉可比), 否则退回历史 val
+        basis = "test" if rec.best_test_mae is not None else "val"
+        mae_used = rec.best_test_mae if basis == "test" else rec.best_mae
+        rank = 1 + sum(1 for m in baseline_maes if m <= mae_used)
         rows.append(VersionRow(
             record=rec, rank=rank, board_size=len(baseline_maes) + 1,
-            vs_sota=(rec.best_mae - sota_mae) if sota_mae is not None else None,
+            vs_sota=(mae_used - sota_mae) if sota_mae is not None else None,
+            basis=basis,
         ))
     return rows
 
@@ -448,8 +461,8 @@ def render_version_board_md(
     if sota_name and sota_mae is not None:
         lines.append(f"参照 SOTA: **{sota_name}** (MAE {sota_mae:.2f}); MAE 越低越好。")
         lines.append("")
-    lines += ["| 版本 | 日期 | Best MAE | vs SOTA | 榜单位次 | Tag | 复盘 |",
-              "|---|---|---:|---:|---:|---|---|"]
+    lines += ["| 版本 | 日期 | Best val MAE | Test MAE (复评) | vs SOTA | 榜单位次 | Tag | 复盘 |",
+              "|---|---|---:|---:|---:|---:|---|---|"]
     for r in rows:
         rec = r.record
         ver = f"**{rec.version}**"
@@ -459,16 +472,24 @@ def render_version_board_md(
         # README 落在 leaderboard/ 下, 仓库根相对路径 (docs/...) 需上跳一级才可在 GitHub 解析
         retro = (f"[复盘](../{rec.retrospective})" if rec.retrospective and not rec.retrospective.startswith("../")
                  else (f"[复盘]({rec.retrospective})" if rec.retrospective else "—"))
+        if rec.best_test_mae is not None:
+            std_s = f" ± {rec.test_std:.3f}" if rec.test_std else ""
+            n_s = f" (n={rec.n_seeds})" if rec.n_seeds else ""
+            test_cell = f"**{_fmt_mae3(rec.best_test_mae)}**{std_s}{n_s}"
+        else:
+            test_cell = "—"
+        rank_s = f"**{r.rank}** / {r.board_size}" + ("" if r.basis == "test" else "<br>(val 口径)")
         lines.append(
-            f"| {ver} | {rec.date} | **{_fmt_mae3(rec.best_mae)}** | "
-            f"{_fmt_delta(r.vs_sota)} | **{r.rank}** / {r.board_size} | {tag} | {retro} |"
+            f"| {ver} | {rec.date} | **{_fmt_mae3(rec.best_mae)}** | {test_cell} | "
+            f"{_fmt_delta(r.vs_sota)} | {rank_s} | {tag} | {retro} |"
         )
     lines += ["",
               f"> 位次口径: 该版本最佳单独与已发表 baseline 混排 (不同版本互不占位); "
               f"完整模型存档见 [{dataset}.md]({dataset}.md)。", "",
-              "> ⚠️ **指标口径声明**: 本项目版本行 Best MAE 为**验证集 (val) MAE** "
-              "(split 6/2/2, masked metric, 12 horizons 平均); 已发表 baseline/SOTA 数值为**文献报告的 test MAE**。"
-              "两者口径不同, 混排位次仅供演进参照, 不构成严格可比的排名结论。", ""]
+              "> **指标口径说明**: 「Best val MAE」为验证集历史成绩 (split 6/2/2, masked metric, "
+              "12 horizons 平均); 「Test MAE (复评)」为 E1 口径对齐后 test 集多 seed 重评值 "
+              "——与文献报告的 test MAE 同口径可比。无复评值的版本行位次仍以 val 标注; "
+              "有复评值的版本行位次按 test 计算。", ""]
     return "\n".join(lines)
 
 
@@ -498,16 +519,23 @@ def render_version_readme_md(
         lines += ["## 成绩随版本演进", "",
                   f"![{dataset} 方法版本成绩演进]({trend_image})", ""]
 
-    # 当前最佳: 取全版本 min(best_mae) —— 版本不一定单调变强 (如 v4 路由失效收关),
-    # 不能假设"最新=最佳"。同分时取日期更早者 (先达到者占优)。
+    # 当前最佳: 有 test 复评值的版本按 test 口径比 (与文献同炉可比, 论文口径);
+    # 无 test 复评值的版本回退 val。两组口径不混排 (test 组优先)。
     if rows:
-        cur = min(rows, key=lambda r: (r.record.best_mae, r.record.date))
-        lines += ["## 当前最佳", "",
-                  f"- **{cur.record.version}** ({cur.record.date}): "
-                  f"Best MAE **{_fmt_mae3(cur.record.best_mae)}**, "
-                  f"榜单位次 **{cur.rank}** / {cur.board_size}" +
-                  (f", 距 SOTA ({sota_name} {sota_mae:.2f}) {_fmt_delta(cur.vs_sota)}"
-                   if sota_mae is not None else "")]
+        cur = min(rows, key=lambda r: (0 if r.record.best_test_mae is not None else 1,
+                                       r.record.best_test_mae if r.record.best_test_mae is not None
+                                       else r.record.best_mae, r.record.date))
+        best_line = (f"- **{cur.record.version}** ({cur.record.date}): "
+                     f"Best val MAE **{_fmt_mae3(cur.record.best_mae)}**")
+        if cur.record.best_test_mae is not None:
+            std_s = f" ± {cur.record.test_std:.3f}" if cur.record.test_std else ""
+            n_s = f" ({cur.record.n_seeds} seeds)" if cur.record.n_seeds else ""
+            best_line += f", Test MAE **{_fmt_mae3(cur.record.best_test_mae)}**{std_s}{n_s}"
+        best_line += (f", 榜单位次 **{cur.rank}** / {cur.board_size}"
+                      + (" (test 口径)" if cur.basis == "test" else " (val 口径)"))
+        if cur.vs_sota is not None and sota_mae is not None:
+            best_line += f", 距 SOTA ({sota_name} {sota_mae:.2f}) {_fmt_delta(cur.vs_sota)}"
+        lines += ["## 当前最佳", "", best_line]
         if cur.record.model_dir:
             lines.append(f"- 模型卡: [{cur.record.model_dir}]({cur.record.model_dir}/)")
         if cur.record.tag:

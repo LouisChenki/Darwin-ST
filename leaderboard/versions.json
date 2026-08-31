@@ -25,7 +25,10 @@
     "title": "Stage1 搜索空间升级（joint/cross/iterative fusion）+ 24h 长跑",
     "retrospective": "docs/SOTA_RETROSPECTIVE.md",
     "dataset": "PeMS04",
-    "model_dir": "models/PeMS04/05_mae18.35_f93f4598"
+    "model_dir": "models/PeMS04/05_mae18.35_f93f4598",
+    "best_test_mae": 18.464,
+    "test_std": 0.036,
+    "n_seeds": 6
   },
   {
     "version": "v3",
@@ -35,7 +38,10 @@
     "title": "Tier-2 v1 方法升级（履历/家谱精炼/proxy/信用分/独立采样 + 631 卡机制库）",
     "retrospective": "docs/TIER2_V1_RETROSPECTIVE.md",
     "dataset": "PeMS04",
-    "model_dir": "models/PeMS04/07_mae18.36_6bcc97b9"
+    "model_dir": "models/PeMS04/07_mae18.36_6bcc97b9",
+    "best_test_mae": 18.356,
+    "test_std": 0.0,
+    "n_seeds": 1
   },
   {
     "version": "v4",
