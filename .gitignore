@@ -39,3 +39,9 @@ src/darwin_st/knowledge/data/*.md
 .venv
 # 模型权重二进制 (体积大, 留服务器数据盘; git 只存档基因型/超参/模型卡/算子代码)
 leaderboard/models/**/model.pt
+
+# 论文实验分析产物 (本地证据; 图表/JSON 产物按 frozen-runs 同款规程冻结, 不入 git)
+paper-results/
+
+# herdr/agent 会话生成物
+.agents/

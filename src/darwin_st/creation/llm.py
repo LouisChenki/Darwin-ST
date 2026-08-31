@@ -41,7 +41,12 @@ class MockLLM:
 
 
 class OpenAICompatLLM:
-    """OpenAI 兼容 Chat Completions 客户端 (DeepSeek)。纯 stdlib urllib, 零额外依赖。"""
+    """OpenAI 兼容 Chat Completions 客户端 (DeepSeek)。纯 stdlib urllib, 零额外依赖。
+
+    可复现性留档 (E14/R9 防线): 环境变量 LLM_ARCHIVE 指向 jsonl 路径时, 每次调用追加
+    {ts, model, temperature, max_tokens, messages, response} —— prompt/response 全量留档,
+    防模型版本漂移质疑 (默认空=不留档, 行为不变)。追加写失败只告警不影响调用。
+    """
 
     def __init__(
         self,
@@ -56,6 +61,23 @@ class OpenAICompatLLM:
         if not self._api_key:
             raise RuntimeError(f"环境变量 {api_key_env} 未设置 (key 不应硬编码)")
         self.timeout = timeout
+        self._archive_path = os.environ.get("LLM_ARCHIVE", "") or None
+
+    def _log_call(self, messages: list[dict], temperature: float, max_tokens: int,
+                  response: str | None, error: str | None) -> None:
+        if not self._archive_path:
+            return
+        try:
+            from datetime import datetime, timezone
+            rec = {"ts": datetime.now(timezone.utc).isoformat(), "model": self.model,
+                   "temperature": temperature, "max_tokens": max_tokens,
+                   "messages": messages, "response": response, "error": error}
+            with open(self._archive_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            print(f"[LLM] ⚠️ 留档写失败 (不影响调用): {type(e).__name__}: {str(e)[:120]}")
 
     def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 16384) -> str:
         payload = json.dumps({
@@ -69,7 +91,11 @@ class OpenAICompatLLM:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 data = json.load(resp)
-            return data["choices"][0]["message"]["content"]
+            text = data["choices"][0]["message"]["content"]
+            self._log_call(messages, temperature, max_tokens, text, None)
+            return text
         except urllib.error.HTTPError as e:
             body = e.read()[:300].decode("utf-8", "replace")
+            self._log_call(messages, temperature, max_tokens, None,
+                           f"HTTP {e.code}: {body[:200]}")
             raise RuntimeError(f"LLM API HTTP {e.code}: {body}") from None
