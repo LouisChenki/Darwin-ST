@@ -9,7 +9,7 @@ clip 5.0 (train_one 语义), 同一 P.evaluate 真实尺度 masked 指标分别�
     BASELINE=dcrnn SEEDS=0,1,2 OUT=results/dcrnn_pems04.json python -u scripts/run_baseline.py
 
 环境变量:
-    BASELINE    必需: dcrnn | gwnet | agcrn | stid
+    BASELINE    必需: 注册表内任一名 (dcrnn/gwnet/agcrn/stid/ha/ar/fc_lstm)
     DATASET     默认 PeMS04 (protocol.PROFILES 任一已登记数据集)
     DEVICE      默认 cuda:0
     EPOCHS      训练轮数上限 (默认 100; 早停 patience=10, min_delta=0.001 相对)
@@ -31,7 +31,8 @@ try:
 except Exception:
     pass
 
-BASELINE_NAMES = ("dcrnn", "gwnet", "agcrn", "stid")
+from darwin_st.baselines import BASELINES as _REG
+BASELINE_NAMES = tuple(sorted(_REG))
 
 # baseline_registry.py 中对应的已发表条目名 (AGCRN 未登记 → None, 不臆造)
 _PUBLISHED_KEY = {"dcrnn": "DCRNN", "gwnet": "GraphWaveNet", "agcrn": None, "stid": "STID"}

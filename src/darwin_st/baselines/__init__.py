@@ -22,9 +22,12 @@ import torch.nn as nn
 from darwin_st.baselines.agcrn import AGCRN
 from darwin_st.baselines.dcrnn import DCRNN
 from darwin_st.baselines.gwnet import GWNet
+from darwin_st.baselines.statistical import AutoregressiveBaseline, FCLSTM, HistoricalAverage
 from darwin_st.baselines.stid import STID
 
-__all__ = ["AGCRN", "DCRNN", "GWNet", "STID", "BASELINES", "build_baseline"]
+__all__ = ["AGCRN", "DCRNN", "GWNet", "STID",
+           "HistoricalAverage", "AutoregressiveBaseline", "FCLSTM",
+           "BASELINES", "build_baseline"]
 
 # 跑批入口 (scripts/run_baseline.py 的 BASELINE 环境变量) 的名字注册表
 BASELINES: dict[str, type[nn.Module]] = {
@@ -32,6 +35,9 @@ BASELINES: dict[str, type[nn.Module]] = {
     "gwnet": GWNet,
     "agcrn": AGCRN,
     "stid": STID,
+    "ha": HistoricalAverage,
+    "ar": AutoregressiveBaseline,
+    "fc_lstm": FCLSTM,
 }
 
 
